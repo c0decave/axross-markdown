@@ -17,6 +17,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TOOLS_DIR="${APPIMAGE_TOOLS_DIR:-$HERE/../build/appimage-tools}"
 
 [[ -f "$ELF" ]] || { echo "build_appimage: no binary at $ELF" >&2; exit 2; }
+# both absolute: the image is read back from inside another folder below
+ELF="$(cd "$(dirname -- "$ELF")" && pwd)/$(basename -- "$ELF")"
+mkdir -p "$(dirname -- "$OUT")"
+OUT="$(cd "$(dirname -- "$OUT")" && pwd)/$(basename -- "$OUT")"
 APPIMAGETOOL="$TOOLS_DIR/appimagetool-x86_64.AppImage"
 RUNTIME="$TOOLS_DIR/appimage-runtime-x86_64"
 bash "$HERE/fetch_appimagetool.sh" "$APPIMAGETOOL"
