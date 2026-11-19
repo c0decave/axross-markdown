@@ -1,0 +1,2464 @@
+"""Places under the home folder the agent never writes, moves or deletes.
+
+Changed, they run code or widen the agent's rights with no prompt: its own
+settings and MCP servers, its caches of code it runs (compiled extension
+code, downloaded updates, MCP server discovery: ``~/.cache/axross``), shell
+and session start files, autostart entries, user services, commands on
+PATH, Python start hooks, Git and pip settings, SSH and GnuPG keys.
+core.mcp_server refuses tool writes there whatever the root, and
+core.agent_sandbox mounts them read-only - the missing ones too, so that an
+agent cannot create them (how: see that module).
+
+Places under ``~/.config``, ``~/.local/share``, ``~/.local/state`` and
+``~/.cache`` are also protected where ``$XDG_CONFIG_HOME``,
+``$XDG_DATA_HOME``, ``$XDG_STATE_HOME`` and ``$XDG_CACHE_HOME`` move them
+(both locations count).
+
+Every platform's places count on every platform (:data:`MACOS_DIRS`,
+:data:`WINDOWS_DIRS`, ...; inert where they mean nothing). Computed at
+check time: the home's folders on PATH and its site-packages on sys.path
+(:func:`_dynamic_dirs`), and the XDG folders the user's session sets even
+when this process lacks the variables (:func:`remember_xdg`, the shell and
+session files). A Python start file (``*.pth``, ``sitecustomize.py``) is
+refused wherever it is.
+
+A path names a place when it is the place or lies inside it, compared
+component by component (Windows separators included), case-insensitively
+where the file system usually is (Windows, macOS), and also through each
+place's resolved path (a symlink at ``~/.config`` would otherwise lead
+around ``~/.config/autostart``).
+
+Inside the agent sandbox HOME is ``/tmp`` while the host's home is mounted
+at its own path: the sandbox passes that path in :data:`HOST_HOME_ENV`.
+
+The read side is a list of its own (:data:`SECRET_DIRS` and the ones after
+it, :func:`read_refusal`): secret files whose contents no tool hands out -
+axross's tokens and keys, SSH and GnuPG private keys. Their names may be
+listed; the write list above is not changed by it.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+
+#: Folders (relative to the home folder, "/"-separated).
+HOME_DIRS = (
+    ".config/axross", ".local/share/axross", ".local/state/axross",
+    # code axross runs from its cache: compiled extensions (core.extension_code_cache),
+    # updates (update/) and MCP server discovery (mcp-discover/)
+    ".cache/axross",
+    ".config/autostart", ".config/autostart-scripts", ".config/systemd",
+    ".config/environment.d", ".config/fish",
+    ".config/plasma-workspace", ".config/git", ".config/pip", ".config/containers",
+    ".ssh", ".gnupg", ".local/share/applications",
+    # user services and D-Bus activation (both start programs on demand)
+    ".local/share/systemd/user", ".local/share/dbus-1/services",
+    # commands on PATH and the user site-packages (a .pth file runs at every Python start)
+    ".local/bin", ".local/lib",
+    # shell, editor and window-manager start code
+    ".bashrc.d", ".oh-my-zsh", ".vim", ".config/nvim",
+    ".config/i3", ".config/sway", ".config/hypr", ".ipython",
+    # other agents' and editors' settings: their MCP servers and hooks run code
+    ".claude", ".config/Claude", ".cursor", ".config/Code/User", ".vscode/extensions",
+    # container CLI plugins and credential helpers
+    ".docker",
+    # more commands on PATH: ~/bin (Debian's ~/.profile adds it once it
+    # exists), language tool chains, and the pipx / uv tool venvs (axross
+    # itself, installed with pipx; their site-packages run .pth files)
+    "bin", ".cargo/bin", "go/bin", ".deno/bin", ".bun/bin", ".npm-global/bin", ".pyenv/shims",
+    ".local/share/pipx", ".local/pipx", ".local/share/uv/tools",
+    # more editors, terminal multiplexers and window managers that run code at start
+    ".config/tmux", ".emacs.d", ".config/emacs", ".config/openbox", ".config/lxsession",
+    ".config/awesome", ".config/bspwm", ".config/sxhkd", ".config/qtile",
+    ".config/herbstluftwm", ".xmonad", ".config/xmonad", ".config/labwc", ".config/river",
+    ".config/niri", ".kde/Autostart", ".kde4/Autostart", ".config/upstart",
+    # file-manager actions (a menu entry runs the command it names)
+    ".local/share/kio/servicemenus", ".local/share/kservices5/ServiceMenus",
+    ".local/share/nautilus/scripts",
+)
+#: Files (relative to the home folder).
+HOME_FILES = (
+    ".bashrc", ".bash_profile", ".bash_login", ".bash_logout", ".bash_aliases", ".profile",
+    ".zshrc", ".zprofile", ".zshenv", ".zlogin", ".zlogout", ".xprofile", ".xsession",
+    ".xsessionrc", ".xinitrc", ".pam_environment", ".inputrc", ".gitconfig", ".pip/pip.conf",
+    ".vimrc", ".npmrc", ".claude.json",
+    ".tmux.conf", ".emacs", ".emacs.el", ".gvimrc", ".exrc", ".screenrc", ".gdbinit",
+    ".xbindkeysrc", ".mailcap", ".config/mimeapps.list", ".config/wayfire.ini",
+)
+#: macOS (relative to the home folder): launchd agents, login items, axross's
+#: own folders and preferences, the user site-packages, other agents' settings.
+MACOS_DIRS = (
+    "Library/LaunchAgents", "Library/LaunchDaemons", "Library/Application Support/axross",
+    "Library/Application Support/com.apple.backgroundtaskmanagementagent",
+    "Library/Application Support/Claude", "Library/Application Support/Code/User",
+    "Library/Python", "Library/Services",
+)
+MACOS_FILES = (
+    "Library/Preferences/com.axross.Axross.plist",
+    "Library/Preferences/com.apple.loginitems.plist",
+)
+#: Windows (relative to the home folder): the Startup folder, PowerShell
+#: profiles (Documents may be moved into OneDrive), axross's own folders,
+#: the user site-packages, commands on PATH, other agents' settings.
+WINDOWS_DIRS = (
+    "AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Startup",
+    "AppData/Roaming/axross", "AppData/Local/axross",
+    "Documents/PowerShell", "Documents/WindowsPowerShell",
+    "OneDrive/Documents/PowerShell", "OneDrive/Documents/WindowsPowerShell",
+    "AppData/Roaming/Python", "AppData/Local/Microsoft/WindowsApps",
+    "AppData/Roaming/Claude", "AppData/Roaming/Code/User",
+)
+WINDOWS_FILES: tuple[str, ...] = ()
+#: ``(variable, folders below it)``: where Windows' own variables move them.
+WINDOWS_ENV_DIRS = (
+    ("APPDATA", ("Microsoft/Windows/Start Menu/Programs/Startup", "axross", "Python",
+                 "Claude", "Code/User")),
+    ("LOCALAPPDATA", ("axross", "Microsoft/WindowsApps")),
+)
+#: File names Python runs at start wherever they lie in a site folder: no
+#: tool writes them anywhere (a site folder outside the lists - a venv -
+#: is not known here).
+START_NAMES = ("*.pth", "sitecustomize.py", "usercustomize.py")
+#: Names of the folders whose .pth files Python runs (found on sys.path).
+SITE_DIR_NAMES = ("site-packages", "dist-packages")
+#: Default-deny for writes: besides the places above, no tool changes a
+#: hidden entry directly in a home folder (``~/.pdbrc``, ``~/.wezterm.lua``,
+#: ``~/.aliases``, ``~/.jupyter``, ...) or any entry of the folders below
+#: (``~/.config/kitty``, ``~/.local/share/gnome-shell``, ...) - too many
+#: programs run code from there to list them all. A folder there that the
+#: user grants explicitly (the MCP root, a folder of the agent) is writable
+#: below it (the places above stay protected): :func:`refusal` *granted*.
+DENY_ALL_BELOW = (".config", ".local/share", ".local/state",
+                  # snap packages' own homes (~/snap/<app>/<revision>/.config, ...)
+                  "snap")
+#: The same for macOS (all of ~/Library) and Windows (%APPDATA%).
+MACOS_DENY_ALL_BELOW = ("Library",)
+WINDOWS_DENY_ALL_BELOW = ("AppData/Roaming",)
+#: Default-deny for reads (core.mcp_server, the agent's tools): the contents
+#: of a hidden entry of a home folder (``~/.config/<app>``, ``~/.mozilla``,
+#: ``~/.local/share/TelegramDesktop``) and of ``~/snap`` (the snap packages'
+#: homes: Firefox and Chromium profiles) are not handed out unless they lie
+#: in a folder the user granted (the MCP root or an extra folder inside such
+#: a place) - too many programs keep sessions, tokens and keys there to list
+#: them all. Names stay listable; the user's other files are read as before.
+READ_DENY_ALL_BELOW = ("snap",)
+#: Hidden entries of the home folder that writes may change anyway
+#: (reviewed: nothing runs code from them). Compared case-folded.
+HIDDEN_WRITABLE: tuple[str, ...] = ()
+#: Git runs code from these wherever a repository is (hooks, ``core.fsmonitor``,
+#: ``core.pager`` and filters in the config, submodule URLs): refused anywhere.
+#: Names below a Git folder; a ``.git`` entry itself (a folder or a
+#: ``gitdir:`` file) is refused too, or a folder renamed to ``.git`` brings
+#: a config along. ``commondir`` and ``gitdir`` point Git at another folder
+#: whose config and hooks it then uses. A Git folder is any ``.git`` folder,
+#: any ``*.git`` folder (a bare repository) and any folder Git would take for
+#: one (:data:`GIT_SHAPE`: ``HEAD``, ``objects/`` and ``refs/`` - Git finds a
+#: bare repository by its shape when a shell's prompt runs ``git status`` in it).
+GIT_DIR = ".git"
+GIT_CODE_NAMES = ("config", "config.worktree", "hooks", "info", "commondir", "gitdir")
+GIT_TREE_NAMES = (".gitmodules",)
+#: What makes a folder a Git folder to Git: a ``HEAD`` file and the folders
+#: ``objects`` and ``refs``. No tool creates the last of them in a folder
+#: that is not one yet (a folder of the project made into a repository Git
+#: finds before the real one).
+GIT_SHAPE = ("HEAD", "objects", "refs")
+#: Mercurial, Sapling, Jujutsu, darcs and Breezy: ``(folder, paths below
+#: it)`` that run code or point at a folder whose settings do (``.hg/hgrc``
+#: hooks, ``.hg/hgrc-not-shared`` - read for every repository too -,
+#: ``.hg/sharedpath``, Sapling's ``.sl/config``, ``.jj/repo`` - a file in a
+#: workspace -, ``.jj/repo/config.toml``, darcs's ``_darcs/prefs/defaults``
+#: (``--posthook``), Breezy's ``.bzr/branch/branch.conf`` and the
+#: ``.bzr/branch/location`` of a lightweight checkout).
+VCS_CODE = ((".hg", (("hgrc",), ("hgrc-not-shared",), ("sharedpath",))),
+            (".sl", (("config",), ("hgrc",), ("hgrc-not-shared",), ("sharedpath",))),
+            (".jj", (("repo",), ("repo", "config.toml"))),
+            ("_darcs", (("prefs", "defaults"),)),
+            (".bzr", (("branch", "branch.conf"), ("branch", "location"))))
+#: Folders of a project (at any depth) whose files other programs run as
+#: code when the user opens the project, starts a session in it or commits:
+#: Claude Code's ``.claude/settings*.json`` (hooks, MCP servers), VS Code's
+#: ``.vscode/tasks.json`` (a task run on folder open), ``settings.json``
+#: (tool paths, terminal environment), ``launch.json`` and ``mcp.json``,
+#: Cursor's, Gemini's, Codex's, Windsurf's, Roo's, Kiro's, Amazon Q's and
+#: Continue's MCP configs, JetBrains run configurations (``.idea``, Fleet's
+#: ``.fleet``), Zed's tasks, a dev container's ``postCreateCommand``
+#: (``.devcontainer``) and husky's Git hooks (``.husky``). The agent writes
+#: none of them, wherever they are (core.mcp_server; read-only in the agent
+#: sandbox where they exist).
+PROJECT_CODE_DIRS = (".claude", ".vscode", ".cursor", ".idea", ".zed", ".devcontainer",
+                     ".husky", ".fleet", ".gemini", ".codex", ".windsurf", ".roo", ".kiro",
+                     ".amazonq", ".continue", ".theia")
+#: Files of a project (at any depth, :mod:`fnmatch` patterns) other programs
+#: run code from: project MCP servers (``.mcp.json``), a dev container
+#: (``.devcontainer.json``), a VS Code workspace (``*.code-workspace``:
+#: settings and tasks), and the hook managers pre-commit, lefthook and
+#: overcommit, whose installed Git hook reads them at every commit.
+PROJECT_CODE_FILES = (".mcp.json", ".devcontainer.json", "*.code-workspace",
+                      ".pre-commit-config.yaml", ".pre-commit-config.yml",
+                      "lefthook.yml", "lefthook.yaml", ".lefthook.yml", ".lefthook.yaml",
+                      "lefthook-local.yml", "lefthook-local.yaml", ".lefthook-local.yml",
+                      ".lefthook-local.yaml", ".overcommit.yml")
+#: Git's global and system configs (besides ``$GIT_CONFIG_GLOBAL`` and
+#: ``$GIT_CONFIG_SYSTEM``): read for ``core.hooksPath`` and their includes.
+GIT_GLOBAL_CONFIGS = (".gitconfig", ".config/git/config")
+GIT_SYSTEM_CONFIG = "/etc/gitconfig"
+#: Most bytes of one Git config read, most config files (with includes)
+#: read for one repository, deepest include chain.
+MAX_GIT_CONFIG_BYTES = 256 * 1024
+MAX_GIT_CONFIGS = 32
+MAX_GIT_INCLUDE_DEPTH = 5
+#: axross's trash folder (core.trash): no tool writes there wherever it is
+#: (a planted entry is restored by the user with axross's rights), and its
+#: contents are secret (a trashed key is still a key).
+TRASH_NAME = ".axross-trash"
+#: zsh's start files, also in ``$ZDOTDIR`` (set in ``~/.zshenv``, often
+#: ``~/.config/zsh``): protected there too.
+ZSH_FILES = (".zshenv", ".zprofile", ".zshrc", ".zlogin", ".zlogout")
+#: Where ZDOTDIR is commonly set, besides each home's ``.zshenv``.
+ZDOTDIR_SYSTEM_FILES = ("/etc/zsh/zshenv", "/etc/zshenv")
+#: Where axross remembers the XDG folders it ran with (below the default
+#: ``~/.config/axross``, a protected place wherever XDG points): an MCP
+#: server started without the user's XDG variables (by a desktop client)
+#: still protects them (:func:`remember_xdg`).
+XDG_RECORD = ".config/axross/xdg-locations.json"
+#: Shell and session files the XDG variables are commonly set in: read
+#: (line by line, ``XDG_..._HOME=value`` anywhere in a line, fish's
+#: ``set -gx XDG_..._HOME value``) for the same reason. A folder: its files
+#: with the suffix of :data:`XDG_PROFILE_DIRS`.
+XDG_PROFILE_FILES = (".profile", ".bash_profile", ".bash_login", ".bashrc", ".zshenv",
+                     ".zprofile", ".zshrc", ".zlogin", ".xprofile", ".xsessionrc", ".xsession",
+                     ".xinitrc", ".pam_environment", ".config/environment.d",
+                     ".config/plasma-workspace/env", ".config/fish/config.fish",
+                     ".config/fish/conf.d")
+#: ``folder -> file suffix`` read in the folders of :data:`XDG_PROFILE_FILES`.
+XDG_PROFILE_DIRS = {".config/environment.d": ".conf", ".config/plasma-workspace/env": ".sh",
+                    ".config/fish/conf.d": ".fish"}
+#: The PATH of the host (its entries in the home folder), for the worker
+#: in the agent sandbox, whose PATH is the sandbox's.
+HOST_PATH_ENV = "AXROSS_AGENT_HOST_PATH"
+#: The host's home folder, set by core.agent_sandbox for the worker.
+HOST_HOME_ENV = "AXROSS_AGENT_HOST_HOME"
+#: ``(home-relative prefix, XDG variable, variable naming the host's value
+#: in the agent sandbox)``: where XDG moves the places below the prefix.
+XDG_PLACES = (
+    (".config", "XDG_CONFIG_HOME", "AXROSS_AGENT_HOST_XDG_CONFIG_HOME"),
+    (".local/share", "XDG_DATA_HOME", "AXROSS_AGENT_HOST_XDG_DATA_HOME"),
+    (".local/state", "XDG_STATE_HOME", "AXROSS_AGENT_HOST_XDG_STATE_HOME"),
+    (".cache", "XDG_CACHE_HOME", "AXROSS_AGENT_HOST_XDG_CACHE_HOME"),
+)
+
+def _case_insensitive() -> bool:
+    return sys.platform in ("win32", "darwin")
+
+
+def _windows_names() -> bool:
+    return sys.platform == "win32"
+
+
+def _key(path: str) -> tuple[str, ...]:
+    """*path* as comparable components: normcase, casefolded where names
+    are case-insensitive, NFC (macOS stores names decomposed), and on
+    Windows without what the OS drops when it opens a name - trailing dots
+    and spaces (``.claude.json.`` is ``.claude.json``) and an alternate
+    data stream (``name:stream``)."""
+    import unicodedata
+
+    text = unicodedata.normalize("NFC", os.path.normcase(os.path.abspath(path)))
+    if _case_insensitive():
+        text = text.casefold()
+    parts = [part for part in text.replace("\\", "/").split("/") if part]
+    if _windows_names():
+        cleaned = []
+        for i, part in enumerate(parts):
+            if i > 0 and ":" in part:  # the first part is the drive ("c:")
+                part = part.split(":", 1)[0]
+            cleaned.append(part.rstrip(". ") or part)
+        parts = cleaned
+    return tuple(parts)
+
+
+def _resolver():
+    """``os.path.realpath`` for many absolute paths that share folders: each
+    folder on the way is looked at once (``lstat``), and only a symlink is
+    resolved with realpath. A new one per check (nothing is kept across
+    tool calls)."""
+    memo: dict[str, str] = {}
+
+    def real(path: str) -> str:
+        path = os.path.abspath(path)
+        done = memo.get(path)
+        if done is not None:
+            return done
+        parent, name = os.path.split(path)
+        if parent == path or not name:
+            memo[path] = path
+            return path
+        joined = os.path.join(real(parent), name)
+        if os.path.islink(joined):
+            joined = os.path.realpath(joined)
+        memo[path] = joined
+        return joined
+
+    return real
+
+
+def homes(environ=os.environ) -> list[str]:
+    """The home folders to protect: this process's, and the host's when
+    running in the agent sandbox."""
+    found = [os.path.expanduser("~"), environ.get(HOST_HOME_ENV, "")]
+    out: list[str] = []
+    for home in found:
+        if home and os.path.isabs(home):
+            for variant in (os.path.abspath(home), os.path.realpath(home)):
+                if variant not in out:
+                    out.append(variant)
+    return out
+
+
+def places(home: str) -> list[str]:
+    """Every protected place of *home*, as typed and as resolved."""
+    out: list[str] = []
+    for rel in HOME_DIRS + HOME_FILES:
+        place = os.path.join(home, *rel.split("/"))
+        for variant in (place, os.path.realpath(place)):
+            if variant not in out:
+                out.append(variant)
+    return out
+
+
+def _home_rel(home: str, rel: str) -> str:
+    return os.path.join(home, *rel.split("/"))
+
+
+def _inside_key(inner: tuple[str, ...], outer: tuple[str, ...]) -> bool:
+    """Whether the key *inner* lies strictly below *outer*."""
+    return len(inner) > len(outer) and inner[:len(outer)] == outer
+
+
+#: ``path -> ((mtime_ns, size), {variable: [values]})``: profile files read.
+_PROFILE_CACHE: dict[str, tuple[tuple[int, int], dict[str, list[str]]]] = {}
+_XDG_VARS = tuple(var for _prefix, var, _host in XDG_PLACES)
+
+
+def _xdg_owner_names(home: str) -> list[str]:
+    """The user names ``$USER`` / ``$LOGNAME`` may stand for in *home*'s
+    files: the folder's owner and its name."""
+    names = [os.path.basename(os.path.normpath(home))]
+    try:
+        import pwd
+
+        names.insert(0, pwd.getpwuid(os.stat(home).st_uid).pw_name)
+    except (ImportError, KeyError, OSError):
+        pass
+    return [n for i, n in enumerate(names) if n and n not in names[:i]]
+
+
+def _xdg_expand(value: str, home: str) -> list[str]:
+    """The absolute folders a profile's raw *value* names: quotes removed,
+    ``${XDG_..:-default}`` as its default, ``$HOME`` / ``~`` / ``@{HOME}``
+    and ``$USER`` / ``$LOGNAME`` replaced (each user name the home may
+    belong to). Another variable or a relative path names nothing (the XDG
+    spec ignores those)."""
+    import re
+
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        value = value[1:-1]
+    value = value.replace('"', "").replace("'", "")
+    value = re.sub(r"\$\{XDG_(?:CONFIG|DATA|STATE|CACHE)_HOME:?[-=]([^}]*)\}", r"\1", value)
+    for token in ("${HOME}", "$HOME", "@{HOME}"):
+        value = value.replace(token, home)
+    if value == "~" or value.startswith("~/"):
+        value = home + value[1:]
+    out: list[str] = []
+    user_var = r"\$\{?(?:USER|LOGNAME)\b\}?"
+    texts = [value]
+    if re.search(user_var, value):
+        texts = [re.sub(user_var, user, value) for user in _xdg_owner_names(home)]
+        # "/home/$USER/x": the folder named after the user is the home folder
+        texts.append(re.sub(r"^/[^$]*?/" + user_var, lambda _m: home, value))
+    for text in texts:
+        if "$" in text or "`" in text or not os.path.isabs(text):
+            continue
+        text = os.path.normpath(text)
+        if text not in out:
+            out.append(text)
+    return out
+
+
+#: An assignment anywhere in a line (``export A=1 XDG_CONFIG_HOME=~/x``,
+#: ``[ -z ... ] && export XDG_DATA_HOME="$HOME/d"``, pam's ``VAR DEFAULT=``)
+#: and fish's ``set -gx XDG_CONFIG_HOME ~/x``.
+_XDG_ASSIGN = None
+_XDG_FISH = None
+
+
+def _profile_values(path: str, home: str) -> dict[str, list[str]]:
+    """The absolute XDG folders *path* (a shell or session file) sets."""
+    global _XDG_ASSIGN, _XDG_FISH
+    import re
+
+    try:
+        st = os.stat(path)
+    except OSError:
+        return {}
+    stamp = (st.st_mtime_ns, st.st_size)
+    cached = _PROFILE_CACHE.get(path)
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    if _XDG_ASSIGN is None:
+        value = r"((?:\"[^\"]*\"|'[^']*'|\$\{[^}\s]*\}|[^\s;&|#'\"])+)"
+        _XDG_ASSIGN = re.compile(r"(?<![\w${])(XDG_(?:CONFIG|DATA|STATE|CACHE)_HOME)"
+                                 r"(?:\s+(?:DEFAULT|OVERRIDE))?\s*=\s*" + value)
+        _XDG_FISH = re.compile(r"\bset\s+(?:-{1,2}[A-Za-z]+\s+)*"
+                               r"(XDG_(?:CONFIG|DATA|STATE|CACHE)_HOME)\s+" + value)
+    found: dict[str, list[str]] = {}
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            text = fh.read(256 * 1024)
+    except OSError:
+        text = ""
+    for line in text.splitlines():
+        if "XDG_" not in line:
+            continue
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            continue
+        for pattern in (_XDG_ASSIGN, _XDG_FISH):
+            for match in pattern.finditer(line):
+                for folder in _xdg_expand(match.group(2), home):
+                    values = found.setdefault(match.group(1), [])
+                    if folder not in values:
+                        values.append(folder)
+    _PROFILE_CACHE[path] = (stamp, found)
+    return found
+
+
+def _recorded_xdg(home: str) -> dict[str, list[str]]:
+    """The XDG folders axross ran with (:func:`remember_xdg`) and the ones
+    *home*'s shell and session files set."""
+    import json
+
+    out: dict[str, list[str]] = {}
+
+    def add(var: str, values) -> None:
+        if var not in _XDG_VARS or not isinstance(values, list):
+            return
+        for value in values[:16]:
+            if isinstance(value, str) and os.path.isabs(value):
+                out.setdefault(var, []).append(value)
+
+    try:
+        with open(_home_rel(home, XDG_RECORD), encoding="utf-8") as fh:
+            data = json.loads(fh.read(64 * 1024))
+    except (OSError, ValueError, RecursionError):
+        data = None
+    if isinstance(data, dict):
+        for var, values in data.items():
+            add(var, values)
+    files = []
+    for rel in XDG_PROFILE_FILES:
+        path = _home_rel(home, rel)
+        if os.path.isdir(path):
+            suffix = XDG_PROFILE_DIRS.get(rel, ".conf")
+            try:
+                files += sorted(os.path.join(path, n) for n in os.listdir(path)
+                                if n.endswith(suffix))[:64]
+            except OSError:
+                pass
+        else:
+            files.append(path)
+    for path in files:
+        for var, values in _profile_values(path, home).items():
+            add(var, values)
+    return out
+
+
+def remember_xdg(environ=os.environ) -> None:
+    """Record this process's XDG folders below the home folder
+    (:data:`XDG_RECORD`), so that an MCP server started without them still
+    protects the places they move. Called by the GUI at start; never raises."""
+    import json
+    import tempfile
+
+    try:
+        home = os.path.expanduser("~")
+        if not os.path.isabs(home):
+            return
+        path = _home_rel(home, XDG_RECORD)
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.loads(fh.read(64 * 1024))
+        except (OSError, ValueError, RecursionError):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        before = json.dumps(data, sort_keys=True)
+        for var in _XDG_VARS:
+            value = environ.get(var, "")
+            if not value or not os.path.isabs(value):
+                continue
+            value = os.path.abspath(value)
+            known = [v for v in data.get(var, []) if isinstance(v, str) and v != value]
+            data[var] = [value, *known][:4]
+        if json.dumps(data, sort_keys=True) == before:
+            return
+        folder = os.path.dirname(path)
+        os.makedirs(folder, mode=0o700, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".xdg-locations-", dir=folder)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=1, sort_keys=True)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except Exception:  # noqa: BLE001 - a missing record only loses the extra protection
+        import logging
+
+        logging.getLogger(__name__).debug("remember_xdg failed", exc_info=True)
+
+
+def _xdg_bases(environ) -> list[tuple[str, str]]:
+    """``(home-relative prefix, folder)`` of every XDG location set to an
+    absolute path - this process's and, in the agent sandbox, the host's;
+    also the ones axross ran with and the user's shell and session files set
+    (an MCP server started by a desktop client may lack the variables)."""
+    out: list[tuple[str, str]] = []
+    recorded = [_recorded_xdg(home) for home in homes(environ)]
+    for prefix, var, host_var in XDG_PLACES:
+        values = [environ.get(var, ""), environ.get(host_var, "")]
+        for found in recorded:
+            values += found.get(var, [])
+        for value in values:
+            if value and os.path.isabs(value):
+                base = (prefix, os.path.abspath(value))
+                if base not in out:
+                    out.append(base)
+    return out
+
+
+#: ``path -> ((mtime_ns, size), [raw values])``: ZDOTDIR lines read.
+_ZDOT_CACHE: dict[str, tuple[tuple[int, int], list[str]]] = {}
+
+
+def _zdotdir_lines(path: str) -> list[str]:
+    """The raw values of the ``ZDOTDIR=...`` lines of *path* (cached by
+    modification time and size)."""
+    import re
+
+    try:
+        st = os.stat(path)
+    except OSError:
+        return []
+    stamp = (st.st_mtime_ns, st.st_size)
+    cached = _ZDOT_CACHE.get(path)
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    found: list[str] = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            text = fh.read(256 * 1024)
+    except OSError:
+        text = ""
+    line_re = re.compile(r"\s*(?:export\s+)?ZDOTDIR\s*=\s*(\S+?)\s*;?\s*(?:#.*)?")
+    for line in text.splitlines():
+        match = line_re.fullmatch(line)
+        if match:
+            found.append(match.group(1).strip("'\""))
+    _ZDOT_CACHE[path] = (stamp, found[:16])
+    return found[:16]
+
+
+def _expand_zdotdir(value: str, home: str, config_dirs: list[str]) -> list[str]:
+    """The absolute folders *value* (a ZDOTDIR line's value) may name: with
+    ``$HOME`` / ``~`` replaced and ``$XDG_CONFIG_HOME`` (or
+    ``${XDG_CONFIG_HOME:-default}``) as each of *config_dirs* and the default."""
+    import re
+
+    xdg = re.compile(r"\$\{XDG_CONFIG_HOME(?::?-([^}]*))?\}|\$XDG_CONFIG_HOME\b")
+    out: list[str] = []
+    for config in config_dirs:
+        text = xdg.sub(lambda m: m.group(1) if m.group(1) is not None and config == "" else
+                       (config or os.path.join(home, ".config")), value)
+        for token in ("${HOME}", "$HOME"):
+            text = text.replace(token, home)
+        if text.startswith("~/"):
+            text = home + text[1:]
+        if "$" in text or not os.path.isabs(text):
+            continue
+        text = os.path.normpath(text)
+        if text not in out:
+            out.append(text)
+    return out
+
+
+def zdotdirs(environ=os.environ) -> list[str]:
+    """The folders zsh may read its start files from (``$ZDOTDIR``): this
+    process's, and the ones each home's ``.zshenv`` and the system's zshenv
+    set (an MCP server started by a desktop client lacks the variable)."""
+    out: list[str] = []
+    value = environ.get("ZDOTDIR", "")
+    if value and os.path.isabs(value):
+        out.append(os.path.normpath(value))
+    for home in homes(environ):
+        configs = [""] + [base for prefix, base in _xdg_bases(environ) if prefix == ".config"]
+        for path in (_home_rel(home, ".zshenv"), *ZDOTDIR_SYSTEM_FILES):
+            for raw in _zdotdir_lines(path):
+                for folder in _expand_zdotdir(raw, home, configs):
+                    if folder not in out:
+                        out.append(folder)
+    return out
+
+
+def _platform_lists() -> tuple[list[tuple[str, bool]], list[tuple[str, bool]]]:
+    """``(this platform's entries, the other platforms' entries)`` beyond
+    :data:`HOME_DIRS` / :data:`HOME_FILES` (``(home-relative, is_folder)``)."""
+    own: list[tuple[str, bool]] = []
+    foreign: list[tuple[str, bool]] = []
+    for platform, dirs, files in (("darwin", MACOS_DIRS, MACOS_FILES),
+                                  ("win32", WINDOWS_DIRS, WINDOWS_FILES)):
+        entries = [(rel, True) for rel in dirs] + [(rel, False) for rel in files]
+        (own if sys.platform == platform else foreign).extend(entries)
+    return own, foreign
+
+
+def _dynamic_dirs(environ, home_list: list[str]) -> list[str]:
+    """Folders of a home that are protected because of where they are
+    used: the PATH's (a new file there is a command) and the site-packages
+    on sys.path (their .pth files run at every Python start). A PATH entry
+    that is a home folder itself is left out (it would protect all of it)."""
+    candidates: list[str] = []
+    for value in (environ.get("PATH", ""), environ.get(HOST_PATH_ENV, "")):
+        candidates += [e for e in value.split(os.pathsep) if e and os.path.isabs(e)]
+    candidates += [e for e in sys.path if isinstance(e, str) and os.path.isabs(e)
+                   and os.path.basename(os.path.normpath(e)) in SITE_DIR_NAMES]
+    home_keys = [_key(h) for h in home_list]
+    out: list[str] = []
+    for entry in candidates:
+        entry = os.path.normpath(entry)
+        ek = _key(entry)
+        if any(_inside_key(ek, hk) for hk in home_keys) and entry not in out:
+            out.append(entry)
+    return out
+
+
+def home_path_dirs(environ=os.environ) -> list[str]:
+    """The PATH entries inside a home folder (for :data:`HOST_PATH_ENV`)."""
+    home_keys = [_key(h) for h in homes(environ)]
+    out = []
+    for e in environ.get("PATH", "").split(os.pathsep):
+        if e and os.path.isabs(e) and any(_inside_key(_key(e), hk) for hk in home_keys):
+            out.append(os.path.normpath(e))
+    return out
+
+
+def protected_paths(environ=os.environ, *, foreign_missing: bool = True
+                    ) -> list[tuple[str, bool]]:
+    """``(path, is_folder)`` of every protected place as typed: below each
+    home, where the XDG (and on Windows APPDATA / LOCALAPPDATA) variables
+    move them, the home's folders on PATH and its site-packages on sys.path.
+    Every platform's places count (inert elsewhere, cheap to refuse);
+    *foreign_missing* False lists another platform's places only where they
+    exist (core.agent_sandbox makes no mount points for them)."""
+    out: list[tuple[str, bool]] = []
+    seen: set[str] = set()
+
+    def add(path: str, folder: bool) -> None:
+        if path not in seen:
+            seen.add(path)
+            out.append((path, folder))
+
+    entries = [(rel, True) for rel in HOME_DIRS] + [(rel, False) for rel in HOME_FILES]
+    own, foreign = _platform_lists()
+    home_list = homes(environ)
+    for home in home_list:
+        for rel, folder in entries + own:
+            add(_home_rel(home, rel), folder)
+        for rel, folder in foreign:
+            path = _home_rel(home, rel)
+            if foreign_missing or os.path.lexists(path):
+                add(path, folder)
+    for prefix, base in _xdg_bases(environ):
+        for rel, folder in entries:
+            if rel.startswith(prefix + "/"):
+                add(os.path.join(base, *rel[len(prefix) + 1:].split("/")), folder)
+    for var, rels in WINDOWS_ENV_DIRS:
+        value = environ.get(var, "")
+        if not value or not os.path.isabs(value):
+            continue
+        for rel in rels:
+            path = _home_rel(value, rel)
+            if foreign_missing or sys.platform == "win32" or os.path.lexists(path):
+                add(path, True)
+    for path in _dynamic_dirs(environ, home_list):
+        add(path, True)
+    for folder in zdotdirs(environ):
+        for name in ZSH_FILES:
+            add(os.path.join(folder, name), False)
+    return out
+
+
+#: Most hidden entries of one home folder :func:`write_deny_places` lists.
+MAX_HIDDEN_ENTRIES = 4096
+
+
+def write_deny_places(environ=os.environ, *, foreign_missing: bool = True
+                      ) -> list[tuple[str, bool]]:
+    """``(path, is_folder)`` of the default-deny places of the write side
+    (:data:`DENY_ALL_BELOW`), for core.agent_sandbox: each home's existing
+    hidden entries and the folders whose every entry is denied (as typed;
+    *foreign_missing* False: another platform's only where they exist).
+    A hidden entry that does not exist yet cannot be listed - the sandbox
+    keeps the home folder itself from getting new entries."""
+    out: list[tuple[str, bool]] = []
+
+    def add(path: str, folder: bool) -> None:
+        if (path, folder) not in out and (path, not folder) not in out:
+            out.append((path, folder))
+
+    own_platform = {"darwin": MACOS_DENY_ALL_BELOW, "win32": WINDOWS_DENY_ALL_BELOW}
+    for home in homes(environ):
+        if not _key(home):
+            continue
+        try:
+            names = sorted(n for n in os.listdir(home) if _hidden_name(n))
+        except OSError:
+            names = []
+        for name in names[:MAX_HIDDEN_ENTRIES]:
+            path = os.path.join(home, name)
+            add(path, os.path.isdir(path) and not os.path.islink(path))
+        for rel in DENY_ALL_BELOW:
+            add(_home_rel(home, rel), True)
+        for rel in MACOS_DENY_ALL_BELOW + WINDOWS_DENY_ALL_BELOW:
+            path = _home_rel(home, rel)
+            if (foreign_missing or rel in own_platform.get(sys.platform, ())
+                    or os.path.lexists(path)):
+                add(path, True)
+    for prefix, base in _xdg_bases(environ):
+        if prefix in DENY_ALL_BELOW:
+            add(base, True)
+    appdata = environ.get("APPDATA", "")
+    if appdata and os.path.isabs(appdata) and (foreign_missing or os.path.lexists(appdata)):
+        add(appdata, True)
+    return out
+
+
+def grant_lifts(place: str, granted, environ=os.environ) -> bool:
+    """Whether a *granted* folder lifts default-deny for *place* (a place of
+    :func:`write_deny_places`): it lies in a granted folder that is at or
+    below the denied entry (the user named it). A settings folder itself
+    (``~/.config``) is lifted only by granting that very folder - a grant
+    of ``~/.local`` does not open ``~/.local/share``."""
+    areas = _deny_areas(environ)
+    grants = _granted_keys(granted)
+    pk = _key(os.path.abspath(place))
+    if _denied(pk, areas, grants):
+        return False
+    all_bases = {base for base, kind in areas if kind == "all"}
+    if pk in all_bases:
+        return pk in grants
+    return bool(_denials(pk, areas))
+
+
+def _all_places(environ) -> list[str]:
+    """Every protected place, as typed and as resolved."""
+    out: list[str] = []
+    real = _resolver()
+    for place, _folder in protected_paths(environ):
+        for variant in (place, real(place)):
+            if variant not in out:
+                out.append(variant)
+    return out
+
+
+def existing_places(environ=os.environ) -> list[str]:
+    """The protected places that exist now (as typed, not resolved)."""
+    return [place for place, _folder in protected_paths(environ) if os.path.lexists(place)]
+
+
+def _start_name(name: str) -> bool:
+    import fnmatch
+
+    if _windows_names():
+        name = name.split(":", 1)[0].rstrip(". ") or name
+    if _case_insensitive():
+        name = name.casefold()
+    return any(fnmatch.fnmatchcase(name, pattern) for pattern in START_NAMES)
+
+
+def _deny_areas(environ) -> list[tuple[tuple[str, ...], str]]:
+    """``(key of a folder, kind)`` of the default-deny areas for writes:
+    kind "hidden" (each home: its hidden entries) or "all" (every entry of
+    ~/.config, ~/.local/share, ~/.local/state - also where XDG moves them -,
+    ~/Library, %APPDATA%). As typed and as resolved."""
+    areas: list[tuple[tuple[str, ...], str]] = []
+
+    def add(path: str, kind: str) -> None:
+        for variant in (os.path.abspath(path), os.path.realpath(path)):
+            item = (_key(variant), kind)
+            if item[0] and item not in areas:
+                areas.append(item)
+
+    for home in homes(environ):
+        add(home, "hidden")
+        for rel in DENY_ALL_BELOW + MACOS_DENY_ALL_BELOW + WINDOWS_DENY_ALL_BELOW:
+            add(_home_rel(home, rel), "all")
+    for prefix, base in _xdg_bases(environ):
+        if prefix in DENY_ALL_BELOW:
+            add(base, "all")
+    appdata = environ.get("APPDATA", "")
+    if appdata and os.path.isabs(appdata):
+        add(appdata, "all")
+    return areas
+
+
+def _hidden_name(name: str) -> bool:
+    allowed = {n.casefold() for n in HIDDEN_WRITABLE}
+    return name.startswith(".") and name not in (".", "..") and name.casefold() not in allowed
+
+
+def _denials(ck: tuple[str, ...], areas) -> list[tuple[int, str]]:
+    """``(length of the area's key, kind)`` of each default-deny area *ck*
+    lies in (strictly below its folder: a hidden entry of a home, any entry
+    of a settings folder)."""
+    out = []
+    for base, kind in areas:
+        n = len(base)
+        if len(ck) > n and ck[:n] == base and (kind == "all" or _hidden_name(ck[n])):
+            out.append((n, kind))
+    return out
+
+
+def _granted_keys(granted) -> list[tuple[str, ...]]:
+    """The keys of the *granted* folders, as typed and resolved."""
+    out: list[tuple[str, ...]] = []
+    for folder in granted or ():
+        if not folder or not isinstance(folder, str) or not os.path.isabs(folder):
+            continue
+        for variant in (os.path.abspath(folder), os.path.realpath(folder)):
+            gk = _key(variant)
+            if gk and gk not in out:
+                out.append(gk)
+    return out
+
+
+def _lifted(ck: tuple[str, ...], n: int, kind: str, grants) -> bool:
+    """Whether a granted folder lifts the area (key length *n*, *kind*) for
+    *ck*: it holds *ck* and lies at or below the denied entry (``ck[:n+1]``)
+    - or is the settings folder itself (kind "all"). A granted home folder,
+    or a folder above the area, lifts nothing."""
+    return any(ck[:len(g)] == g and (len(g) > n or (kind == "all" and len(g) == n))
+               for g in grants)
+
+
+def _denied(ck: tuple[str, ...], areas, grants) -> bool:
+    """Whether default-deny refuses *ck*: it lies in an area no grant lifts."""
+    return any(not _lifted(ck, n, kind, grants) for n, kind in _denials(ck, areas))
+
+
+def _denied_entry(ck: tuple[str, ...], areas) -> tuple[str, ...] | None:
+    """The key of the default-deny entry *ck* is (or lies in), or None."""
+    for n, _kind in _denials(ck, areas):
+        return ck[:n + 1]
+    return None
+
+
+#: Most symlinks followed for one path (Linux's own limit is 40).
+MAX_LINK_HOPS = 40
+
+
+def _link_chain(path: str, readlink=None) -> list[str]:
+    """Every name a write or read of *path* goes by: the absolute path as
+    typed, the path after each symlink on the way is followed (one hop at a
+    time, the rest of the path joined on), and the resolved path. A missing
+    component ends nothing (the rest is joined as it is). *readlink(path)*
+    returns a link's target or None (memoised by the caller)."""
+    path = os.path.abspath(path)
+    out = [path]
+    if os.name != "posix":
+        real = os.path.realpath(path)
+        if real != path:
+            out.append(real)
+        return out
+    if readlink is None:
+        readlink = _readlink_or_none
+    todo = [part for part in path.split("/") if part]
+    done = "/"
+    hops = 0
+    while todo:
+        name = todo.pop(0)
+        if name == ".":
+            continue
+        if name == "..":
+            done = os.path.dirname(done)
+            continue
+        here = os.path.join(done, name)
+        target = readlink(here) if hops < MAX_LINK_HOPS else None
+        if target is None:
+            done = here
+            continue
+        hops += 1
+        base = target if os.path.isabs(target) else os.path.join(done, target)
+        variant = os.path.normpath(os.path.join(base, *todo))
+        if variant not in out:
+            out.append(variant)
+        if os.path.isabs(target):
+            done = "/"
+        todo = [part for part in target.split("/") if part] + todo
+    if done not in out:
+        out.append(done)
+    if hops >= MAX_LINK_HOPS:  # a loop: what the OS would make of it
+        real = os.path.realpath(path)
+        if real not in out:
+            out.append(real)
+    return out
+
+
+def _readlink_or_none(path: str) -> str | None:
+    try:
+        return os.readlink(path)
+    except (OSError, ValueError):
+        return None
+
+
+def _memo_readlink():
+    memo: dict[str, str | None] = {}
+
+    def readlink(path: str) -> str | None:
+        if path not in memo:
+            memo[path] = _readlink_or_none(path)
+        return memo[path]
+
+    return readlink
+
+
+#: Folders the link scan (:func:`_area_links`) does not look into: caches
+#: and package stores (many entries, links of their own that name nothing
+#: of the user's).
+LINK_SCAN_SKIP = ("cache", ".cache", "caches", "node_modules", "site-packages",
+                  "dist-packages", "__pycache__", ".git", "registry", "toolchains",
+                  "_cacache", "repository", "versions")
+#: Most entries the link scan looks at per call.
+MAX_LINK_SCAN = 8192
+#: ``folder -> ((mtime_ns, ino), [(name, is_link, is_dir)])``: folders listed.
+_SCAN_CACHE: dict[str, tuple[tuple[int, int], list[tuple[str, bool, bool]]]] = {}
+
+
+def _scan_dir(folder: str) -> list[tuple[str, bool, bool]]:
+    """``(name, is_link, is_dir)`` of *folder*'s entries (cached by the
+    folder's modification time: an entry made, removed or re-pointed
+    changes it)."""
+    try:
+        st = os.stat(folder)
+    except OSError:
+        return []
+    stamp = (st.st_mtime_ns, st.st_ino)
+    cached = _SCAN_CACHE.get(folder)
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    entries: list[tuple[str, bool, bool]] = []
+    try:
+        with os.scandir(folder) as it:
+            for entry in it:
+                try:
+                    is_link = entry.is_symlink()
+                    is_dir = not is_link and entry.is_dir(follow_symlinks=False)
+                except OSError:
+                    continue
+                entries.append((entry.name, is_link, is_dir))
+                if len(entries) >= MAX_LINK_SCAN:
+                    break
+    except OSError:
+        return []
+    entries.sort()
+    if len(_SCAN_CACHE) > 4096:
+        _SCAN_CACHE.clear()
+    _SCAN_CACHE[folder] = (stamp, entries)
+    return entries
+
+
+def _area_links(environ) -> list[tuple[str, str]]:
+    """``(link, its resolved target)`` of the symlinks among each home's
+    hidden entries and up to two folders below them, and among the entries
+    of the settings folders (and one folder below): GNU stow and chezmoi
+    put ``~/.config/kitty -> ~/dotfiles/kitty`` and
+    ``~/.ssh/id_ed25519 -> ~/keys/id_ed25519`` there. Their targets count as
+    the places themselves (:func:`write_checker`, :func:`secret_checker`).
+    Bounded (:data:`MAX_LINK_SCAN` entries); caches are not looked into."""
+    found: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    budget = [MAX_LINK_SCAN]
+
+    def walk(folder: str, depth: int, hidden_only: bool) -> None:
+        if folder in seen or budget[0] <= 0:
+            return
+        seen.add(folder)
+        for name, is_link, is_dir in _scan_dir(folder):
+            if budget[0] <= 0:
+                return
+            budget[0] -= 1
+            if hidden_only and not _hidden_name(name):
+                continue
+            path = os.path.join(folder, name)
+            if is_link:
+                found.append((path, os.path.realpath(path)))
+            elif is_dir and depth > 0 and name.casefold() not in LINK_SCAN_SKIP:
+                walk(path, depth - 1, False)
+
+    for home in homes(environ):
+        if _key(home):
+            walk(os.path.realpath(home), 3, True)
+        for rel in DENY_ALL_BELOW:
+            walk(os.path.realpath(_home_rel(home, rel)), 1, False)
+    for prefix, base in _xdg_bases(environ):
+        if prefix in DENY_ALL_BELOW:
+            walk(os.path.realpath(base), 1, False)
+    if budget[0] <= 0:
+        import logging
+
+        logging.getLogger(__name__).debug(
+            "symlinks of the hidden folders: stopped after %d entries", MAX_LINK_SCAN)
+    return found
+
+
+def _home_or_above(tk: tuple[str, ...], home_keys) -> bool:
+    return any(hk[:len(tk)] == tk for hk in home_keys)
+
+
+def _git_shaped(path: str, memo: dict) -> bool:
+    """Whether Git takes the folder *path* for a repository (:data:`GIT_SHAPE`)."""
+    done = memo.get(path)
+    if done is None:
+        # Any entry will do: Git only asks access(X_OK) of objects and
+        # refs, so an executable FILE named objects passes too.
+        done = all(os.path.lexists(os.path.join(path, n)) for n in GIT_SHAPE)
+        memo[path] = done
+    return done
+
+
+def _fold_name(name: str) -> str:
+    """*name* case-folded - on every platform: Git, Mercurial and the tools
+    of :data:`PROJECT_CODE_DIRS` open their files by name, and on a
+    case-insensitive volume (a FAT or exFAT stick, an SMB share, an ext4
+    folder with casefold) Linux returns ``head`` for ``HEAD`` as well."""
+    return name.casefold()
+
+
+def _path_parts(path: str) -> list[str]:
+    return [part for part in os.path.abspath(path).replace("\\", "/").split("/") if part]
+
+
+def _git_code(ck: tuple[str, ...], path: str | None = None, memo: dict | None = None) -> bool:
+    """Whether *ck* (the key of *path*) is a Git, Mercurial or Jujutsu file
+    that runs code: :data:`GIT_CODE_NAMES` anywhere below a Git folder (a
+    ``.git`` or ``*.git`` folder, or one shaped like a repository - looked
+    up on disk when *path* is given) or directly in a folder that holds a
+    ``HEAD``; a ``.git`` entry itself, a folder shaped like a repository or
+    holding ``HEAD`` beside a config or hooks; ``.gitmodules``; the entry
+    that would make a folder a repository (:data:`GIT_SHAPE`: ``HEAD`` beside
+    a config or hooks, or the last of the three); :data:`VCS_CODE`. Folders
+    made on the way (a copy's or an archive's) cannot complete one: ``HEAD``
+    and the config are files, and whichever comes second is refused."""
+    names = {n.casefold() for n in GIT_CODE_NAMES}
+    # Compared case-folded on every platform (:func:`_fold_name`).
+    ck = tuple(_fold_name(part) for part in ck)
+    if ck and ck[-1] in {n.casefold() for n in GIT_TREE_NAMES}:
+        return True
+    for i, part in enumerate(ck):
+        for folder, rels in VCS_CODE:
+            # The file itself, or a folder on its way (the .hg folder, as
+            # with .git: a folder renamed to .hg brings its hgrc along).
+            tail = ck[i + 1:]
+            if part == folder.casefold() and any(
+                    tuple(r.casefold() for r in rel[:len(tail)]) == tail for rel in rels):
+                return True
+    parts = _path_parts(path) if path is not None else None
+    if parts is not None and len(parts) != len(ck):
+        parts = None
+    memo = {} if memo is None else memo
+    fold = _fold_name
+
+    def real(i: int) -> str:
+        return os.sep + os.sep.join(parts[:i + 1]) if os.name == "posix" else \
+            os.sep.join(parts[:i + 1])
+
+    def lexists(folder: str, name: str) -> bool:
+        key = (folder, name)
+        if key not in memo:
+            memo[key] = os.path.lexists(os.path.join(folder, name))
+        return memo[key]
+
+    def holds_code(folder: str) -> bool:
+        return any(lexists(folder, n) for n in GIT_CODE_NAMES)
+
+    def by_name(part: str) -> bool:
+        return part == GIT_DIR or (part.endswith(".git") and len(part) > len(".git"))
+
+    last_i = len(ck) - 1
+    for i, part in enumerate(ck):
+        named = by_name(part)
+        shaped = not named and parts is not None and _git_shaped(real(i), memo)
+        head = not (named or shaped) and parts is not None and lexists(real(i), "HEAD")
+        if not (named or shaped or head):
+            continue
+        if i == last_i:
+            if part == GIT_DIR.casefold() or shaped or (head and holds_code(real(i))):
+                return True
+            continue
+        if head:
+            if ck[i + 1].casefold() in names:
+                return True
+            continue
+        if any(later.casefold() in names for later in ck[i + 1:]):
+            return True
+    # The entry that would make its folder a repository: HEAD beside a
+    # config or hooks (or beside objects/ and refs/), or the last of HEAD,
+    # objects/ and refs/.
+    if parts is not None and len(ck) >= 2:
+        last = fold(parts[-1])
+        folder = real(len(parts) - 2)
+        if (last in {fold(n) for n in GIT_SHAPE} and not by_name(ck[-2])
+                and not _git_shaped(folder, memo)):
+            if last == fold("HEAD") and holds_code(folder):
+                return True
+            others = [n for n in GIT_SHAPE if fold(n) != last]
+            if all(lexists(folder, n) for n in others):
+                return True
+    return False
+
+
+def _git_message(path: str) -> str:
+    return (f"{path}: the agent does not change Git's settings, hooks or submodules "
+            "(config, hooks, info, commondir, gitdir of a .git or *.git folder or of a "
+            "folder shaped like a repository or holding a HEAD, .gitmodules, a .git "
+            "entry, a HEAD beside a config or hooks, the last of HEAD/objects/refs that "
+            "would make a folder a repository; .hg/hgrc, .hg/hgrc-not-shared, .sl/config, "
+            ".jj/repo, _darcs/prefs/defaults, .bzr/branch/branch.conf): Git, Mercurial, "
+            "Sapling, Jujutsu, darcs and Breezy run code from them")
+
+
+def _folded_keys(path: str) -> list[tuple[str, ...]]:
+    """The case-folded keys of *path* as named and resolved."""
+    out = [tuple(_fold_name(part) for part in _key(path))]
+    real = os.path.realpath(path)
+    if real != path:
+        folded = tuple(_fold_name(part) for part in _key(real))
+        if folded not in out:
+            out.append(folded)
+    return out
+
+
+def _project_code(ck: tuple[str, ...], grants=()) -> str | None:
+    """The :data:`PROJECT_CODE_DIRS` folder *ck* lies in (or is) or the
+    :data:`PROJECT_CODE_FILES` file it is (as named in *ck*), or None.
+    Compared case-folded (:func:`_fold_name`). Only the names below the
+    longest of the granted folders (*grants*, keys) *ck* lies in count: a
+    root the user chose inside such a folder (a Claude Code worktree in
+    ``.claude/worktrees``) is the user's to grant."""
+    import fnmatch
+
+    dirs = {d.casefold() for d in PROJECT_CODE_DIRS}
+    start = max((len(g) for g in grants if ck[:len(g)] == g), default=0)
+    for part in ck[start:]:
+        if _fold_name(part) in dirs:
+            return part
+    if len(ck) > start:
+        last = _fold_name(ck[-1])
+        if any(fnmatch.fnmatchcase(last, pattern.casefold()) for pattern in PROJECT_CODE_FILES):
+            return ck[-1]
+    return None
+
+
+def _project_message(path: str, name: str) -> str:
+    return (f"{path}: the agent does not change {name}: other programs run code from a "
+            "project's tool settings (.claude, .vscode, .cursor, .idea, .zed, "
+            ".devcontainer, .husky and the like, .mcp.json, .pre-commit-config.yaml, "
+            "lefthook.yml) when the project is opened, a session starts in it or the "
+            "user commits")
+
+
+def _git_value(raw: str) -> str:
+    """A Git config value as Git reads it: quotes removed, escapes resolved,
+    a comment (``#`` or ``;`` outside quotes) cut off."""
+    out: list[str] = []
+    quoted = False
+    i = 0
+    while i < len(raw):
+        char = raw[i]
+        if char == "\\" and i + 1 < len(raw):
+            out.append({"n": "\n", "t": "\t", "b": "\b"}.get(raw[i + 1], raw[i + 1]))
+            i += 2
+            continue
+        if char == '"':
+            quoted = not quoted
+        elif char in "#;" and not quoted:
+            break
+        else:
+            out.append(char)
+        i += 1
+    return "".join(out).strip()
+
+
+_GIT_SECTION = None
+
+
+def _git_config_read(path: str) -> list[tuple[str, str, str]]:
+    """``(section, key, value)`` of the Git config file *path* (section and
+    key lower-case, a subsection dropped; :data:`MAX_GIT_CONFIG_BYTES` at
+    most); empty when it cannot be read."""
+    import re
+
+    global _GIT_SECTION
+    if _GIT_SECTION is None:
+        _GIT_SECTION = re.compile(r'\[\s*([A-Za-z0-9.-]+)(?:\s+"(?:[^"\\\n]|\\.)*")?\s*\]')
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read(MAX_GIT_CONFIG_BYTES)
+    except (OSError, ValueError):
+        return []
+    text = data.decode("utf-8", "replace").replace("\\\r\n", "").replace("\\\n", "")
+    out: list[tuple[str, str, str]] = []
+    section = ""
+    for line in text.splitlines():
+        rest = line.strip()
+        match = _GIT_SECTION.match(rest)
+        if match:
+            section = match.group(1).casefold()
+            rest = rest[match.end():].strip()
+        if not rest or rest[0] in "#;":
+            continue
+        key, eq, raw = rest.partition("=")
+        key = key.strip().casefold()
+        if key:
+            out.append((section, key, _git_value(raw) if eq else "true"))
+    return out
+
+
+def _git_config_path(value: str, base: str, home: str) -> str | None:
+    """A path value of a Git config (``core.hooksPath``, ``include.path``)
+    as Git takes it: ``~/`` is the home folder, a relative one lies in
+    *base*."""
+    if not value:
+        return None
+    if value == "~" or value.startswith("~/"):
+        value = home + value[1:]
+    elif value.startswith("~"):
+        value = os.path.expanduser(value)
+        if value.startswith("~"):
+            return None
+    return os.path.normpath(os.path.join(base, value))
+
+
+def _git_config_values(files: list[str], home: str) -> tuple[list[str], list[str]]:
+    """``(core.hooksPath values, config files read)`` of the Git configs
+    *files* and the files they include (``include.path``,
+    ``includeIf.*.path`` - every condition taken as met), at most
+    :data:`MAX_GIT_CONFIGS` files :data:`MAX_GIT_INCLUDE_DEPTH` deep. A
+    value is as written; each comes with nothing about its file (a relative
+    hooksPath lies in the work tree whichever file sets it)."""
+    hooks: list[str] = []
+    read: list[str] = []
+    queue = [(path, 0) for path in files]
+    while queue and len(read) < MAX_GIT_CONFIGS:
+        path, depth = queue.pop(0)
+        if path in read:
+            continue
+        read.append(path)
+        for section, key, value in _git_config_read(path):
+            if section == "core" and key == "hookspath" and value:
+                hooks.append(value)
+            elif section in ("include", "includeif") and key == "path" and \
+                    depth < MAX_GIT_INCLUDE_DEPTH:
+                included = _git_config_path(value, os.path.dirname(path), home)
+                if included is not None:
+                    queue.append((included, depth + 1))
+    return hooks, read
+
+
+def _git_global_configs(environ, home: str) -> list[str]:
+    """Git's global and system config files for *environ*."""
+    files: list[str] = []
+    if environ.get("GIT_CONFIG_SYSTEM"):
+        files.append(environ["GIT_CONFIG_SYSTEM"])
+    elif not environ.get("GIT_CONFIG_NOSYSTEM"):
+        files.append(GIT_SYSTEM_CONFIG)
+    if environ.get("GIT_CONFIG_GLOBAL"):
+        files.append(environ["GIT_CONFIG_GLOBAL"])
+    else:
+        xdg = environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
+        files += [os.path.join(home, GIT_GLOBAL_CONFIGS[0]), os.path.join(xdg, "git", "config")]
+    return files
+
+
+def _git_env_hooks(environ) -> list[str]:
+    """``core.hooksPath`` set through ``GIT_CONFIG_COUNT`` / ``GIT_CONFIG_KEY_<n>`` /
+    ``GIT_CONFIG_VALUE_<n>``."""
+    try:
+        count = min(int(environ.get("GIT_CONFIG_COUNT") or 0), 1024)
+    except ValueError:
+        return []
+    return [environ.get(f"GIT_CONFIG_VALUE_{n}", "") for n in range(count)
+            if environ.get(f"GIT_CONFIG_KEY_{n}", "").casefold() == "core.hookspath"
+            and environ.get(f"GIT_CONFIG_VALUE_{n}")]
+
+
+def _repo_git_dirs(root: str) -> list[str]:
+    """The Git folders of the work tree *root*: its ``.git`` folder, or the
+    one a ``gitdir:`` file names, and the folder that one's ``commondir``
+    names (a worktree's or submodule's repository)."""
+    git = os.path.join(root, GIT_DIR)
+    if os.path.isdir(git):
+        git_dir = git
+    else:
+        try:
+            with open(git, "rb") as fh:
+                line = fh.read(4096).decode("utf-8", "replace").splitlines()[0]
+        except (OSError, ValueError, IndexError):
+            return []
+        if not line.startswith("gitdir:"):
+            return []
+        git_dir = os.path.normpath(os.path.join(root, line[len("gitdir:"):].strip()))
+    out = [git_dir]
+    try:
+        with open(os.path.join(git_dir, "commondir"), "rb") as fh:
+            common = fh.read(4096).decode("utf-8", "replace").strip()
+    except (OSError, ValueError):
+        common = ""
+    if common:
+        out.append(os.path.normpath(os.path.join(git_dir, common)))
+    return out
+
+
+def git_hook_places(root: str, environ=os.environ, *, global_hooks=None) -> list[str]:
+    """The folders Git runs hooks from for the work tree *root*, besides its
+    ``.git/hooks`` (``core.hooksPath`` of its own config - ``.githooks``,
+    husky's ``.husky/_`` - or of the global and system configs and
+    ``GIT_CONFIG_*``), and the files its config includes
+    (``include.path = ../.gitconfig``: a file of the work tree that is read
+    as Git's settings). Empty when *root* holds no ``.git`` entry.
+    *global_hooks*: the global hooksPath values when already read."""
+    if not os.path.lexists(os.path.join(root, GIT_DIR)):
+        return []
+    home = environ.get("HOME") or os.path.expanduser("~")
+    files: list[str] = []
+    for git_dir in _repo_git_dirs(root):
+        files += [os.path.join(git_dir, "config"), os.path.join(git_dir, "config.worktree")]
+    hooks, read = _git_config_values(files, home)
+    if global_hooks is None:
+        global_hooks = _git_config_values(_git_global_configs(environ, home), home)[0] \
+            + _git_env_hooks(environ)
+    out: list[str] = []
+    for value in hooks + list(global_hooks):
+        path = _git_config_path(value, root, home)
+        if path is not None and path not in out:
+            out.append(path)
+    # The included files (the repository's own config files are Git
+    # folders' and refused anyway).
+    for path in read[len(files):]:
+        if path not in out:
+            out.append(path)
+    return out
+
+
+def project_code_entries(folder: str, environ=os.environ) -> list[str]:
+    """The entries of *folder* other programs run code from that exist
+    (:data:`PROJECT_CODE_DIRS`, :data:`PROJECT_CODE_FILES`) and the existing
+    hook folders and included config files of the repository it is
+    (:func:`git_hook_places`) - for core.agent_sandbox, which mounts them
+    read-only."""
+    out: list[str] = []
+    try:
+        with os.scandir(folder) as it:
+            names = [entry.name for entry in it]
+    except OSError:
+        names = []
+    for name in sorted(names)[:MAX_HIDDEN_ENTRIES]:
+        if _project_code((name,)) is not None:
+            out.append(os.path.join(folder, name))
+    for path in git_hook_places(folder, environ):
+        if os.path.lexists(path) and path not in out:
+            out.append(path)
+    return out
+
+
+def _link_target_denials(environ, areas, home_keys) -> list[tuple[tuple[str, ...], tuple[str, ...]]]:
+    """``(key of a link's target, key of the link)`` for the symlinks in the
+    default-deny areas (:func:`_area_links`): writing the target changes
+    what the link's place holds."""
+    out = []
+    for link, target in _area_links(environ):
+        lk, tk = _key(link), _key(target)
+        if not tk or _home_or_above(tk, home_keys) or not _denials(lk, areas):
+            continue
+        if (tk, lk) not in out:
+            out.append((tk, lk))
+    return out
+
+
+def deny_link_targets(environ=os.environ, *, granted=()) -> list[str]:
+    """The resolved targets of the symlinks in the default-deny places
+    (``~/.config/kitty -> ~/dotfiles/kitty``) that no *granted* folder lifts,
+    for core.agent_sandbox: read-only there as well. Never a home folder or
+    a folder above one."""
+    areas = _deny_areas(environ)
+    grants = _granted_keys(granted)
+    home_keys = [_key(h) for h in homes(environ)]
+    out: list[str] = []
+    for link, target in _area_links(environ):
+        lk, tk = _key(link), _key(target)
+        if (not tk or _home_or_above(tk, home_keys) or not _denials(lk, areas)
+                or not _denied(lk, areas, grants)):
+            continue
+        if target not in out:
+            out.append(target)
+    return out
+
+
+def write_checker(environ=os.environ, *, granted=(), members: bool = False):
+    """:func:`refusal` with the places resolved once - for the many paths of
+    one tool call (an archive's members); a new one per call. *members*:
+    the paths are an archive's members, and one named ``HEAD`` (at any
+    depth) is refused as well - with a config, hooks, objects and refs from
+    the same archive it makes a folder Git runs code from."""
+    places = [(_key(place), place) for place in _all_places(environ)]
+    areas = _deny_areas(environ)
+    grants = _granted_keys(granted)
+    home_keys = [_key(h) for h in homes(environ)]
+    targets = _link_target_denials(environ, areas, home_keys)
+    readlink = _memo_readlink()
+    home = environ.get("HOME") or os.path.expanduser("~")
+    global_hooks = _git_config_values(_git_global_configs(environ, home), home)[0] \
+        + _git_env_hooks(environ)
+    # Absolute global hooksPath folders count for every path; a relative
+    # one in each work tree (git_hook_places).
+    global_keys: list[tuple[str, ...]] = []
+    for value in global_hooks:
+        hook_path = _git_config_path(value, os.sep, home)
+        if hook_path is not None and (value.startswith("~") or os.path.isabs(value)):
+            global_keys += _folded_keys(hook_path)
+    repo_memo: dict[str, list[tuple[str, ...]]] = {}
+    try:
+        from axross_markdown._ax.core.mcp_script_pin import write_guard  # files host-run MCP servers run
+    except ImportError:
+        # A program exported without axross's MCP servers (axross-markdown)
+        # starts none; axross itself still refuses to start a server whose
+        # pinned files changed since the user confirmed them.
+        mcp_files = None
+    else:
+        mcp_files = write_guard(environ)
+
+    def repo_keys(folder: str) -> list[tuple[str, ...]]:
+        keys = repo_memo.get(folder)
+        if keys is None:
+            keys = []
+            for hook_path in git_hook_places(folder, environ, global_hooks=global_hooks):
+                keys += _folded_keys(hook_path)
+            repo_memo[folder] = keys
+        return keys
+
+    def hook_place(candidate: str, ck: tuple[str, ...]) -> bool:
+        fk = tuple(_fold_name(part) for part in ck)
+        if any(fk[:len(k)] == k for k in global_keys):
+            return True
+        folder = os.path.dirname(candidate)
+        for _ in range(256):
+            if any(fk[:len(k)] == k for k in repo_keys(folder)):
+                return True
+            parent = os.path.dirname(folder)
+            if parent == folder:
+                break
+            folder = parent
+        return False
+
+    def check(path: str, *, entry: bool = False) -> str | None:
+        # Looked up afresh for every path: an archive's members are made
+        # one after the other, and what the last one made (a HEAD, an
+        # objects entry) decides whether the next one is Git's code.
+        shape_memo: dict = {}
+        absolute = os.path.abspath(path)
+        if members and _fold_name(os.path.basename(absolute)) == _fold_name("HEAD"):
+            return (f"{path}: the agent does not extract a file named HEAD: with a config "
+                    "or hooks beside it Git takes the folder for a repository and runs "
+                    "code from it")
+        candidates = list(_link_chain(absolute, readlink))
+        parent_real = os.path.join(os.path.realpath(os.path.dirname(absolute)),
+                                   os.path.basename(absolute))
+        if parent_real not in candidates:
+            candidates.append(parent_real)
+        for candidate in candidates:
+            if _start_name(os.path.basename(candidate)):
+                return (f"{path}: the agent does not write Python start files "
+                        f"({', '.join(START_NAMES)}): Python runs them at every start")
+        keyed = [(_key(c), c) for c in candidates]
+        for candidate in candidates if mcp_files is not None else ():
+            refused = mcp_files(candidate, entry)
+            if refused:
+                return refused.replace(candidate, path, 1)
+        for pk, place in places:
+            for ck, _c in keyed:
+                if ck[:len(pk)] == pk:
+                    return (f"{path}: the agent does not change {place} (it could run code "
+                            "or widen its own rights from there)")
+                if entry and len(ck) < len(pk) and pk[:len(ck)] == ck:
+                    return f"{path} holds {place}, which the agent does not change"
+        for ck, candidate in keyed:
+            if _git_code(ck, candidate, shape_memo):
+                return _git_message(path)
+            project = _project_code(ck, grants)
+            if project is not None:
+                return _project_message(path, project)
+            if hook_place(candidate, ck):
+                return (f"{path}: the agent does not change Git hooks or the settings Git "
+                        "reads: the folder core.hooksPath names (.githooks, .husky/_) and "
+                        "the files a repository's config includes - the next git commit "
+                        "or checkout runs code from them")
+            if _system_secret(ck):
+                return (f"{path}: the agent does not change a process's memory, environment "
+                        "or open files below /proc, nor /run/secrets")
+            if TRASH_NAME in ck:
+                return (f"{path}: the agent does not change axross's trash ({TRASH_NAME}): "
+                        "what is restored from it is put back with axross's rights")
+            if _denied(ck, areas, grants):
+                return (f"{path}: the agent does not change hidden entries of the home "
+                        "folder or entries of the settings and data folders (~/.config, "
+                        "~/.local/share, ~/.local/state, ~/snap, ~/Library, %APPDATA%) "
+                        "unless that folder is granted to it: programs run code from many "
+                        "of them")
+            for tk, lk in targets:
+                if (ck[:len(tk)] == tk and _denied(lk, areas, grants)
+                        and not any(ck[:len(g)] == g and len(g) >= len(tk) for g in grants)):
+                    return (f"{path}: the agent does not change "
+                            f"{os.sep + os.sep.join(tk) if os.name == 'posix' else tk}: "
+                            "a symlink in a hidden folder of the home or a settings folder "
+                            "points there (a program reads it as its settings)")
+        return None
+
+    return check
+
+
+def refusal(path: str, *, entry: bool = False, environ=os.environ,
+            granted=()) -> str | None:
+    """Why *path* must not be changed, or None. *entry*: the path's entry
+    is created, removed or moved, so a folder that holds a protected place
+    is refused too (deleting or replacing ~/.config takes ~/.config/autostart).
+    A Python start file (:data:`START_NAMES`), a Git file that runs code
+    (:data:`GIT_CODE_NAMES`) and axross's trash are refused wherever they
+    are. Default-deny (:data:`DENY_ALL_BELOW`): a hidden entry of a home
+    folder and every entry of its settings and data folders are refused
+    unless they lie in a *granted* folder (the MCP root, the agent's
+    folders) that is itself in such a place. Each name the path goes by
+    counts - as typed, after each symlink on the way, resolved - and the
+    target of a symlink in those places counts as the place."""
+    return write_checker(environ, granted=granted)(path, entry=entry)
+
+
+# -- the read side: secrets --------------------------------------------------------------
+#
+# Read, these turn "read my files" into the user's accounts: axross's OAuth
+# refresh tokens (Google Drive, OneDrive, Dropbox), its MCP HTTP token, its
+# chat accounts' encryption keys and sync tokens, Bluetooth link keys, the
+# ADB key it made, the key of its extension code cache, and the SSH and
+# GnuPG private keys. core.mcp_server refuses to hand their contents to a
+# tool (read_file, grep, checksum, preview, copies, the groups' readers)
+# unless the operator opts in.
+
+#: Folders whose every file is secret (relative to the home folder).
+SECRET_DIRS = (".local/state/axross/chat", ".gnupg/private-keys-v1.d",
+               ".gnupg/openpgp-revocs.d",
+               # the desktop's keyrings (GNOME Keyring, KWallet)
+               ".local/share/keyrings", ".local/share/kwalletd",
+               # axross's trash: a trashed key is still a key (core.trash)
+               ".axross-trash",
+               # other programs' credential stores: cloud and cluster CLIs,
+               # password managers, messengers
+               ".aws", ".azure", ".kube", ".config/gh", ".config/gcloud", ".config/rclone",
+               ".terraform.d", ".password-store", ".config/op", ".config/Signal",
+               ".config/sops", ".config/age",
+               # browser and mail profiles: saved passwords, cookies, session keys
+               ".mozilla", ".thunderbird", ".icedove", ".config/google-chrome",
+               ".config/google-chrome-beta", ".config/google-chrome-unstable",
+               ".config/chromium", ".config/BraveSoftware", ".config/microsoft-edge",
+               ".config/vivaldi", ".config/opera", ".var/app/org.mozilla.firefox",
+               ".var/app/com.google.Chrome", ".var/app/org.chromium.Chromium",
+               ".var/app/com.brave.Browser", ".snap/firefox", ".snap/chromium",
+               # snap packages keep their profiles below ~/snap (Ubuntu's Firefox)
+               "snap/firefox", "snap/chromium", "snap/thunderbird", "snap/brave",
+               "snap/telegram-desktop", "snap/discord", "snap/signal-desktop", "snap/slack",
+               # messengers' sessions (an account taken over)
+               ".local/share/TelegramDesktop", ".var/app/org.telegram.desktop",
+               ".config/discord", ".config/discordcanary", ".config/discordptb",
+               ".var/app/com.discordapp.Discord", ".config/Element", ".config/Element-Nightly",
+               ".var/app/im.riot.Riot", ".config/Slack", ".purple",
+               # more CLIs' tokens, saved connections and VPN keys
+               ".config/glab-cli", ".config/doctl", ".config/hcloud", ".fly",
+               ".config/ngrok", ".ngrok2", ".config/filezilla", ".filezilla",
+               ".config/remmina", ".local/share/remmina", ".wireguard")
+#: Secret files (relative to the home folder).
+SECRET_FILES = (".gnupg/secring.gpg", ".android/adbkey",
+                # the key that authenticates the extension code cache
+                ".config/axross/extension-code.key",
+                ".local/share/axross/bluetooth-direct-keys.json",
+                # passwords and tokens other programs keep in plain text
+                ".netrc", ".git-credentials", ".pypirc", ".npmrc", ".yarnrc", ".yarnrc.yml",
+                ".docker/config.json", ".cargo/credentials", ".cargo/credentials.toml",
+                ".vault-token", ".config/hub", ".claude/.credentials.json", ".pgpass",
+                ".my.cnf", ".s3cfg", ".boto", ".config/containers/auth.json",
+                ".local/share/fish/fish_history", ".terraformrc",
+                ".m2/settings.xml", ".m2/settings-security.xml", ".gradle/gradle.properties")
+#: macOS and Windows (relative to the home folder; every platform's count):
+#: the keychains, browser profiles, cookies.
+PLATFORM_SECRET_DIRS = (
+    "Library/Keychains", "Library/Cookies", "Library/Application Support/Google/Chrome",
+    "Library/Application Support/Chromium", "Library/Application Support/BraveSoftware",
+    "Library/Application Support/Microsoft Edge", "Library/Application Support/Firefox",
+    "Library/Thunderbird", "Library/Application Support/Signal",
+    "AppData/Local/Google/Chrome/User Data", "AppData/Local/Chromium/User Data",
+    "AppData/Local/BraveSoftware", "AppData/Local/Microsoft/Edge/User Data",
+    "AppData/Roaming/Mozilla", "AppData/Roaming/Thunderbird", "AppData/Roaming/Signal",
+    "AppData/Roaming/gcloud",
+)
+#: Names (case-folded) of files that are secret anywhere below a hidden
+#: entry of the home folder (``~/.foo/.../name``; also the hidden entry
+#: itself, with all it holds when it is a folder - ``~/.bash_history``,
+#: ``~/.secrets/``): credential and token files, private keys, password
+#: databases, shell and REPL histories (commands typed with tokens in them),
+#: cookie jars. Folders deeper down are not matched by name, nor are files
+#: of code (:data:`SECRET_CODE_SUFFIXES`: a Python under ``~/.pyenv`` has
+#: ``tokenize.py`` and ``secrets.py``, packages ``credentials.py``) or public
+#: keys (``id_ed25519.pub``).
+SECRET_HIDDEN_PATTERNS = ("*credential*", "*token*", "*secret*", "*.pem", "*.key",
+                          "*key*.json", "id_*", "*.kdbx", "*history*", "cookies*")
+SECRET_CODE_SUFFIXES = (".py", ".pyc", ".pyi", ".pyd", ".pyo", ".so", ".dll", ".dylib",
+                        ".js", ".mjs", ".cjs", ".ts", ".map", ".rb", ".go", ".rs", ".java",
+                        ".class", ".jar", ".h", ".hpp", ".c", ".cc", ".cpp", ".lua", ".pm",
+                        ".el", ".elc", ".vim", ".css", ".html", ".d")
+#: Folders the agent sandbox does not look into for those names (code and
+#: package caches: many files, no credentials) - by name anywhere, and by
+#: place below the home folder.
+SECRET_WALK_SKIP = ("site-packages", "dist-packages", "node_modules", "__pycache__", ".git",
+                    ".venv", "venv")
+SECRET_WALK_SKIP_PATHS = (".cargo/registry", ".cargo/git", ".rustup", ".npm/_cacache",
+                          ".gradle/caches", ".gradle/wrapper", ".m2/repository",
+                          ".pyenv/versions", ".nvm/versions", ".local/lib")
+#: Hidden entries of the home looked at last (big caches: they should not
+#: use up the walk before the folders that hold settings).
+SECRET_WALK_LAST = (".cache", ".var", ".local")
+#: Folders whose entries are walked (and covered) one by one, each with a
+#: budget of its own, like the hidden entries of the home: a big
+#: ``~/.local/share/Steam`` is covered, not all of ``~/.local``.
+SECRET_WALK_CONTAINERS = (".config", ".local", ".local/share", ".local/state", ".var",
+                          ".var/app", ".cache")
+#: Most entries the agent sandbox looks at for :data:`SECRET_HIDDEN_PATTERNS`
+#: (:func:`secret_hides`) below one hidden entry of the home, in all, and
+#: how deep. A hidden entry whose walk does not end in its budget is covered
+#: whole (the sandbox cannot tell what is in the rest of it).
+MAX_SECRET_WALK_ENTRY = 25_000
+MAX_SECRET_WALK = 200_000
+MAX_SECRET_DEPTH = 8
+#: Most files the agent sandbox covers for the patterns (a mount each).
+MAX_SECRET_PATTERN_HIDES = 1024
+#: ``(folder, patterns)``: the entries of *folder* whose name matches
+#: (core.connection_manager names a token file ``gdrive_token.<profile>-<hash>.json``,
+#: core.mcp_http's is ``mcp-http-<port>.token``; their temporary siblings too).
+SECRET_NAMES = ((".config/axross", ("*token*",)),)
+#: ``(folder, patterns)``: every entry of *folder* but those whose name
+#: matches - a private key in ~/.ssh may have any name.
+SECRET_UNLESS = ((".ssh", ("*.pub", "known_hosts", "known_hosts.old", "authorized_keys",
+                           "authorized_keys2", "config")),)
+
+
+#: Names (case-folded) of files that are secret wherever they are - in a
+#: project folder too: credential stores, private keys, Terraform state
+#: (it holds every resource's secrets), password databases, dotenv files
+#: (``.env``, ``.env.production``; not their ``.example`` and the like).
+SECRET_NAMES_ANYWHERE = (".git-credentials", ".netrc", "_netrc", ".pgpass", ".env", ".env.*",
+                         "*.env", ".envrc", "*.tfstate", "*.tfstate.backup", "*.kdbx", "*.kdb",
+                         "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "id_ecdsa_sk",
+                         "id_ed25519_sk", "id_rsa[._~-]*", "id_dsa[._~-]*", "id_ecdsa[._~-]*",
+                         "id_ed25519[._~-]*", "*.ppk", "*.p12", "*.pfx", ".npmrc", ".pypirc",
+                         ".htpasswd", ".htdigest", "kubeconfig", "*.kubeconfig",
+                         "kubeconfig.y*ml", "credentials.json", "client_secret*.json",
+                         "secrets.y*ml", "secrets.json", "*.secrets.y*ml",
+                         # MySQL's, Vault's, s3cmd's and boto's credential files
+                         ".my.cnf", ".mylogin.cnf", ".vault-token", ".s3cfg", ".boto",
+                         # OAuth and cloud credentials, Terraform's, Docker's old
+                         # one, Java and GnuPG key stores
+                         "token.json", "service-account*.json", "*service_account*.json",
+                         "credentials.tfrc.json", ".dockercfg", "*.jks", "*.keystore",
+                         "secring.gpg")
+#: Suffixes of a copy a person or an editor leaves (``.env~``,
+#: ``.netrc.bak``): taken off before a name is matched, as often as there
+#: are.
+SECRET_BACKUP_SUFFIXES = ("~", ".bak", ".old", ".orig", ".save", ".swp", ".swo", ".tmp",
+                          ".backup", ".copy")
+#: ``(folder, file)`` that is secret wherever it is (a project's copy of
+#: ``~/.aws/credentials``, ``~/.docker/config.json``, ``~/.kube/config``).
+SECRET_PATHS_ANYWHERE = ((".aws", "credentials"), (".docker", "config.json"),
+                         (".kube", "config"))
+SECRET_NAMES_ANYWHERE_UNLESS = ("*.example", "*.sample", "*.template", "*.dist", "*.defaults",
+                                "*.tpl", "*.pub")
+#: How much of a file :func:`_secret_content` looks at, and what makes it a
+#: secret there wherever it is: a PEM or OpenSSH private key (also inside a
+#: bundle or after OpenSSL's "Bag Attributes"), a PuTTY key, a KeePass
+#: database (KeePass 1 and KDBX signatures).
+SECRET_CONTENT_HEAD = 4096
+#: How far :func:`_secret_content` looks for a PEM private key: a
+#: certificate bundle (haproxy's cert + chain + key, a fullchain with the
+#: key last) has it after several KiB.
+SECRET_CONTENT_SCAN = 1024 * 1024
+_SECRET_CONTENT = None
+_KEEPASS_MAGIC = (b"\x03\xd9\xa2\x9a\x67\xfb\x4b\xb5", b"\x03\xd9\xa2\x9a\x65\xfb\x4b\xb5",
+                  b"\x03\xd9\xa2\x9a\x66\xfb\x4b\xb5")
+
+
+def _without_backup_suffix(name: str) -> str:
+    """*name* without the backup suffixes of :data:`SECRET_BACKUP_SUFFIXES`."""
+    folded = name
+    changed = True
+    while changed and folded:
+        changed = False
+        for suffix in SECRET_BACKUP_SUFFIXES:
+            if len(folded) > len(suffix) and folded.casefold().endswith(suffix):
+                folded = folded[: -len(suffix)]
+                changed = True
+    # vim's swap file of .env is .env.swp, of foo it is .foo.swp
+    return folded
+
+
+def _secret_anywhere(name: str) -> bool:
+    """Whether a file is secret by its name wherever it is
+    (:data:`SECRET_NAMES_ANYWHERE`) - its backup copies too."""
+    for candidate in dict.fromkeys((name, _without_backup_suffix(name))):
+        if (_secret_name(candidate, SECRET_NAMES_ANYWHERE)
+                and not _secret_name(candidate, SECRET_NAMES_ANYWHERE_UNLESS)):
+            return True
+    return False
+
+
+#: Folders whose files are secret on any machine (a remote one too): every
+#: file but these names.
+REMOTE_SECRET_FOLDERS = {
+    ".ssh": ("*.pub", "known_hosts", "known_hosts.old", "authorized_keys", "authorized_keys2",
+             "config"),
+    ".gnupg": ("*.conf", "pubring.kbx", "pubring.gpg", "trustdb.gpg"),
+}
+
+
+def remote_secret_refusal(path: str) -> str | None:
+    """Why *path* on a remote machine is a secret by its name, or None: the
+    names secret anywhere (and their backup copies), the folder/file pairs
+    of :data:`SECRET_PATHS_ANYWHERE`, and the files of ``.ssh`` and
+    ``.gnupg`` (:data:`REMOTE_SECRET_FOLDERS`). The local rules that need
+    the home folder or the file's content cannot be applied there."""
+    import fnmatch
+
+    parts = tuple(p for p in path.replace("\\", "/").split("/") if p and p != ".")
+    if not parts:
+        return None
+    name = parts[-1]
+    secret = _secret_anywhere(name) or _secret_path_anywhere(parts)
+    for folder, allowed in REMOTE_SECRET_FOLDERS.items():
+        if len(parts) >= 2 and folder in (p.casefold() for p in parts[:-1]):
+            if not any(fnmatch.fnmatchcase(name.casefold(), pat) for pat in allowed):
+                secret = True
+    if not secret:
+        return None
+    return (f"{path}: the MCP server does not read this secret file on a remote either "
+            "(--mcp-allow-secret-reads hands secrets out)")
+
+
+def _secret_path_anywhere(ck: tuple[str, ...]) -> bool:
+    """Whether *ck* ends in one of :data:`SECRET_PATHS_ANYWHERE`."""
+    if len(ck) < 2:
+        return False
+    tail = (ck[-2].casefold(), ck[-1].casefold())
+    return any(tail == (folder, name) for folder, name in SECRET_PATHS_ANYWHERE)
+
+
+def _secret_pattern():
+    global _SECRET_CONTENT
+    import re
+
+    if _SECRET_CONTENT is None:
+        # Any characters of one line around "PRIVATE KEY" (a no-break space
+        # in the header does not hide the key below it); bounded, so the
+        # search stays linear.
+        # A PuTTY key's first line anywhere, not only at a line start: inside
+        # an uncompressed tar or zip, or after other text on its line, it was
+        # handed out (round-3 review).
+        # PEM and OpenSSH (five dashes), ssh.com / Tectia (four dashes and
+        # a space: PuTTYgen's "Export ssh.com key"), spaced or not, in any
+        # case; a PuTTY key; an age identity (its 58 Bech32 characters).
+        _SECRET_CONTENT = re.compile(
+            _BEGIN_LINE
+            + rb"|PuTTY-User-Key-File-[0-9]{1,2}:"
+            + rb"|AGE-SECRET-KEY-1[02-9AC-HJ-NP-Z]{58}",
+            re.IGNORECASE)
+    return _SECRET_CONTENT
+
+
+#: A key's BEGIN / END line: four or five dashes, a space or not.
+_BEGIN_LINE = rb"-{4,5} ?BEGIN[^\r\n]{1,60}?PRIVATE KEY[^\r\n]{0,20}?-{4,5}"
+_END_LINE = rb"-{4,5} ?END[^\r\n]{1,60}?PRIVATE KEY[^\r\n]{0,20}?-{4,5}"
+
+_MARKER_WORDS = ("PRIVATE KEY", "PuTTY-User-Key-File-", "AGE-SECRET-KEY-1")
+#: The markers in UTF-16 and UTF-32 (a key saved by a Windows editor), in
+#: their usual case, upper and lower case: such a window is also looked at
+#: as text.
+_WIDE_CODECS = ("utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be")
+_WIDE_MARKERS = tuple(
+    {variant.encode(codec)
+     for marker in _MARKER_WORDS
+     for variant in (marker, marker.upper(), marker.lower())
+     for codec in _WIDE_CODECS})
+_PLAIN_MARKER = None
+
+
+def _marked(data: bytes) -> bool:
+    """Whether *data* has one of the markers - plain in any case, or wide -
+    at all (the cheap test before the patterns)."""
+    global _PLAIN_MARKER
+    import re
+
+    if _PLAIN_MARKER is None:
+        _PLAIN_MARKER = re.compile(
+            b"|".join(re.escape(m.encode()) for m in _MARKER_WORDS), re.IGNORECASE)
+    return (_PLAIN_MARKER.search(data) is not None
+            or any(marker in data for marker in _WIDE_MARKERS))
+
+
+def _as_text_variants(data: bytes):
+    """*data* itself and, when it has a wide marker, its UTF-16 and UTF-32
+    readings (both byte orders, every alignment) as UTF-8."""
+    yield data
+    if not any(marker in data for marker in _WIDE_MARKERS):
+        return
+    for codec in _WIDE_CODECS:
+        width = 4 if "32" in codec else 2
+        for start in range(width):
+            part = data[start:]
+            yield part[: len(part) // width * width].decode(codec, "ignore").encode(
+                "utf-8", "ignore")
+
+
+#: A key's end line: what a window of a file that starts inside the key
+#: still holds (its BEGIN line may lie before the window).
+_SECRET_END = None
+
+
+def secret_in_content(data: bytes) -> bool:
+    """Whether *data* - a window of a file being handed out - holds a
+    private key's BEGIN or END line, a PuTTY key or a KeePass signature.
+    :func:`read_refusal` looks at a file's first
+    :data:`SECRET_CONTENT_SCAN` bytes; a read beyond them (a read_file
+    offset) checks what it serves with this."""
+    global _SECRET_END
+    import re
+
+    if _SECRET_END is None:
+        _SECRET_END = re.compile(_END_LINE, re.IGNORECASE)
+    if data[:8] in _KEEPASS_MAGIC:
+        return True
+    if not _marked(data):
+        return False
+    return any(_secret_pattern().search(text) is not None
+               or _SECRET_END.search(text) is not None
+               for text in _as_text_variants(data))
+
+
+#: How far :func:`inside_key_block` walks back over base64 lines.
+KEY_BLOCK_WALK_LIMIT = 16 << 20
+
+
+def _base64_line(line: bytes) -> bool:
+    line = line.rstrip(b"\r")
+    return bool(line) and len(line) <= 128 and all(
+        c in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=" for c in line)
+
+
+def inside_key_block(fh, offset: int, limit: int = KEY_BLOCK_WALK_LIMIT) -> bool:
+    """Whether *offset* of the seekable *fh* lies inside a private key's
+    block whose BEGIN line is further back than any fixed margin (a PGP
+    key block of hundreds of KiB): the lines before *offset* are walked
+    back while they are base64 (and the armour's few ``Name: value``
+    lines); a BEGIN ... PRIVATE KEY line reached that way is True.
+    Anything else - text, a base64 blob that is no key - is False quickly
+    or at *limit* bytes."""
+    import re
+
+    begin = re.compile(_BEGIN_LINE, re.IGNORECASE)
+    pos = max(0, int(offset))
+    pending = b""  # the start of the line that continues past the chunk
+    walked = 0
+    headers = 0
+    first = True
+    while pos > 0 and walked < limit:
+        step = min(64 * 1024, pos)
+        pos -= step
+        fh.seek(pos)
+        chunk = fh.read(step)
+        walked += len(chunk)
+        lines = (chunk + pending).split(b"\n")
+        pending = lines[0] if pos > 0 else b""
+        body = lines[1:] if pos > 0 else lines
+        for line in reversed(body):
+            if first:
+                first = False
+                if not line or _base64_line(line):
+                    continue  # the line the window starts in
+                return bool(begin.search(line))
+            if _base64_line(line) or not line.strip(b"\r"):
+                continue
+            if begin.search(line):
+                return True
+            if b": " in line and len(line) < 200 and headers < 16:
+                headers += 1  # an armour header (Version: ...)
+                continue
+            return False
+    return bool(pending) and begin.search(pending) is not None
+
+
+class SecretScanningReader:
+    """A read handle that refuses (PermissionError) as soon as the bytes it
+    has handed out hold a private key's BEGIN or END line, a PuTTY key or
+    a KeePass signature - anywhere in the file, not only in the first MiB
+    :func:`read_refusal` looks at. The MCP server reads every local file
+    through it (encrypt, pack, copies to a remote, resources/read ...): a
+    key padded past 1 MiB was handed out inside an .axenc, an archive or a
+    remote copy. A window of the last bytes carries a marker split between
+    two reads."""
+
+    #: Bytes of the previous reads kept to find a marker split between two
+    #: reads: a BEGIN line, in UTF-16 too.
+    _KEEP = 512
+
+    def __init__(self, handle, path: str) -> None:
+        self._handle = handle
+        self._path = path
+        self._tail = b""
+        self._at_start = True
+
+    def _scan(self, data) -> None:
+        if not data:
+            return
+        chunk = bytes(data)
+        window = self._tail + chunk
+        hit = (self._at_start and chunk[:8] in _KEEPASS_MAGIC) or (
+            _marked(window) and secret_in_content(window))
+        self._at_start = False
+        self._tail = window[-self._KEEP:]
+        if hit:
+            raise PermissionError(
+                f"{self._path}: refused - the file holds a private key or a password "
+                "database (--mcp-allow-secret-reads hands secrets out)")
+
+    def read(self, *args):
+        data = self._handle.read(*args)
+        self._scan(data)
+        return data
+
+    def read1(self, *args):
+        data = self._handle.read1(*args)
+        self._scan(data)
+        return data
+
+    def readinto(self, buffer):
+        count = self._handle.readinto(buffer)
+        if count:
+            self._scan(memoryview(buffer)[:count])
+        return count
+
+    def readline(self, *args):
+        data = self._handle.readline(*args)
+        self._scan(data)
+        return data
+
+    def seek(self, *args):
+        # A jump: the window no longer continues the bytes before it.
+        self._tail = b""
+        return self._handle.seek(*args)
+
+    def __iter__(self):
+        while True:
+            line = self.readline()
+            if not line:
+                return
+            yield line
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self._handle.close()
+        return False
+
+    def __getattr__(self, name):
+        return getattr(self._handle, name)
+
+
+def _secret_content(path: str) -> bool:
+    """Whether the regular file *path* holds a private key or a password
+    database: a KeePass signature at its start, a PEM or OpenSSH private
+    key or a PuTTY key in its first :data:`SECRET_CONTENT_SCAN` bytes."""
+    _secret_pattern()
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+                     | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+    except OSError:
+        return False
+    try:
+        import stat as stat_module
+
+        if not stat_module.S_ISREG(os.fstat(fd).st_mode):
+            return False
+        head = os.read(fd, SECRET_CONTENT_HEAD)
+        if secret_in_content(head):
+            return True
+        # Further on, in chunks that overlap by more than a header's length
+        # (in UTF-16 too).
+        keep = SecretScanningReader._KEEP
+        done, tail = len(head), head[-keep:]
+        while len(head) and done < SECRET_CONTENT_SCAN:
+            head = os.read(fd, min(256 * 1024, SECRET_CONTENT_SCAN - done))
+            done += len(head)
+            chunk = tail + head
+            if _marked(chunk) and secret_in_content(b"\0" * 8 + chunk):
+                return True
+            tail = chunk[-keep:]
+        return False
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+#: ``/proc/<pid>/...`` entries that hand out a process's secrets: its
+#: environment (API keys, tokens), command line, memory and what it has
+#: open; ``/proc/self`` and ``/proc/thread-self`` whole.
+PROC_SECRET_NAMES = ("environ", "cmdline", "mem", "maps", "smaps", "smaps_rollup", "numa_maps",
+                     "pagemap", "auxv", "fd", "fdinfo", "map_files", "root", "cwd", "exe",
+                     "stack", "syscall", "io", "mountinfo", "mounts", "attr")
+#: Folders of the system whose every file is secret (container and
+#: orchestrator secrets).
+SYSTEM_SECRET_DIRS = ("/run/secrets", "/var/run/secrets")
+
+
+def _system_secret(ck: tuple[str, ...]) -> bool:
+    """Whether *ck* is a process's secrets below /proc or a system secrets
+    folder (:data:`PROC_SECRET_NAMES`, :data:`SYSTEM_SECRET_DIRS`)."""
+    if os.name != "posix":
+        return False
+    if len(ck) >= 2 and ck[0] == "proc":
+        if ck[1] in ("self", "thread-self"):
+            return True
+        if ck[1].isdigit() and any(part in PROC_SECRET_NAMES for part in ck[2:]):
+            return True
+    return any(ck[:len(k)] == k for k in (_key(d) for d in SYSTEM_SECRET_DIRS))
+
+
+def _secret_rules(environ) -> list[tuple[tuple[str, ...], str, tuple[str, ...]]]:
+    """``(key of a folder or file, kind, patterns)`` of every secret place:
+    kind "all" (the place and all below it), "names" (entries matching
+    *patterns*) or "unless" (entries not matching them)."""
+    rules: list[tuple[tuple[str, ...], str, tuple[str, ...]]] = []
+    real = _resolver()
+
+    def add(path: str, kind: str, patterns: tuple[str, ...] = ()) -> None:
+        for variant in (path, real(path)):
+            rule = (_key(variant), kind, patterns)
+            if rule not in rules:
+                rules.append(rule)
+
+    for home in homes(environ):
+        for rel in SECRET_DIRS + SECRET_FILES + PLATFORM_SECRET_DIRS:
+            add(os.path.join(home, *rel.split("/")), "all")
+        for rel, patterns in SECRET_NAMES:
+            add(os.path.join(home, *rel.split("/")), "names", patterns)
+        for rel, patterns in SECRET_UNLESS:
+            add(os.path.join(home, *rel.split("/")), "unless", patterns)
+        if _key(home):
+            add(home, "hidden-names", SECRET_HIDDEN_PATTERNS)
+    for var, rels in (("APPDATA", ("Mozilla", "Thunderbird", "Signal", "gcloud")),
+                      ("LOCALAPPDATA", ("Google/Chrome/User Data", "Chromium/User Data",
+                                        "BraveSoftware", "Microsoft/Edge/User Data"))):
+        value = environ.get(var, "")
+        if value and os.path.isabs(value):
+            for rel in rels:
+                add(_home_rel(value, rel), "all")
+    for prefix, base in _xdg_bases(environ):
+        for rel in SECRET_DIRS + SECRET_FILES:
+            if rel.startswith(prefix + "/"):
+                add(os.path.join(base, *rel[len(prefix) + 1:].split("/")), "all")
+    # Where XDG moves them: the Bluetooth keys, the MCP HTTP token.
+    data = environ.get("XDG_DATA_HOME", "")
+    if data and os.path.isabs(data):
+        add(os.path.join(data, "axross", "bluetooth-direct-keys.json"), "all")
+    runtime = environ.get("XDG_RUNTIME_DIR", "")
+    if runtime and os.path.isabs(runtime):
+        add(os.path.join(runtime, "axross"), "names", ("*token*",))
+    return rules
+
+
+def _secret_name(name: str, patterns: tuple[str, ...]) -> bool:
+    import fnmatch
+
+    folded = name.casefold()
+    return any(fnmatch.fnmatchcase(folded, p) for p in patterns)
+
+
+def _secret_file_name(name: str) -> bool:
+    """Whether a file below a hidden folder of the home is secret by its name."""
+    return (_secret_name(name, SECRET_HIDDEN_PATTERNS)
+            and not name.casefold().endswith(SECRET_CODE_SUFFIXES + (".pub",)))
+
+
+def _secret_match(ck: tuple[str, ...], rule) -> bool:
+    import fnmatch
+
+    base, kind, patterns = rule
+    if ck[:len(base)] != base:
+        return False
+    if kind == "all":
+        return True
+    if kind == "hidden-names":
+        below = ck[len(base):]
+        return (bool(below) and below[0].startswith(".")
+                and (_secret_file_name(below[0]) or _secret_file_name(below[-1])))
+    if len(ck) == len(base):
+        return False  # the folder itself: its names may be listed
+    name = ck[len(base)]
+    matched = any(fnmatch.fnmatchcase(name, p.casefold() if _case_insensitive() else p)
+                  for p in patterns)
+    return matched if kind == "names" else not matched
+
+
+def _secret_inodes(environ, rules) -> set[tuple[int, int]]:
+    """``(device, inode)`` of the secret files that exist (the files and
+    the files in the folders of the secret lists, a few levels deep, and the
+    entries of a folder whose every entry but some is secret): a hard link
+    elsewhere shares one. Bounded (4096 files)."""
+    import stat as stat_module
+
+    out: set[tuple[int, int]] = set()
+    budget = [4096]
+    real = _resolver()
+
+    def add_file(path: str) -> None:
+        try:
+            st = os.stat(path)
+        except OSError:
+            return
+        if stat_module.S_ISREG(st.st_mode):
+            out.add((st.st_dev, st.st_ino))
+
+    def walk(folder: str, depth: int) -> None:
+        for name, is_link, is_dir in _scan_dir(folder):
+            if budget[0] <= 0:
+                return
+            budget[0] -= 1
+            path = os.path.join(folder, name)
+            if is_dir:
+                if depth > 0:
+                    walk(path, depth - 1)
+            elif not is_link:
+                add_file(path)
+
+    for home in homes(environ):
+        for rel in SECRET_FILES:
+            add_file(_home_rel(home, rel))
+        for rel, patterns in SECRET_NAMES:
+            folder = real(_home_rel(home, rel))
+            for name, is_link, is_dir in _scan_dir(folder):
+                if not is_dir and not is_link and _secret_name(name, patterns):
+                    add_file(os.path.join(folder, name))
+        for rel in tuple(rel for rel, _p in SECRET_UNLESS) + SECRET_DIRS:
+            folder = real(_home_rel(home, rel))
+            if os.path.isdir(folder):
+                walk(folder, 3)
+    for prefix, base in _xdg_bases(environ):
+        for rel in SECRET_FILES:
+            if rel.startswith(prefix + "/"):
+                add_file(os.path.join(base, *rel[len(prefix) + 1:].split("/")))
+    return out
+
+
+def secret_checker(environ=os.environ, *, granted=()):
+    """:func:`read_refusal` with the secret places resolved once - for the
+    many paths of one tool call (grep, recursive_checksum); a new one per
+    call, so a place re-pointed later is seen by the next call. *granted*:
+    the folders the user gave the tools (the MCP root and extra folders):
+    one inside a hidden entry of the home or a settings folder lifts
+    default-deny for reads below it (:data:`READ_DENY_ALL_BELOW`); the
+    secret places stay secret in it."""
+    import stat as stat_module
+
+    rules = _secret_rules(environ)
+    areas = _deny_areas(environ)
+    for home in homes(environ):
+        for rel in READ_DENY_ALL_BELOW:
+            for variant in (_home_rel(home, rel), os.path.realpath(_home_rel(home, rel))):
+                item = (_key(variant), "all")
+                if item[0] and item not in areas:
+                    areas.append(item)
+    grants = _granted_keys(granted)
+    home_keys = [_key(h) for h in homes(environ)]
+    # The targets of the symlinks among the secret places (~/.ssh/id_ed25519
+    # -> ~/keys/id_ed25519) are secret where they are, too.
+    for link, target in _area_links(environ):
+        lk, tk = _key(link), _key(target)
+        if tk and not _home_or_above(tk, home_keys) and any(_secret_match(lk, r) for r in rules):
+            rule = (tk, "all", ())
+            if rule not in rules:
+                rules.append(rule)
+    readlink = _memo_readlink()
+    inodes: list[set[tuple[int, int]]] = []
+
+    def check(path: str, *, entry: bool = False) -> str | None:
+        # The contents are what the path resolves to; a symlink to a
+        # secret, or a folder linked into ~/.ssh, resolves into the place -
+        # and each name on the way counts (a link in ~/.ssh to a key elsewhere).
+        absolute = os.path.abspath(path)
+        chain = _link_chain(absolute, readlink)
+        keys = list(dict.fromkeys(_key(c) for c in chain))
+        for ck in keys:
+            if TRASH_NAME in ck:
+                return (f"{path}: the agent does not read axross's trash ({TRASH_NAME}): "
+                        "what was deleted there may be a key or token")
+        for rule in rules:
+            for ck in keys:
+                if _secret_match(ck, rule):
+                    return (f"{path}: the agent does not read this secret file (a token or "
+                            "private key: it would open the account or host it is for)")
+                if entry and len(ck) <= len(rule[0]) and rule[0][:len(ck)] == ck:
+                    return f"{path} holds secret files, which the agent does not read"
+        for ck in keys:
+            if _denied(ck, areas, grants):
+                return (f"{path}: the agent does not read hidden entries of the home folder "
+                        "or the settings, data and snap folders (~/.config, ~/.local, ~/snap, "
+                        "~/Library, %APPDATA%) unless that folder is granted to it (the MCP "
+                        "root or an extra folder there): many hold sessions, tokens and keys")
+            if _system_secret(ck):
+                return (f"{path}: the agent does not read a process's environment, command "
+                        "line, memory or open files below /proc, nor /run/secrets: they "
+                        "hold API keys and tokens")
+            if ck and (_secret_anywhere(ck[-1]) or _secret_path_anywhere(ck)):
+                return (f"{path}: the agent does not read this file: by its name it holds "
+                        "credentials, keys or secrets wherever it is (.env, *.env, .envrc, "
+                        ".netrc, .git-credentials, .pgpass, .npmrc, .pypirc, .htpasswd, "
+                        "*.tfstate, *.kdbx, id_rsa and its copies, *.ppk, *.p12, kubeconfig, "
+                        "credentials.json, secrets.yaml, .aws/credentials, "
+                        ".docker/config.json, .kube/config)")
+        try:
+            st = os.stat(chain[-1])
+        except OSError:
+            st = None
+        # A private key or password database by its contents, whatever
+        # its name (a project's deploy/id_rsa, a renamed key).
+        if st is not None and stat_module.S_ISREG(st.st_mode) and _secret_content(chain[-1]):
+            return (f"{path}: the agent does not read this file: it holds a private key or "
+                    "a password database (found by its contents)")
+        # A hard link shares a secret file's contents under another name.
+        if st is not None and stat_module.S_ISREG(st.st_mode) and st.st_nlink > 1:
+            if not inodes:
+                inodes.append(_secret_inodes(environ, rules))
+            if (st.st_dev, st.st_ino) in inodes[0]:
+                return (f"{path}: the agent does not read this file: it is a hard link to a "
+                        "secret file (a token or private key)")
+        return None
+
+    return check
+
+
+def read_refusal(path: str, *, entry: bool = False, environ=os.environ,
+                 granted=()) -> str | None:
+    """Why the contents of *path* must not be handed to a tool, or None.
+    *entry*: the path is copied or moved as a whole, so a folder that holds
+    a secret is refused too (copying ~/.ssh takes its keys along). Compared
+    like :func:`refusal` (components, case, each name on the way). Also
+    default-deny for reads (:data:`READ_DENY_ALL_BELOW`) unless *granted*."""
+    return secret_checker(environ, granted=granted)(path, entry=entry)
+
+
+def _pattern_secrets(home: str, within) -> list[tuple[str, bool]]:
+    """``(path, is_folder)`` of the existing entries below *home*'s hidden
+    entries whose name matches :data:`SECRET_HIDDEN_PATTERNS` (a matching
+    folder whole) - only below the folders in *within* (None: everywhere).
+    A bounded walk per hidden entry (:data:`MAX_SECRET_WALK_ENTRY` entries,
+    :data:`MAX_SECRET_WALK` in all, :data:`MAX_SECRET_DEPTH` deep, caches
+    last and package stores skipped); a hidden entry whose walk does not end
+    within that - or that holds more than :data:`MAX_SECRET_PATTERN_HIDES`
+    matches - is listed whole. Symlinks are not followed."""
+    import logging
+
+    found: list[tuple[str, bool]] = []
+    real_home = os.path.realpath(home)
+    try:
+        top = sorted(n for n in os.listdir(real_home) if n.startswith(".")
+                     and n not in (".", ".."))
+    except OSError:
+        return found
+    last = {n.casefold() for n in SECRET_WALK_LAST}
+    top.sort(key=lambda n: (n.casefold() in last, n))
+    skip_paths = {os.path.join(real_home, *rel.split("/")) for rel in SECRET_WALK_SKIP_PATHS}
+
+    def wanted(path: str) -> bool:
+        if within is None:
+            return True
+        return any(path == w or path.startswith(w.rstrip(os.sep) + os.sep)
+                   or w.startswith(path.rstrip(os.sep) + os.sep) for w in within)
+
+    containers = {os.path.join(real_home, *rel.split("/")) for rel in SECRET_WALK_CONTAINERS}
+    units: list[str] = []
+
+    def expand(path: str, depth: int) -> None:
+        if not wanted(path):
+            return
+        try:
+            if os.path.islink(path):
+                return
+            is_dir = os.path.isdir(path)
+        except OSError:
+            return
+        name = os.path.basename(path)
+        if depth == 0 and _secret_file_name(name):
+            found.append((path, is_dir))
+            return
+        if not is_dir:
+            if _secret_file_name(name):
+                found.append((path, False))
+            return
+        if path in containers:
+            try:
+                names = sorted(os.listdir(path))[:MAX_HIDDEN_ENTRIES]
+            except OSError:
+                return
+            for child in names:
+                expand(os.path.join(path, child), depth + 1)
+            return
+        units.append(path)
+
+    for name in top:
+        expand(os.path.join(real_home, name), 0)
+    total = MAX_SECRET_WALK
+    for entry in units:
+        budget = min(MAX_SECRET_WALK_ENTRY, total)
+        room = MAX_SECRET_PATTERN_HIDES - len(found)
+        mine: list[tuple[str, bool]] = []
+        stack = [(entry, 0)]
+        complete = True
+        while stack:
+            if budget <= 0 or len(mine) > room:
+                complete = False
+                break
+            path, depth = stack.pop()
+            budget -= 1
+            total -= 1
+            if path != entry and not wanted(path):
+                continue
+            try:
+                is_link = os.path.islink(path)
+                sub_dir = not is_link and os.path.isdir(path)
+            except OSError:
+                continue
+            if is_link:
+                continue
+            base = os.path.basename(path)
+            if path != entry and not sub_dir and _secret_file_name(base):
+                mine.append((path, False))
+                continue
+            if (sub_dir and depth < MAX_SECRET_DEPTH and base not in SECRET_WALK_SKIP
+                    and path not in skip_paths):
+                try:
+                    names = sorted(os.listdir(path))
+                except OSError:
+                    continue
+                stack.extend((os.path.join(path, n), depth + 1) for n in reversed(names))
+        if complete:
+            found.extend(mine)
+            continue
+        logging.getLogger(__name__).warning(
+            "secret files: %s holds more than the sandbox looks at (%d entries, %d found); "
+            "it is covered whole in the agent sandbox", entry,
+            MAX_SECRET_WALK_ENTRY if budget <= 0 else MAX_SECRET_WALK_ENTRY - budget, len(mine))
+        found.append((entry, True))
+    return found
+
+
+def secret_hides(environ=os.environ, *, within=None) -> list[tuple[str, bool]]:
+    """``(path, is_folder)`` of the existing secret places core.agent_sandbox
+    covers in the sandbox (an empty read-only folder, an empty file): every
+    secret folder and file, all of a folder whose private keys may have
+    any name (``~/.ssh``), and each matching entry of a folder with secret
+    names (axross's token files). Resolved, and never a symlink: a link
+    leads to its target, which is listed instead."""
+    import fnmatch
+
+    out: list[tuple[str, bool]] = []
+
+    def add(path: str) -> None:
+        real = os.path.realpath(path)
+        if not os.path.lexists(real) or os.path.islink(real):
+            return
+        item = (real, os.path.isdir(real))
+        if item not in out:
+            out.append(item)
+
+    def add_names(folder: str, patterns: tuple[str, ...]) -> None:
+        real = os.path.realpath(folder)
+        try:
+            names = sorted(os.listdir(real))[:4096]
+        except OSError:
+            return
+        for name in names:
+            key = name.casefold() if _case_insensitive() else name
+            if any(fnmatch.fnmatchcase(key, p) for p in patterns):
+                add(os.path.join(real, name))
+
+    for home in homes(environ):
+        for rel in SECRET_DIRS + SECRET_FILES + PLATFORM_SECRET_DIRS:
+            add(_home_rel(home, rel))
+        for rel, patterns in SECRET_NAMES:
+            add_names(_home_rel(home, rel), patterns)
+        for rel, _patterns in SECRET_UNLESS:
+            add(_home_rel(home, rel))
+    for prefix, base in _xdg_bases(environ):
+        for rel in SECRET_DIRS + SECRET_FILES:
+            if rel.startswith(prefix + "/"):
+                add(os.path.join(base, *rel[len(prefix) + 1:].split("/")))
+        if prefix == ".config":
+            add_names(os.path.join(base, "axross"), ("*token*",))
+    for var, rels in (("APPDATA", ("Mozilla", "Thunderbird", "Signal", "gcloud")),
+                      ("LOCALAPPDATA", ("Google/Chrome/User Data", "Chromium/User Data",
+                                        "BraveSoftware", "Microsoft/Edge/User Data"))):
+        value = environ.get(var, "")
+        if value and os.path.isabs(value):
+            for rel in rels:
+                add(_home_rel(value, rel))
+    # The targets of symlinks among the secret places (~/.ssh/id_ed25519 ->
+    # ~/keys/id_ed25519) hold the secret themselves.
+    rules = _secret_rules(environ)
+    home_keys = [_key(h) for h in homes(environ)]
+    for link, target in _area_links(environ):
+        tk = _key(target)
+        if tk and not _home_or_above(tk, home_keys) and any(
+                _secret_match(_key(link), rule) for rule in rules):
+            add(target)
+    covered = [path for path, _folder in out]
+    seen_homes: set[str] = set()
+    for home in homes(environ):
+        real_home = os.path.realpath(home)
+        if real_home in seen_homes or not _key(real_home):
+            continue
+        seen_homes.add(real_home)
+        for path, _folder in _pattern_secrets(home, within):
+            if not any(path == c or path.startswith(c.rstrip(os.sep) + os.sep) for c in covered):
+                add(path)
+    runtime = environ.get("XDG_RUNTIME_DIR", "")
+    if runtime and os.path.isabs(runtime):
+        add_names(os.path.join(runtime, "axross"), ("*token*",))
+    return out

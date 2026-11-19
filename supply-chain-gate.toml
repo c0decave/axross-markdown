@@ -1,0 +1,15 @@
+# axross's supply-chain gate (docs/SUPPLY_CHAIN_GATE.md in axross) on this
+# program's lock. The CI checks out axross's security/ folder and its
+# scanners' lock into .axross and runs
+#   python -I .axross/security/supply_chain_gate.py --config supply-chain-gate.toml check
+# Every pin must have a reviewed entry in axross's baseline: the lock is
+# axross's (build/requirements-standalone-markdown.txt), written here by
+# scripts/export_standalone.py markdown.
+root = "."
+locks = ["requirements.lock.txt"]
+scanner_lock = ".axross/build/requirements-scan-tools.txt"
+index_config = ["pyproject.toml", ".github/workflows/tests.yml"]
+baseline_dir = ".axross/security/supply_chain_baseline"
+cache_dir = ".supply-chain-cache"
+min_age_days = 14
+user_agent = "axross-markdown-supply-chain-gate/1"

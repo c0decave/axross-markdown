@@ -1,0 +1,477 @@
+"""Window handling shared by the image viewer and the media viewer.
+
+* A Maximize button in the title bar (a QDialog has none by default).
+* Ctrl+M toggles maximized <-> normal; F11 toggles fullscreen and comes
+  back to the state it left (maximized or normal), which Qt itself does
+  not do: ``showFullScreen`` drops the maximized bit.
+* A window manager that ignores a maximize request (sway and other tiling
+  managers: measured in sway 1.7, ``showMaximized`` changes nothing on a
+  floating window) gets the screen filled by axross itself after
+  :data:`WM_GRACE_MS`; restore puts the old geometry back.
+* The last normal geometry and whether the window was maximized are kept
+  per viewer in ``session.json`` under ``window.viewers.<name>`` — the
+  file the main window already keeps its own size and visual settings in
+  (``core.i18n.SETTINGS_FILE``). It is written when a viewer closes,
+  never on a resize, and merged so every other key in the file stays.
+* A remembered geometry is clamped to the available screen on restore, so
+  a window saved on a larger or detached monitor never opens off-screen.
+* :func:`show_independent` shows a viewer or editor (text, hex, image,
+  properties, checksum, ...) as a window of its own: non-modal, owned by
+  the main window, deleted when closed. ``QDialog.exec()`` made each of
+  them application-modal with a nested event loop, so an open hex window
+  froze the editor window and the main window until it closed.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from pathlib import Path
+
+from PyQt6 import sip
+from PyQt6.QtCore import QEvent, QObject, QRect, QSize, Qt, QTimer
+from PyQt6.QtGui import QGuiApplication, QKeySequence, QShortcut
+from PyQt6.QtWidgets import QWidget
+
+from axross_markdown._ax.core import i18n
+
+log = logging.getLogger("ui.viewer_window")
+
+MAXIMIZE_KEY = "Ctrl+M"
+FULLSCREEN_KEY = "F11"
+
+#: Key under ``window`` in session.json that holds one entry per viewer.
+VIEWERS_KEY = "viewers"
+
+#: Size a viewer opens at when nothing (valid) is remembered.
+DEFAULT_SIZES: dict[str, tuple[int, int]] = {
+    "image": (900, 680),
+    "markdown": (960, 720),
+    "media": (1000, 720),
+    "system_info": (1180, 800),
+}
+
+#: Dynamic property: was the window maximized when it went fullscreen?
+_MAXIMIZED_BEFORE_FULLSCREEN = "axrossMaximizedBeforeFullScreen"
+
+#: Dynamic property: the normal geometry of a window axross maximized
+#: itself because the window manager ignored the request.
+EMULATED_MAXIMIZE = "axrossEmulatedMaximize"
+#: How long a window manager gets to answer a maximize request before
+#: axross fills the screen itself.
+WM_GRACE_MS = 350
+#: Pixels a window that fills its screen may be off by: the frame and the
+#: border a window manager adds (sway 1.7: 4 x 2 px around 1920 x 1080).
+FILL_TOLERANCE_PX = 16
+
+
+def _fills(window: QWidget, avail: QRect) -> bool:
+    g = window.geometry()
+    return all(
+        abs(a - b) <= FILL_TOLERANCE_PX
+        for a, b in (
+            (g.x(), avail.x()),
+            (g.y(), avail.y()),
+            (g.width(), avail.width()),
+            (g.height(), avail.height()),
+        )
+    )
+
+
+# -- window state --------------------------------------------------------------
+
+
+def set_window_flag(window: QWidget, flag: Qt.WindowType, on: bool = True) -> None:
+    """Switch *flag* of the window *window* - cheaply before it is shown.
+
+    ``setWindowFlag`` reparents the widget: for one without its native
+    window yet, Qt treats that as a new parent and repolishes every child
+    under the application's style sheet - 10-20 ms for a dialog of 200
+    widgets, twice per dialog (Maximize, frameless title bar). A window
+    not created yet only needs the flags stored: they take effect when it
+    is first shown (Qt reads them then). A window already on screen still
+    goes through ``setWindowFlag`` (which hides it; the caller shows it
+    again)."""
+    flags = window.windowFlags()
+    wanted = flags | flag if on else flags & ~flag
+    if wanted == flags:
+        return
+    if window.isWindow() and not window.testAttribute(Qt.WidgetAttribute.WA_WState_Created):
+        window.overrideWindowFlags(wanted)
+        return
+    window.setWindowFlag(flag, on)
+
+
+def allow_maximize(window: QWidget) -> None:
+    """Give *window* a Maximize button in its title bar."""
+    set_window_flag(window, Qt.WindowType.WindowMaximizeButtonHint, True)
+
+
+def _emulated_geometry(window: QWidget) -> QRect | None:
+    """The saved normal geometry while axross keeps *window* filling its
+    screen; None otherwise. A window resized since (by hand, by the window
+    manager) is no longer maximized: the property is dropped."""
+    saved = window.property(EMULATED_MAXIMIZE)
+    if not isinstance(saved, QRect) or not saved.isValid():
+        return None
+    screen = window.screen()
+    if screen is None or not _fills(window, screen.availableGeometry()):
+        window.setProperty(EMULATED_MAXIMIZE, QRect())
+        return None
+    return saved
+
+
+def is_maximized(window: QWidget) -> bool:
+    """Maximized by the window manager, or by axross where it ignored the
+    request."""
+    return window.isMaximized() or _emulated_geometry(window) is not None
+
+
+def normal_geometry(window: QWidget) -> QRect:
+    """The geometry *window* returns to from maximized / fullscreen."""
+    saved = _emulated_geometry(window)
+    return QRect(saved) if saved is not None else window.normalGeometry()
+
+
+def _fill_screen_if_ignored(window: QWidget, normal: QRect) -> None:
+    """The window manager had its chance: when *window* is still not
+    maximized, fill the available screen and keep *normal* for restore."""
+    if not window.isVisible() or window.isMaximized() or window.isFullScreen():
+        return
+    screen = window.screen()
+    if screen is None:
+        return
+    avail = screen.availableGeometry()
+    if _fills(window, avail):
+        return
+    log.info(
+        "The window manager ignored Maximize for %r; filling the screen instead",
+        window.windowTitle(),
+    )
+    window.setProperty(EMULATED_MAXIMIZE, QRect(normal))
+    window.setGeometry(avail)
+
+
+def _request_maximized(window: QWidget) -> None:
+    normal = window.geometry()
+    window.showMaximized()
+
+    def check() -> None:
+        if sip.isdeleted(window):  # closed and deleted meanwhile
+            return
+        _fill_screen_if_ignored(window, normal)
+
+    QTimer.singleShot(WM_GRACE_MS, check)
+
+
+def toggle_maximized(window: QWidget) -> None:
+    """Maximized -> normal, normal -> maximized. In fullscreen, Ctrl+M asks
+    for a maximized window, so it leaves fullscreen into maximized."""
+    saved = _emulated_geometry(window)
+    if saved is not None and not window.isFullScreen():
+        window.setProperty(EMULATED_MAXIMIZE, QRect())
+        window.setGeometry(saved)
+        return
+    if window.isFullScreen() or not window.isMaximized():
+        _request_maximized(window)
+    else:
+        window.showNormal()
+
+
+def toggle_fullscreen(window: QWidget) -> None:
+    """Enter fullscreen, or leave it to the state it was entered from."""
+    if window.isFullScreen():
+        leave_fullscreen(window)
+        return
+    window.setProperty(_MAXIMIZED_BEFORE_FULLSCREEN, window.isMaximized())
+    window.showFullScreen()
+
+
+def leave_fullscreen(window: QWidget) -> None:
+    """Back to maximized or normal, whichever fullscreen was entered from."""
+    if not window.isFullScreen():
+        return
+    if _was_maximized_before_fullscreen(window):
+        window.showMaximized()
+    else:
+        window.showNormal()
+
+
+def _was_maximized_before_fullscreen(window: QWidget) -> bool:
+    return bool(window.property(_MAXIMIZED_BEFORE_FULLSCREEN))
+
+
+_MAXIMIZE_SHORTCUT = "axMaximizeShortcut"
+
+
+def maximize_shortcut(window: QWidget) -> QShortcut:
+    """The window's one Ctrl+M shortcut, created on the first call. The
+    close corner and the viewers both ask for it: two shortcuts on one key
+    make Qt report it ambiguous and fire neither."""
+    for existing in window.findChildren(QShortcut, _MAXIMIZE_SHORTCUT):
+        if existing.parent() is window:
+            return existing
+    sc = QShortcut(QKeySequence(MAXIMIZE_KEY), window)
+    sc.setObjectName(_MAXIMIZE_SHORTCUT)
+    sc.activated.connect(lambda: toggle_maximized(window))
+    return sc
+
+
+def install_window_keys(window: QWidget, *, fullscreen: bool) -> list[QShortcut]:
+    """Ctrl+M (and F11 when *fullscreen*) as window-wide shortcuts, so they
+    work whichever child has the focus."""
+    shortcuts = [maximize_shortcut(window)]
+    if fullscreen:
+        sc = QShortcut(QKeySequence(FULLSCREEN_KEY), window)
+        sc.activated.connect(lambda: toggle_fullscreen(window))
+        shortcuts.append(sc)
+    return shortcuts
+
+
+# -- persistence ---------------------------------------------------------------
+
+
+def _settings_path() -> Path:
+    # Looked up per call: tests and the window patch the module attribute.
+    return Path(i18n.SETTINGS_FILE)
+
+
+def _read_settings():
+    from axross_markdown._ax.ui.state_files import _read_json_file
+
+    return _read_json_file(_settings_path())
+
+
+def _valid_entry(entry) -> dict | None:
+    if not isinstance(entry, dict):
+        return None
+    values = {}
+    for key in ("x", "y", "width", "height"):
+        value = entry.get(key)
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        values[key] = value
+    if values["width"] <= 0 or values["height"] <= 0:
+        return None
+    values["maximized"] = entry.get("maximized") is True
+    return values
+
+
+def load_state(name: str) -> dict | None:
+    """The remembered state of viewer *name*, or ``None`` when there is
+    none or it is unusable (any failure costs the size, not the viewer)."""
+    try:
+        data = _read_settings()
+    except (OSError, ValueError):
+        return None
+    window = data.get("window") if isinstance(data, dict) else None
+    viewers = window.get(VIEWERS_KEY) if isinstance(window, dict) else None
+    if not isinstance(viewers, dict):
+        return None
+    return _valid_entry(viewers.get(name))
+
+
+def clamp_to_screen(rect: QRect, window: QWidget | None = None) -> QRect:
+    """*rect* shrunk to fit the available area of the screen it is on and
+    moved fully inside it. A rect on no screen goes to the window's screen,
+    else the primary one."""
+    screen = QGuiApplication.screenAt(rect.center())
+    if screen is None and window is not None:
+        screen = window.screen()
+    if screen is None:
+        screen = QGuiApplication.primaryScreen()
+    if screen is None:
+        return QRect(rect)
+    avail = screen.availableGeometry()
+    width = max(1, min(rect.width(), avail.width()))
+    height = max(1, min(rect.height(), avail.height()))
+    x = min(max(rect.x(), avail.left()), avail.left() + avail.width() - width)
+    y = min(max(rect.y(), avail.top()), avail.top() + avail.height() - height)
+    return QRect(x, y, width, height)
+
+
+def restore_window_state(window: QWidget, name: str) -> None:
+    """Size and place *window* as viewer *name* was last closed; call it
+    before the window is shown. Without a usable entry it gets the default
+    size and opens normal."""
+    state = load_state(name)
+    if state is None:
+        # Capped at the screen: System Information opened 1180x800 on a
+        # 1280x800 screen, its title bar and bottom edge off it.
+        from axross_markdown._ax.ui.screen_fit import fit_size
+
+        window.resize(fit_size(QSize(*DEFAULT_SIZES[name]), window))
+        return
+    rect = QRect(state["x"], state["y"], state["width"], state["height"])
+    normal = clamp_to_screen(rect, window)
+    window.setGeometry(normal)
+    if state["maximized"]:
+        window.setWindowState(window.windowState() | Qt.WindowState.WindowMaximized)
+        _FillOnceShown(window, normal)
+
+
+class _FillOnceShown(QObject):
+    """After the first Show: fill the screen if the window manager ignored
+    the maximized state the window was restored with."""
+
+    def __init__(self, window: QWidget, normal: QRect) -> None:
+        super().__init__(window)
+        self._window = window
+        self._normal = QRect(normal)
+        window.installEventFilter(self)
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802 - Qt override
+        if watched is self._window and event.type() == QEvent.Type.Show:
+            self._window.removeEventFilter(self)
+            window, normal = self._window, self._normal
+
+            def check() -> None:
+                if not sip.isdeleted(window):
+                    _fill_screen_if_ignored(window, normal)
+
+            QTimer.singleShot(WM_GRACE_MS, check)
+            self.deleteLater()
+        return False
+
+
+def save_window_state(window: QWidget, name: str) -> None:
+    """Remember *window*'s normal geometry and maximized state as viewer
+    *name*. Only a window that is on screen is saved: a viewer that closed
+    before it was shown (a failed load) must not overwrite what is kept."""
+    if not window.isVisible():
+        return
+    full = window.isFullScreen()
+    maximized = is_maximized(window) or (full and _was_maximized_before_fullscreen(window))
+    rect = normal_geometry(window) if (full or is_maximized(window)) else window.geometry()
+    if not rect.isValid():
+        rect = window.geometry()
+    entry = {
+        "x": rect.x(),
+        "y": rect.y(),
+        "width": rect.width(),
+        "height": rect.height(),
+        "maximized": maximized,
+    }
+    from axross_markdown._ax.ui.state_files import _write_private_text
+
+    # Same merge as MainWindow._save_session and i18n.store_language: keep
+    # whatever this function does not write itself.
+    from axross_markdown._ax.core.json_store import read_for_merge
+    from axross_markdown._ax.ui.state_files import MAX_UI_STATE_BYTES
+
+    try:
+        data = read_for_merge(_settings_path(), max_bytes=MAX_UI_STATE_BYTES)
+    except OSError as exc:
+        # Unreadable: writing would replace the layout, panes and settings.
+        log.warning("viewer window state not saved: %s", exc)
+        return
+    win = data.get("window")
+    if not isinstance(win, dict):
+        win = {}
+    viewers = win.get(VIEWERS_KEY)
+    if not isinstance(viewers, dict):
+        viewers = {}
+    viewers[name] = entry
+    win[VIEWERS_KEY] = viewers
+    data["window"] = win
+    try:
+        _write_private_text(_settings_path(), json.dumps(data, indent=2))
+    except OSError as exc:
+        log.warning("Could not save the %s viewer window state: %s", name, exc)
+
+
+# -- independent windows ---------------------------------------------------------
+
+#: Every window shown with show_independent that still exists.
+_INDEPENDENT: list[QWidget] = []
+
+
+def owner_window(widget: QWidget | None) -> QWidget | None:
+    """The outermost window *widget* lies in: the main window for a pane in
+    it and for a pane in a detached workspace window (whose parent is the
+    main window); *widget*'s own window when nothing is above it."""
+    top = widget.window() if widget is not None else None
+    while top is not None and top.parentWidget() is not None:
+        top = top.parentWidget().window()
+    return top
+
+
+def _forget(window: QWidget) -> None:
+    for index, other in enumerate(_INDEPENDENT):
+        if other is window:
+            del _INDEPENDENT[index]
+            return
+
+
+def show_independent(window: QWidget) -> QWidget:
+    """Show *window* - a viewer or editor dialog - as a window of its own:
+    non-modal (it blocks neither the main window nor any other viewer, and
+    the caller returns at once), deleted when it closes, raised. It stays
+    listed for :func:`close_independent_windows` until it is destroyed."""
+    window.setWindowModality(Qt.WindowModality.NonModal)
+    window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+    if not any(other is window for other in _INDEPENDENT):
+        _INDEPENDENT.append(window)
+        window.destroyed.connect(lambda _obj=None, w=window: _forget(w))
+    window.show()
+    window.raise_()
+    window.activateWindow()
+    return window
+
+
+def independent_windows(owner: QWidget | None = None) -> list[QWidget]:
+    """The windows shown with show_independent that still exist - all of
+    them, or those *owner* (a main window) owns."""
+    alive = [w for w in _INDEPENDENT if not sip.isdeleted(w)]
+    _INDEPENDENT[:] = alive
+    if owner is None:
+        return list(alive)
+    return [w for w in alive if owner_window(w.parentWidget()) is owner]
+
+
+def close_independent_windows(owner: QWidget) -> bool:
+    """Close every open window *owner* owns, each asking about its unsaved
+    changes as when closed by hand. False - and the rest stay open - as
+    soon as one is kept open."""
+    from axross_markdown._ax.ui.window_dock_bar import bar_for
+
+    bar = bar_for(owner)
+    docked = {id(w) for w in bar.windows()} if bar is not None else set()
+    for window in independent_windows(owner):
+        if sip.isdeleted(window):
+            continue
+        if id(window) in docked:
+            # Put into the dock bar with _ it is hidden, not closed: it may
+            # hold unsaved edits. Shown again, so its question is seen.
+            bar.restore(window)
+        elif not window.isVisible():
+            continue
+        if not window.close():
+            return False
+    return True
+
+
+__all__ = [
+    "DEFAULT_SIZES",
+    "EMULATED_MAXIMIZE",
+    "FULLSCREEN_KEY",
+    "MAXIMIZE_KEY",
+    "VIEWERS_KEY",
+    "allow_maximize",
+    "clamp_to_screen",
+    "close_independent_windows",
+    "independent_windows",
+    "install_window_keys",
+    "is_maximized",
+    "leave_fullscreen",
+    "load_state",
+    "maximize_shortcut",
+    "normal_geometry",
+    "owner_window",
+    "restore_window_state",
+    "save_window_state",
+    "show_independent",
+    "toggle_fullscreen",
+    "toggle_maximized",
+    "WM_GRACE_MS",
+]
