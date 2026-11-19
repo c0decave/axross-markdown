@@ -31,7 +31,7 @@ _UTF16_BOMS = (b"\xff\xfe", b"\xfe\xff")
 #: Everything QPlainTextEdit turns into a block break (QTextCursor::insertText
 #: also splits at the frame marks U+FDD0 and U+FDD1). The widget keeps none
 #: of them, so the save has to put back the one each line had.
-_LINE_BREAK = re.compile("(\r\n|\r|\n| |\ufdd0|\ufdd1)")
+_LINE_BREAK = re.compile("(\r\n|\r|\n|\u2029|\ufdd0|\ufdd1)")
 NEWLINE_NAMES = {"\n": "LF", "\r\n": "CRLF", "\r": "CR"}
 
 
