@@ -5161,5 +5161,7 @@
   "{path} was changed after its metadata was removed": "{path} wurde geändert, nachdem seine Metadaten entfernt wurden",
   "the cleaned copy {path} is gone": "die bereinigte Kopie {path} ist nicht mehr da",
   "{path} was changed after it was written": "{path} wurde geändert, nachdem sie geschrieben wurde",
-  "The text's size – click for the original size (Ctrl+0)": "Die Textgröße – klicken für die Originalgröße (Strg+0)"
+  "The text's size – click for the original size (Ctrl+0)": "Die Textgröße – klicken für die Originalgröße (Strg+0)",
+  "headings and table cells longer than {count} characters, cut (the editor shows them)": "Überschriften und Tabellenzellen über {count} Zeichen gekürzt (der Editor zeigt sie ganz)",
+  "{name} cannot be read: {error}": "{name} lässt sich nicht lesen: {error}"
 }

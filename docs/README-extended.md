@@ -1,6 +1,6 @@
 # axross-markdown: the extended README
 
-Everything on one page; the short version, with the screenshots, is the [README](../README.md).
+Everything on one page; the short version, with the screenshots, is the [README](../README.md) - installing, the tests and the licence are there.
 
 axross's Markdown viewer on its own: GitHub Markdown with an outline, footnotes, highlighted code and local images - shown, never run.
 
@@ -19,6 +19,8 @@ link opens in the browser only after a question that shows its real address.
 - [The security model](#the-security-model)
 - [Limits](#limits)
 - [Install options](#install-options)
+- [Where it comes from](#where-it-comes-from)
+- [The exact, reviewed dependencies](#the-exact-reviewed-dependencies)
 
 ## The window: keys
 
@@ -105,8 +107,8 @@ What a file holds is shown, never run:
 - **Raw HTML** is kept to a safe subset - no scripts, styles, frames, forms, event
   handlers or `javascript:` / `vbscript:` / `file:` / `data:` links (but data: images);
   what is left of it is shown as its text.
-- **Nothing from the network**: a remote image is a box naming its address; no page,
-  font or style sheet is fetched.
+- **Nothing from the network**: a remote image is a box with its alt text (its address in
+  the box's tooltip); no page, font or style sheet is fetched.
 - **Images** are read only relative to the file, regular files only, never a secret file
   (an SSH key, a keyring, a password store), bounded in bytes (8 MiB), pixels (40 million
   one, 100 million a page) and count (200); an SVG that names other files is not shown,
@@ -134,6 +136,10 @@ What a file holds is shown, never run:
   shown without colours.
 - An emoji short code (`:tada:`) of an emoji no installed font has stays as written.
 - A file that is no text (a picture, a program) is said to be one, not shown.
+- What would hold the window up is laid out shorter: a line of more than 100,000
+  characters without a space is not laid out (a note says so; the editor shows it); a
+  heading's or a table cell's text past 2,000 characters is cut, with "…"; a footnote's
+  ways back to its references are shown for the first 20 ("and 99,980 more").
 
 ## Install options
 
@@ -159,16 +165,12 @@ The Markdown view started as the Markdown viewer of
 [sandbox-ai](https://github.com/c0decave/sandbox-ai)'s Files page (MIT, the same
 author), ported to PyQt6 and axross's backends.
 
+## Where it comes from
+
 It is the same code as in [axross](https://github.com/c0decave/axross), written out by
-axross's `scripts/export_standalone.py markdown`; its settings are axross's
-(`~/.config/axross`), so both share the language, the theme and the tool's state.
-
-## Install and run
-
-```sh
-pip install axross-markdown      # or, from this folder: pip install .
-axross-markdown
-```
+axross's `scripts/export_standalone.py markdown`; it reads axross's settings
+(`~/.config/axross`) for the language and - until View → Theme chooses one in
+`~/.config/axross-markdown/settings.json` - the theme.
 
 ## The exact, reviewed dependencies
 
@@ -183,14 +185,3 @@ pip install --require-hashes -r requirements.lock.txt
 pip install --no-deps .
 ```
 
-## Tests
-
-```sh
-python -m pytest tests
-```
-
-The tool's own tests from axross - 30 files, their imports renamed as the code's - and a test that the program starts and ends cleanly; Qt's offscreen platform, no display needed.
-
-## Licence
-
-Apache-2.0, as axross.

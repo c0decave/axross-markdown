@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "axross-markdown"
-version = "0.16.5"
+version = "0.16.6"
 description = "axross's Markdown viewer on its own: GitHub Markdown with an outline, footnotes, highlighted code and local images - shown, never run"
 readme = "README.md"
 license = "Apache-2.0"

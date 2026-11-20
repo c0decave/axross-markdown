@@ -48,6 +48,10 @@ if sys.argv[-4] not in sys.path:
     # a source checkout (an installed axross is on the path already: put
     # first, its folder - site-packages - would shadow the standard library)
     sys.path.insert(0, sys.argv[-4])
+import os as _os
+_package = _os.path.dirname(_os.path.dirname(sys.argv[-4]))
+if _package not in sys.path:
+    sys.path.insert(0, _package)
 from axross_markdown._ax.core.lex_worker import _serve
 _serve()
 '''
