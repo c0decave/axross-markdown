@@ -28,6 +28,8 @@ import sys
 
 #: Bytes of one file that are read (as the Qt viewer).
 TEXT_LIMIT = 8 << 20
+#: What is said of a file that is no text.
+BINARY = "not a text file (it holds binary data) – not shown"
 #: The widest a text is set unless --width says otherwise (long lines read badly).
 MAX_WIDTH = 100
 #: The narrowest (a bullet, a quote's bar and a table's borders take room:
@@ -53,8 +55,10 @@ def _read(name: str) -> tuple[str, str]:
         # is checked (core.markdown_term.read_picture), as in the viewer.
         with open(name, "rb") as fh:
             data = fh.read(TEXT_LIMIT + 1)
-    from axross_markdown._ax.core.markdown_doc import decode_text
+    from axross_markdown._ax.core.markdown_doc import decode_text, looks_binary
 
+    if looks_binary(data):  # (a picture, a program: said - it was shown as garbage)
+        return "", BINARY
     text = decode_text(data[:TEXT_LIMIT])
     if len(data) > TEXT_LIMIT:
         text += f"\n\n---\n\n*(only the first {TEXT_LIMIT >> 20} MiB are shown)*\n"
@@ -86,18 +90,24 @@ def _parser() -> argparse.ArgumentParser:
     ap.add_argument("-w", "--width", type=_columns, default=0, help=f"columns (default: the terminal's, "
                     f"at most {MAX_WIDTH}; at least {MIN_WIDTH})")
     ap.add_argument("--color", "--colour", dest="color", default="auto",
-                    choices=("auto", "always", "never", "truecolor", "256", "16"))
-    ap.add_argument("--theme", default="auto", choices=("auto", "dark", "light"))
-    ap.add_argument("--images", default="auto", choices=("auto", "kitty", "iterm", "blocks", "none"))
+                    choices=("auto", "always", "never", "truecolor", "256", "16"),
+                    help="colours: auto (a terminal's, NO_COLOR / FORCE_COLOR / COLORTERM), always, never, "
+                         "or a depth (default: auto)")
+    ap.add_argument("--theme", default="auto", choices=("auto", "dark", "light"),
+                    help="colours for a dark or a light background (default: auto - COLORFGBG, else dark)")
+    ap.add_argument("--images", default="auto", choices=("auto", "kitty", "iterm", "blocks", "none"),
+                    help="pictures with kitty's or iTerm2's protocol, in coloured half-blocks, or none "
+                         "(default: auto - the terminal's)")
     ap.add_argument("--image-width", type=_columns, default=0, help="columns an image may take")
     ap.add_argument("--no-links", action="store_true", help="no terminal hyperlinks (OSC 8)")
     ap.add_argument("--pager", dest="pager", action="store_true", default=None,
                     help="always page with less -R")
-    ap.add_argument("--no-pager", dest="pager", action="store_false")
+    ap.add_argument("--no-pager", dest="pager", action="store_false",
+                    help="never page (default: less -R when the text is longer than the screen)")
     ap.add_argument("--toc", action="store_true", help="list the headings only")
     ap.add_argument("--watch", action="store_true",
                     help="draw the file anew whenever it changes (Ctrl+C ends)")
-    ap.add_argument("--version", action="store_true")
+    ap.add_argument("--version", action="store_true", help="show the version and exit")
     return ap
 
 
@@ -156,6 +166,28 @@ def _will_page(text_lines: int, rows: int, force: bool | None) -> bool:
 
 
 def main(argv: list[str] | None = None) -> int:
+    args = sys.argv[1:] if argv is None else list(argv)
+    if args[:1] == ["--lex-worker"]:
+        # A code block lexed in a child (core.lex_worker): a frozen axross-mdcat (Windows'
+        # axross-mdcat.exe) starts it as itself - it answers as the child.
+        from axross_markdown._ax.core.lex_worker import _child_main
+
+        return _child_main()
+    try:
+        status = _main(argv)
+        _write("")  # (what print left in the buffer - --help, --version: its error said too)
+        return status
+    except OutputGone as gone:
+        return gone.status
+    except SystemExit as stop:  # (--help: printed by argparse - a full disk said, not a traceback at the exit)
+        try:
+            _write("")
+        except OutputGone as gone:
+            return gone.status or (stop.code if isinstance(stop.code, int) else 1)
+        raise
+
+
+def _main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.version:
         print(f"axross-mdcat {program_version()}")
@@ -241,15 +273,39 @@ def _close_pager(pager) -> None:
         pass
 
 
-def _write(text: str) -> None:
+class OutputGone(Exception):
+    """Standard output can be written no more: *status* the exit status (0: a pipe closed - "| head" had
+    its lines; 1: an error, said)."""
+
+    def __init__(self, status: int):
+        super().__init__(status)
+        self.status = status
+
+
+def _write(text: str, program: str = "axross-mdcat") -> None:
+    """*text* on standard output - OutputGone once it can be written no more: a pipe closed ("| head
+    -2": it rendered all the rest for nothing) or an error ("> /dev/full": a traceback), said."""
     try:
         sys.stdout.write(text)
         sys.stdout.flush()
-    except BrokenPipeError:  # piped into head: fine
-        try:
-            sys.stdout = open(os.devnull, "w")  # noqa: SIM115 - Python's own advice for EPIPE
-        except OSError:
-            pass
+    except BrokenPipeError:  # piped into head: fine - and no more to do
+        _quiet_stdout()
+        raise OutputGone(0) from None
+    except OSError as exc:  # (a full disk, a closed terminal: said, exit 1)
+        _quiet_stdout()
+        print(f"{program}: cannot write the output: {exc.strerror or exc}", file=sys.stderr)
+        raise OutputGone(1) from None
+
+
+def _quiet_stdout() -> None:
+    """Standard output to /dev/null: what is left in its buffer is dropped (Python's advice for EPIPE -
+    "Exception ignored ... BrokenPipeError" at the exit else)."""
+    try:
+        null = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(null, sys.stdout.fileno())
+        os.close(null)
+    except (OSError, ValueError, AttributeError):
+        pass
 
 
 def _watch(args, width, depth, dark, images, hyperlinks, poll: float = 0.5, rounds: int = 0) -> int:
@@ -258,15 +314,24 @@ def _watch(args, width, depth, dark, images, hyperlinks, poll: float = 0.5, roun
     import time
 
     name = args.files[0]
-    seen = None
+    seen, missing = (), False  # (seen: nothing drawn yet - a file that is not there is said, too)
     checks = 0
     try:
         while True:
             try:
                 st = os.stat(name)
                 now = (st.st_mtime_ns, st.st_size, st.st_ino)
-            except OSError:
+            except OSError as exc:
                 now = None
+                if not missing:  # (said once - it was silent for ever - and waited for)
+                    from axross_markdown._ax.core.markdown_doc import clean
+
+                    print(f"axross-mdcat: {clean(name)}: {exc.strerror or exc} - waiting for it (Ctrl+C ends)",
+                          file=sys.stderr, flush=True)
+                    missing = True
+                seen = now
+            else:
+                missing = False
             if now != seen:
                 seen = now
                 text, _status = _render_files(args, width, depth, dark, images, hyperlinks)

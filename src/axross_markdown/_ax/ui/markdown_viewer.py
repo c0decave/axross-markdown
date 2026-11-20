@@ -87,7 +87,7 @@ Open a Markdown file with **Open…** (Ctrl+O), or name files on the command lin
 - the headings beside the text, a click goes there
 - tables, task lists, strike-through, footnotes, highlighted code
 - images beside the file; nothing is loaded from the network
-- find (Ctrl+F), zoom (Ctrl + / - / 0), Reload (F5), Edit (F4), Back (Alt+Left)
+- find (Ctrl+F), zoom (Ctrl+Plus / Ctrl+Minus / Ctrl+0), Reload (F5), Edit (F4), Back (Alt+Left)
 - Export: HTML, PDF, Print (Ctrl+P); a file changed on disk is shown anew
 """
 
@@ -97,15 +97,16 @@ class MarkdownViewerDialog(QDialog):
     pane it was opened from (Edit opens the editor of its window).
 
     For a program of its own (ui.markdown_app): *opener(viewer)* adds Open…
-    (Ctrl+O); *editor(backend, path)* is what Edit does; an empty *path*
+    (Ctrl+O); *editor(backend, path)* is what Edit does; *view_menu(menu)*
+    fills a View button's menu (the program's theme); an empty *path*
     shows :data:`WELCOME` until a file is opened."""
 
     def __init__(self, backend, path: str, parent=None, *, source_pane=None,
-                 opener=None, editor=None) -> None:
+                 opener=None, editor=None, view_menu=None) -> None:
         super().__init__(parent)
         set_window_icon(self, "markdown")
         self.backend, self.path, self.source_pane = backend, path, source_pane
-        self._opener, self._editor = opener, editor
+        self._opener, self._editor, self._view_menu = opener, editor, view_menu
         self.cut = False
         self.loaded_once = False
         self._generation = 0
@@ -161,8 +162,9 @@ class MarkdownViewerDialog(QDialog):
         zoom_out = QPushButton("−")
         zoom_out.setToolTip(tr("Smaller (Ctrl+-)"))
         zoom_out.clicked.connect(lambda: self.view.zoom_by(-1))
-        zoom_reset = QPushButton("100%")
-        zoom_reset.setToolTip(tr("Original size (Ctrl+0)"))
+        zoom_reset = QPushButton("100%")  # (the zoom level as it is - a click: its own size again)
+        zoom_reset.setToolTip(tr("The text's size – click for the original size (Ctrl+0)"))
+        self.zoom_reset = zoom_reset
         zoom_reset.clicked.connect(lambda: self.view.zoom_by(0))
         zoom_in = QPushButton("+")
         zoom_in.setToolTip(tr("Larger (Ctrl++)"))
@@ -183,6 +185,13 @@ class MarkdownViewerDialog(QDialog):
         if _print_support() is not None:
             menu.addAction(tr("Print…"), self.print_page)
         self.export_button.setMenu(menu)
+        self.view_button = None
+        if self._view_menu is not None:
+            self.view_button = QPushButton(tr("&View"))  # (Alt+V opens it)
+            self.view_button.setToolTip(tr("The theme of the window"))
+            menu = QMenu(self.view_button)
+            self._view_menu(menu)
+            self.view_button.setMenu(menu)
         self.find_field = QLineEdit()
         self.find_field.setPlaceholderText(tr("Find (Ctrl+F, Enter: next, Shift+Enter: back)"))
         self.find_field.setClearButtonEnabled(True)
@@ -192,7 +201,7 @@ class MarkdownViewerDialog(QDialog):
         self.find_count.setTextFormat(Qt.TextFormat.PlainText)
         for widget in (self.back_button, self.forward_button, zoom_out, zoom_in):
             widget.setFixedWidth(max(32, widget.fontMetrics().horizontalAdvance("M") * 3))  # (a sign: no more room)
-        zoom_reset.setFixedWidth(zoom_reset.fontMetrics().horizontalAdvance("100%") + 24)
+        zoom_reset.setFixedWidth(zoom_reset.fontMetrics().horizontalAdvance("1000%") + 24)
         bar.setSpacing(4)
         self._buttons = [w for w in (self.open_button, self.back_button, self.forward_button, self.outline_button,
                                      self.reload_button, self.edit_button) if w is not None]
@@ -212,6 +221,7 @@ class MarkdownViewerDialog(QDialog):
         self.view = MV.MarkdownView(MV.ImageSource(self.backend, self.path), parent=self)
         self.view.navigator = self
         self.view.link.connect(self.follow)
+        self.view.zoom_changed.connect(lambda percent: self.zoom_reset.setText(f"{percent}%"))
         root.addWidget(self.view, 1)
         self._update_history_buttons()
         for keys, slot in (
@@ -324,7 +334,8 @@ class MarkdownViewerDialog(QDialog):
         for layout in (self._bar, self._find_bar):
             while layout.count():
                 layout.takeAt(0)  # (the widgets stay: put in again below)
-        first = self._buttons + ([] if not wide else self._zoom) + [self.export_button]
+        first = self._buttons + ([] if not wide else self._zoom) + [self.export_button] \
+            + ([self.view_button] if self.view_button is not None else [])
         second = [] if wide else self._zoom
         for widget in first:
             self._bar.addWidget(widget)
@@ -379,6 +390,13 @@ class MarkdownViewerDialog(QDialog):
     def _read(self, generation: int, result, error, anchor: str = "", scroll: int | None = None) -> None:
         if generation != self._generation or sip.isdeleted(self):
             return  # a newer Reload is on its way
+        if isinstance(error, MV.BinaryFile):  # (a picture, a program: said in the page - it was garbage)
+            name = MV.printable(posixpath.basename(self.path) or self.path)
+            self.view.show_text(tr("{name} is not a text file: it holds binary data, so it is not shown.").format(
+                name="`" + name.replace("`", "'") + "`"), anchor, scroll)
+            self.view.status.setText("")
+            self.loaded_once = True
+            return
         if error is not None:
             self.view.status.setText(tr("Cannot read {path}: {error}").format(
                 path=MV.printable(self.path), error=MV.printable(error)))
@@ -445,11 +463,15 @@ class MarkdownViewerDialog(QDialog):
             self.end_find(focus=False)
             return False
         flags = QTextDocument.FindFlag.FindBackward if backward else QTextDocument.FindFlag(0)
+        browser = self.view.browser
+        since = browser.textCursor().selectionStart() if backward else browser.textCursor().selectionEnd()
         # (in the page's order, round past its end - a part not laid out yet
         # looked in, laid out first when it holds the next match: None meanwhile)
         found = self.view.find_match(needle, backward, flags, lambda: self.find_next(backward))
         if found is None:
             return False
+        if found and self._into_fold(needle, since, backward):
+            return False  # (a folded <details> on the way holds it: opened, then the match in it selected)
         if not found and self.view.unfold_for(needle=needle, then=lambda: self.find_next(backward)):
             return False  # (in a folded <details>: opened, as a browser's find does, then found)
         self._mark_matches(needle)
@@ -458,6 +480,51 @@ class MarkdownViewerDialog(QDialog):
         elif self.view.status.text().startswith(tr("Not found: {text}").split("{")[0]):
             self.view.status.setText("")
         return found
+
+    def _into_fold(self, needle: str, since: int, backward: bool) -> bool:
+        """A folded <details> between *since* and the match find_match just
+        selected (in the page's order, round past its end) that holds
+        *needle*: opened, the find going on in it - its first match (its last
+        one: *backward*). Find skipped them whenever the page had another
+        match (t/find.md: "of 9", the tenth in the fold)."""
+        folds = self.view.folds_holding(needle)
+        if not folds:
+            return False
+        browser = self.view.browser
+        hit = browser.textCursor().selectionStart()
+        end = browser.document().characterCount()
+        if not backward:
+            spans = [(since, hit)] if hit >= since else [(since, end), (0, hit)]
+            on_way = [fold for low, high in spans for fold in folds if low <= fold[0] < high]
+        else:
+            spans = [(hit, since)] if hit < since else [(hit, end), (0, since)]
+            on_way = [fold for low, high in spans for fold in folds if low <= fold[0] < high][::-1]
+        if not on_way:
+            return False
+        _at, number, count = on_way[0]
+        cursor = browser.textCursor()
+        cursor.setPosition(since)
+        browser.setTextCursor(cursor)
+
+        def opened() -> None:
+            summary = self.view.summary_of(number)
+            if summary is None:
+                return
+            place = browser.textCursor()
+            place.setPosition(summary)
+            browser.setTextCursor(place)
+            hits = self.view.browser.document()
+            match = hits.find(needle, place)
+            for _ in range(count - 1 if backward else 0):  # (backward: its last match)
+                after = hits.find(needle, match)
+                match = after if not after.isNull() else match
+            if match.isNull():
+                return
+            browser.setTextCursor(match)
+            browser.ensureCursorVisible()
+            self._mark_matches(needle)
+
+        return self.view.unfold_for(needle=needle, then=opened, only=number)
 
     def _find_as_typed(self) -> None:
         """The find field changed: the first match from where the last one
@@ -504,6 +571,11 @@ class MarkdownViewerDialog(QDialog):
                 break  # (never: an empty needle is not searched)
             cursor = document.find(needle, cursor)
         browser.setExtraSelections(marks)
+        # (the matches in a folded <details> count too, in their place - find goes into them)
+        for at, _number, inside in self.view.folds_holding(needle):
+            count += inside
+            if current and at < selected.selectionStart():
+                current += inside
         if not count:
             self.find_count.setText(tr("no match"))
         else:
@@ -533,11 +605,10 @@ class MarkdownViewerDialog(QDialog):
             return
         from axross_markdown._ax.ui.text_editor import TextEditorDialog
 
-        dialog = TextEditorDialog(self.backend, self.path, parent=owner)
-        if dialog.loaded:
-            VW.show_independent(dialog)
-        else:
-            dialog.deleteLater()
+        # read off the GUI thread, as the pane opens it: a failed read says
+        # why and closes the window
+        dialog = TextEditorDialog(self.backend, self.path, parent=owner, background=True)
+        VW.show_independent(dialog)
 
     # -- links and the places visited --
 
@@ -793,8 +864,12 @@ class MarkdownViewerDialog(QDialog):
         title = posixpath.basename(self.path) if self.path else tr("Markdown Viewer")
         if self.view.full:
             text = MD.clean(self.view.markdown.removeprefix("\ufeff"))
-            page = H.export_html(MD.parse(text), title=title, dark=False,
-                                 images=_embedded(self.view.originals))
+            images = _embedded(self.view.originals)
+            # (made on a worker thread, the window going on: big.md held it 3.2 s)
+            page = self._in_background(lambda: H.export_html(MD.parse(text), title=title, dark=False, images=images),
+                                       tr("Exporting HTML…"))
+            if page is None:
+                return ""
         else:  # (Qt's own parser: its HTML, made as safe as the other's - not by its policy alone)
             self.view.load_rest_now()
             page = H.safe_page(self.view.browser.document().toHtml(), _embedded(self.view.originals))
@@ -803,23 +878,28 @@ class MarkdownViewerDialog(QDialog):
         return self._write(target, page.encode("utf-8"))
 
     def export_pdf(self, target: str) -> str:
-        """The page as PDF (light colours) in the local file *target*."""
+        """The page as PDF (light colours) in the local file *target* - made
+        a part at a time (_print_to), the window going on; Cancel stops it."""
+        import os
+
         from PyQt6.QtGui import QPageSize, QPdfWriter
 
-        document = self.view.print_document()
         try:
             writer = QPdfWriter(target)
             writer.setPageSize(QPageSize(QPageSize.PageSizeId.A4))
             writer.setTitle(posixpath.basename(self.path) or tr("Markdown Viewer"))
-            document.print(writer)
+            done = self._print_to(writer, tr("Exporting PDF…"))
             del writer  # (the file is complete once the writer is gone)
         except Exception as exc:  # noqa: BLE001 - said, not raised
             self.view.status.setText(tr("Export failed: {error}").format(error=MV.printable(exc)))
             return ""
-        finally:
-            document.deleteLater()
-        import os
-
+        if not done:
+            try:
+                os.remove(target)  # (a PDF cut short: none)
+            except OSError:
+                pass
+            self.view.status.setText(tr("Export cancelled."))
+            return ""
         if not os.path.isfile(target):
             self.view.status.setText(tr("Export failed: {error}").format(error=MV.printable(target)))
             return ""
@@ -837,12 +917,78 @@ class MarkdownViewerDialog(QDialog):
             return False
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return False
-        document = self.view.print_document()
-        try:
-            document.print(printer)
-        finally:
-            document.deleteLater()
+        if not self._print_to(printer, tr("Printing…")):
+            printer.abort()
+            self.view.status.setText(tr("Printing cancelled."))
+            return False
         return True
+
+    def _in_background(self, work, label: str):
+        """*work()* on a worker thread, the window going on meanwhile (a
+        progress window with Cancel once it takes a while): its result, or
+        None when cancelled or it failed (said)."""
+        from PyQt6.QtCore import QEventLoop
+        from PyQt6.QtWidgets import QProgressDialog
+
+        state = {"done": False, "result": None, "error": None}
+        loop = QEventLoop()
+        progress = QProgressDialog(label, tr("Cancel"), 0, 0, self)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(400)
+        progress.canceled.connect(loop.quit)
+
+        def done(result, error):
+            state.update(done=True, result=result, error=error)
+            loop.quit()
+
+        MV.in_background(work, done, owner=self)
+        if not state["done"]:
+            loop.exec()
+        progress.close()
+        progress.deleteLater()
+        if not state["done"]:
+            self.view.status.setText(tr("Export cancelled."))
+            return None
+        if state["error"] is not None:
+            self.view.status.setText(tr("Export failed: {error}").format(error=MV.printable(state["error"])))
+            return None
+        return state["result"]
+
+    def _print_to(self, device, label: str) -> bool:
+        """The page drawn on *device* (a QPdfWriter, a QPrinter) in light
+        colours: its parts made on a worker thread (MV.print_parts), then
+        laid out and drawn one a turn (_PagePrinter) - progress said,
+        Cancel stops it. True when every page was drawn."""
+        from PyQt6.QtCore import QCoreApplication
+        from PyQt6.QtWidgets import QProgressDialog
+
+        text = self.view.markdown.replace("\r\n", "\n").replace("\r", "\n")
+        full = self.view.full
+        made = self._in_background(lambda: MV.print_parts(text, full), label)
+        if made is None:
+            return False
+        kind, parts = made
+        progress = QProgressDialog(label, tr("Cancel"), 0, len(parts), self)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(400)
+        pages = _PagePrinter(device, self.view.browser.document().defaultFont())
+        try:
+            for number, part_text in enumerate(parts):
+                if progress.wasCanceled() or sip.isdeleted(self):
+                    return False
+                part = self.view._part_document(None, part_text, counted=False, kind=kind, dark=False, printed=True)
+                try:
+                    pages.add(part)
+                finally:
+                    part.deleteLater()
+                progress.setValue(number + 1)
+                QCoreApplication.processEvents()  # (a turn between two parts: the window goes on)
+            return not progress.wasCanceled()
+        finally:
+            pages.end()
+            if not sip.isdeleted(progress):
+                progress.close()
+                progress.deleteLater()
 
     def _write(self, target: str, data: bytes) -> str:
         try:
@@ -853,6 +999,101 @@ class MarkdownViewerDialog(QDialog):
             return ""
         self.view.status.setText(tr("Saved: {path}").format(path=MV.printable(target)))
         return target
+
+
+class _PagePrinter:
+    """Documents drawn one after another on a paint device's pages, as
+    QTextDocument.print draws one (2 cm margins, the page's number at its
+    foot) - each laid out on its own: one document of the whole page went
+    past Qt's layout's reach (8,388,607 of its units: big.md's PDF lost its
+    last hundreds of pages). The next document goes on where the one before
+    ended on its last page (an empty line that high above it)."""
+
+    def __init__(self, device, font):
+        from PyQt6.QtCore import QPointF, QRectF
+        from PyQt6.QtGui import QFontMetrics, QPainter
+
+        self.device, self.font = device, font
+        self.painter = QPainter(device)
+        # (as Qt's own: the margin in units of 96 dots an inch - the layout scales it to the device's -,
+        # the page in the device's own)
+        self.margin = int(2 / 2.54 * 96)
+        self.scale = device.logicalDpiY() / 96.0
+        self.body = QRectF(0, 0, device.width(), device.height())
+        ascent = QFontMetrics(font, device).ascent()
+        self.number_at = QPointF(self.body.width() - self.margin * device.logicalDpiX() / 96.0,
+                                 self.body.height() - self.margin * self.scale + ascent + 5 * self.scale)
+        self.number, self.used = 0, 0.0  # (pages begun; how far down the last one is written)
+
+    def add(self, document) -> None:
+        from PyQt6.QtGui import QTextBlockFormat, QTextCharFormat
+
+        if not self.painter.isActive():
+            raise OSError("cannot draw on the printer")
+        layout = document.documentLayout()
+        layout.setPaintDevice(self.device)
+        frame = document.rootFrame().frameFormat()
+        frame.setMargin(self.margin)
+        document.rootFrame().setFrameFormat(frame)
+        height = self.body.height()
+        margin = self.margin * self.scale  # (in the device's units)
+        going_on = self.number and self.used and self.used < height - margin - height / 8
+        if going_on:  # (on where the last one ended: an empty line that high first)
+            cursor = QTextCursor(document)
+            first = document.begin()
+            cursor.insertBlock(first.blockFormat(), first.charFormat())  # (a block of its own: one before a
+            # table - a code block's band, a quote's box - took no height)
+            spacer = QTextBlockFormat()
+            spacer.setLineHeight(max(1.0, (self.used - margin) / self.scale), 2)  # (2: FixedHeight - in 96ths)
+            small = QTextCharFormat()
+            small.setFontPointSize(1)
+            cursor.setPosition(0)
+            cursor.setBlockFormat(spacer)
+            cursor.setBlockCharFormat(small)
+        document.setPageSize(self.body.size())
+        pages = document.pageCount()
+        for index in range(pages):
+            if index or not going_on:
+                if self.number:
+                    self.device.newPage()
+                self.number += 1
+            self._draw(document, index, numbered=bool(index or not going_on))
+        block = document.lastBlock()
+        last = layout.blockBoundingRect(block)
+        # (the room below the last line too: the next document's first line kept its distance; the
+        # empty block after a table: where it begins - below the table's own room)
+        bottom = last.top() if not block.text() else last.bottom() + block.blockFormat().bottomMargin() * self.scale
+        self.used = bottom - (pages - 1) * height
+
+    def _draw(self, document, index: int, numbered: bool) -> None:
+        from PyQt6.QtCore import QRectF
+        from PyQt6.QtGui import QAbstractTextDocumentLayout, QFont, QPalette
+
+        painter, height = self.painter, self.body.height()
+        painter.save()
+        painter.translate(self.body.left(), self.body.top() - index * height)
+        view = QRectF(0, index * height, self.body.width(), height)
+        # (drawn between the page's margins only: a box going on to the next page - an alert, a code
+        # block - had its ground drawn on through the margins, under the page's number, and at the
+        # next page's top an empty piece of it)
+        margin = self.margin * self.scale
+        inside = QRectF(0, index * height + margin, self.body.width(), height - 2 * margin)
+        context = QAbstractTextDocumentLayout.PaintContext()
+        context.clip = inside
+        context.palette.setColor(QPalette.ColorRole.Text, QColor("black"))
+        painter.setClipRect(inside)
+        document.documentLayout().draw(painter, context)
+        if numbered:
+            painter.setClipping(False)
+            painter.setFont(QFont(self.font))
+            shown = str(self.number)
+            painter.drawText(round(self.number_at.x() - painter.fontMetrics().horizontalAdvance(shown)),
+                             round(self.number_at.y() + view.top()), shown)
+        painter.restore()
+
+    def end(self) -> None:
+        if self.painter.isActive():
+            self.painter.end()
 
 
 def _print_support():
@@ -906,11 +1147,11 @@ def _language(name: str) -> str:
 
 
 def open_markdown_viewer(backend, path: str, parent=None, *, source_pane=None, opener=None,
-                         editor=None) -> MarkdownViewerDialog:
+                         editor=None, view_menu=None) -> MarkdownViewerDialog:
     """Show the Markdown file *path* of *backend* in a viewer window of its
     own (non-modal)."""
     dialog = MarkdownViewerDialog(backend, path, VW.owner_window(parent), source_pane=source_pane,
-                                  opener=opener, editor=editor)
+                                  opener=opener, editor=editor, view_menu=view_menu)
     VW.show_independent(dialog)
     return dialog
 

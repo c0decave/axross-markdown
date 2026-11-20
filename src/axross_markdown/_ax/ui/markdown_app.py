@@ -49,7 +49,7 @@ class MarkdownApp:
         for path in paths or [""]:
             full = os.path.abspath(os.path.expanduser(path)) if path else ""
             viewer = open_markdown_viewer(self.backend, full, parent, opener=self.ask_open,
-                                          editor=self.edit)
+                                          editor=self.edit, view_menu=self.view_menu)
             self.viewers.append(viewer)
             opened.append(viewer)
         return opened
@@ -69,6 +69,27 @@ class MarkdownApp:
         if not viewer.path:
             viewer.close()
         return opened
+
+    def view_menu(self, menu) -> None:
+        """View > Theme: axross's themes ("Modern (follow system)" the
+        first), the choice kept in the program's own settings
+        (ui.standalone_app.settings_file)."""
+        from PyQt6.QtGui import QActionGroup
+        from PyQt6.QtWidgets import QApplication
+
+        from axross_markdown._ax.core.i18n import tr
+        from axross_markdown._ax.ui.standalone_app import fill_theme_menu
+
+        themes = menu.addMenu(tr("Theme"))
+
+        def refill() -> None:  # (the one in use checked - another window may have chosen one)
+            for group in themes.findChildren(QActionGroup):
+                group.deleteLater()
+            themes.clear()
+            fill_theme_menu(themes, QApplication.instance(), NAME)
+
+        themes.aboutToShow.connect(refill)
+        refill()
 
     def edit(self, backend, path: str):
         """Edit: the file in the editor window, the preview beside it."""
@@ -120,9 +141,12 @@ def export_html_main(args: list[str]) -> int:
     folder = os.path.dirname(os.path.abspath(name)) if name != "-" else os.getcwd()
     title = os.path.basename(name) if name != "-" else ""
     page = export_html(doc, title=title, images=_images_of(doc, folder))
-    from axross_markdown._ax.core.markdown_cli import _write
+    from axross_markdown._ax.core.markdown_cli import OutputGone, _write
 
-    _write(page)  # (piped into head: it ends quietly - a BrokenPipeError's traceback was printed)
+    try:
+        _write(page, NAME)  # (piped into head: it ends quietly - a BrokenPipeError's traceback was printed)
+    except OutputGone as gone:  # (... "> /dev/full": said, exit 1)
+        return gone.status
     return 0
 
 
@@ -196,6 +220,20 @@ def main(argv: list[str] | None = None) -> int:
     error (exit 2), not a file."""
     args = list(sys.argv if argv is None else argv)
     rest = args[1:]
+    if rest[:1] == ["--svg-worker"]:
+        # A document's SVG drawn in a child process (core.svg_worker): a
+        # frozen build has no python -c, the program itself answers.
+        from axross_markdown._ax.core.svg_worker import _child_main
+
+        return _child_main()
+    if rest[:1] == ["--lex-worker"]:  # (the editor's highlighting lexed in a child: core.lex_worker - as main.py)
+        from axross_markdown._ax.core.lex_worker import _child_main as lex_main
+
+        return lex_main()
+    if rest[:1] == ["--image-worker"]:  # (a picture decoded in a child: core.image_worker - as main.py)
+        from axross_markdown._ax.core.image_worker import _child_main as image_main
+
+        return image_main()
     if any(a in TERMINAL for a in rest):
         # The terminal view (core.markdown_cli, axross-mdcat): no Qt is started.
         from axross_markdown._ax.core.markdown_cli import main as terminal
@@ -212,8 +250,48 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{NAME}: --html takes one file (- for standard input)", file=sys.stderr)
             return 2
         return export_html_main([options.html])
-    return run(NAME, TITLE, "markdown", build, [args[0] if args else NAME, *options.files],
-               smoke_ms=smoke_ms_from_env())
+    try:
+        return run(NAME, TITLE, "markdown", build, [args[0] if args else NAME, *options.files],
+                   smoke_ms=smoke_ms_from_env())
+    except ImportError as exc:  # (a system library Qt needs is missing: said, not a traceback)
+        said = missing_library(exc)
+        if said is None:
+            raise
+        print(f"{NAME}: {said}", file=sys.stderr)
+        return 1
+
+
+#: The packages that bring a system library Qt's window needs (Debian and
+#: Ubuntu / Fedora and RHEL / Arch).
+_PACKAGES = {
+    "libEGL.so.1": "libegl1 / mesa-libEGL / libglvnd",
+    "libGL.so.1": "libgl1 / mesa-libGL / libglvnd",
+    "libOpenGL.so.0": "libopengl0 / libglvnd-opengl / libglvnd",
+    "libxkbcommon.so.0": "libxkbcommon0 / libxkbcommon / libxkbcommon",
+    "libxkbcommon-x11.so.0": "libxkbcommon-x11-0 / libxkbcommon-x11 / libxkbcommon-x11",
+    "libfontconfig.so.1": "libfontconfig1 / fontconfig / fontconfig",
+    "libfreetype.so.6": "libfreetype6 / freetype / freetype2",
+    "libdbus-1.so.3": "libdbus-1-3 / dbus-libs / dbus",
+    "libxcb-cursor.so.0": "libxcb-cursor0 / xcb-util-cursor / xcb-util-cursor",
+}
+
+
+def missing_library(error: ImportError) -> str | None:
+    """What to say when *error* is a system library that is not there (the
+    window cannot start: which library, which package brings it, what works
+    without it) - None for any other ImportError."""
+    import re
+
+    found = re.search(r"([\w.+-]+\.so(?:\.\d+)*): cannot open shared object file", str(error))
+    if found is None:
+        return None
+    library = found.group(1)
+    package = _PACKAGES.get(library)
+    where = (f" - install the package {package} (Debian or Ubuntu / Fedora or RHEL / Arch)" if package
+             else " - install the package of your system that has it")
+    return (f"the window needs the system library {library}, which is not installed{where}. "
+            f"Without it, {NAME} --term FILE shows the file in the terminal and "
+            f"{NAME} --html FILE writes it as a web page.")
 
 
 if __name__ == "__main__":

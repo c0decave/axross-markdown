@@ -1,6 +1,8 @@
 # axross-markdown
 
-**axross's Markdown viewer on its own: GitHub Markdown with an outline, footnotes, highlighted code and local images - shown, never run.**
+*GitHub Markdown in a window of its own - or in the terminal: read, never run.*
+
+![The viewer: outline, alerts, tables, task lists](https://raw.githubusercontent.com/c0decave/axross-markdown/main/docs/screenshots/viewer-light.png)
 
 - **GitHub Markdown, complete** - CommonMark, tables, task lists, footnotes, alerts, definition lists, front matter.
 - **Math without a browser** - `$...$` and `$$...$$`: fractions, integrals, sums, matrices and cases, drawn as text.
@@ -16,6 +18,13 @@
 ## Contents
 
 - **[Everything in detail: the extended README](https://github.com/c0decave/axross-markdown/blob/main/docs/README-extended.md)**
+  - [The window: keys](https://github.com/c0decave/axross-markdown/blob/main/docs/README-extended.md#the-window-keys)
+  - [Export and print](https://github.com/c0decave/axross-markdown/blob/main/docs/README-extended.md#export-and-print)
+  - [Themes](https://github.com/c0decave/axross-markdown/blob/main/docs/README-extended.md#themes)
+  - [In the terminal: axross-mdcat](https://github.com/c0decave/axross-markdown/blob/main/docs/README-extended.md#in-the-terminal-axross-mdcat)
+  - [The security model](https://github.com/c0decave/axross-markdown/blob/main/docs/README-extended.md#the-security-model)
+  - [Limits](https://github.com/c0decave/axross-markdown/blob/main/docs/README-extended.md#limits)
+  - [Install options](https://github.com/c0decave/axross-markdown/blob/main/docs/README-extended.md#install-options)
 - [What changed: the CHANGELOG](https://github.com/c0decave/axross-markdown/blob/main/CHANGELOG.md)
 - [Screenshots](#screenshots)
 - [Install and run](#install-and-run)
@@ -23,10 +32,6 @@
 - [Licence](#licence)
 
 ## Screenshots
-
-![The viewer: outline, alerts, tables, task lists](https://raw.githubusercontent.com/c0decave/axross-markdown/main/docs/screenshots/viewer-light.png)
-
-*The viewer: outline, alerts, tables, task lists.*
 
 | ![Dark theme: code coloured by Pygments, footnotes](https://raw.githubusercontent.com/c0decave/axross-markdown/main/docs/screenshots/viewer-dark.png) | ![Math: fractions, integrals, cases, matrices](https://raw.githubusercontent.com/c0decave/axross-markdown/main/docs/screenshots/viewer-math.png) |
 |:---:|:---:|
@@ -56,6 +61,8 @@ Every dependency is pinned and reviewed in `requirements.lock.txt`
 ```sh
 python -m pytest tests
 ```
+
+The tool's own tests from axross - 30 files, their imports renamed as the code's - and a test that the program starts and ends cleanly; Qt's offscreen platform, no display needed.
 
 ## Licence
 

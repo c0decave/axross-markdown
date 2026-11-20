@@ -137,15 +137,14 @@ def _highlight(code: str, lang: str, dark: bool) -> str | None:
     if not lang or len(code) > HIGHLIGHT_LIMIT:
         return None
     try:
-        from pygments import highlight
+        from pygments import format as formatted
         from pygments.formatters import HtmlFormatter
-        from pygments.lexers import get_lexer_by_name
-        from pygments.util import ClassNotFound
     except ImportError:
         return None
-    try:
-        lexer = get_lexer_by_name(lang.lower(), stripnl=False)
-    except ClassNotFound:
+    # (lexed in a child: a lexer's pattern stuck in backtracking held Python's lock - the window froze;
+    # too slow, the block plain - core.markdown_doc.code_tokens)
+    tokens = MD.code_tokens(code if code.endswith("\n") else code + "\n", lang)
+    if tokens is None:
         return None
     style = _github_style(dark)  # (GitHub's colours, as Qt's own parser's page colours code - Pygments'
     # github-dark left builtins (print, len, str) uncoloured, its numbers as strings)
@@ -153,7 +152,7 @@ def _highlight(code: str, lang: str, dark: bool) -> str | None:
         formatter = HtmlFormatter(noclasses=True, nowrap=True, style=style)
     except Exception:  # noqa: BLE001 - an older Pygments without the style
         formatter = HtmlFormatter(noclasses=True, nowrap=True)
-    return highlight(code, lexer, formatter)
+    return formatted(tokens, formatter)
 
 
 #: GitHub's colours of code on a light page (its "prettylights" palette):
@@ -631,8 +630,8 @@ def display_items(tex: str) -> list:
     ("stack", base, upper, lower),
     ("lines", [rows]) - or [] when it has none but text."""
     items, text, at, depth = [], [], 0, 0
-    if len(tex) > DISPLAY_CHARS:  # (as text, in its line: laid out it held the window)
-        return []
+    if len(tex) > DISPLAY_CHARS or MD.math_too_deep(tex):  # (as text, in its line: laid out it held the
+        return []  # window - deeper than MATH_DEPTH, as written with its note)
     rows = _top_level_rows(tex)  # (lines of its own: "\\" at its top level)
     if len(rows) > 1:
         return [("lines", rows)]
@@ -779,8 +778,8 @@ def _display_html(tex: str, palette: dict, label: str = "") -> str | None:
     a matrix or cases a grid of their own in brackets as tall as they are,
     \\left( \\right) as tall as what they hold, \\tag at the right - or None
     (no such item: a line of text, math_html)."""
-    if len(tex) > MD.MATH_LIMIT:
-        return None
+    if len(tex) > MD.MATH_LIMIT or MD.math_too_deep(tex):
+        return None  # (in its line: math_html - deeper than MATH_DEPTH, as written with its note)
     written, tex = tex, MD.math_normal(tex)  # (\\frac12, {n \\choose k}: stacked as written in braces)
     items = display_items(tex)
     if not items:
@@ -922,9 +921,14 @@ def _row_html(items: list, palette: dict, depth: int) -> str:
             cells.append(_env_html(item[1], item[2], palette, depth))
         elif kind == "root":  # (its sign, its index above it, a bar over what it holds - one style of root)
             _kind, index, inside = item
-            sign = (f'<sup>{_small(_inline(index, palette, True))}</sup>' if index else "") + _glyph("√", 2)
-            cells.append(f'<td valign="bottom">{sign}</td><td valign="bottom" style="border-top: 1px solid '
-                         f'{palette["text"]}; padding: 2px 2px 0px 2px">{_part(inside, palette, depth)}</td>')
+            # (over a stacked part - a fraction, a sum: the sign as tall as it, up to its bar - a small one
+            # stood at its foot, apart from the bar above)
+            tall = any(entry[0] != "text" for entry in display_items(inside)[:DISPLAY_CHARS]) \
+                if depth < DISPLAY_DEPTH else False
+            sign = (f'<sup>{_small(_inline(index, palette, True))}</sup>' if index else "") + _glyph("√", 4 if tall else 2)
+            cells.append(f'<td valign="{"top" if tall else "bottom"}">{sign}</td><td valign="bottom" '
+                         f'style="border-top: 1px solid {palette["text"]}; padding: 2px 2px 0px 2px">'
+                         f'{_part(inside, palette, depth)}</td>')
         elif kind == "brace":  # (its brace a rule under or over it with its ends, its label beyond it)
             _kind, under, inside, label = item
             rule = f"1px solid {palette['text']}"
@@ -1106,7 +1110,10 @@ def _install_rules(md, dark: bool) -> None:
     for Qt differs where Qt's HTML cannot do what a browser does."""
     renderer = md.renderer
     palette = colours(dark)
-    notes_open = renderer.rules.get("footnote_block_open")
+    # (the plugin's own rules under ours: this runs for each page with the same parser - wrapped
+    # again each time, 1,000 pages made the rule a chain too deep for Python: RecursionError)
+    notes_open = getattr(renderer.rules.get("footnote_block_open"), "plugin_rule", renderer.rules.get(
+        "footnote_block_open"))
     if notes_open is not None:
         def footnote_block_open(tokens, idx, options, env):
             meta = tokens[idx].meta or {}
@@ -1118,15 +1125,29 @@ def _install_rules(md, dark: bool) -> None:
                 made = re.sub(r'<hr class="footnotes-sep"\s*/?>\n?', "", made)
             return made
 
+        footnote_block_open.plugin_rule = notes_open
         renderer.rules["footnote_block_open"] = footnote_block_open
-    note_open = renderer.rules.get("footnote_open")
+    note_open = getattr(renderer.rules.get("footnote_open"), "plugin_rule", renderer.rules.get("footnote_open"))
     if note_open is not None:
         def footnote_open(tokens, idx, options, env):
             if (tokens[idx].meta or {}).get("going_on"):  # (cut inside the note: its anchor not again)
                 return f'<li class="footnote-item"><p>{GOING_ON}</p>\n'
             return note_open(tokens, idx, options, env)
 
+        footnote_open.plugin_rule = note_open
         renderer.rules["footnote_open"] = footnote_open
+    note_back = getattr(renderer.rules.get("footnote_anchor"), "plugin_rule", renderer.rules.get("footnote_anchor"))
+    if note_back is not None:
+        def footnote_anchor(tokens, idx, options, env):
+            made = note_back(tokens, idx, options, env)
+            if idx + 1 < len(tokens) and tokens[idx + 1].type == "paragraph_close":
+                return made  # (in the note's last paragraph)
+            # (a note ending in a code block, a list: its way back a line of the note's own - Qt put it
+            # under the note's number, on its own line)
+            return f'<p class="footnote-back">{made.strip()}</p>\n'
+
+        footnote_anchor.plugin_rule = note_back
+        renderer.rules["footnote_anchor"] = footnote_anchor
 
     def math_inline(tokens, idx, options, env):
         # (real sub- and superscripts; what is not understood as code - that part only)
@@ -1227,6 +1248,8 @@ def _install_rules(md, dark: bool) -> None:
         title = token.attrGet("title")
         extra = f' title="{html.escape(str(title))}"' if title else ""
         shown = renderer.renderInlineAsText(token.children or [], options, env)
+        if (token.meta or {}).get("refused"):  # (file:, a data: of no image: a box naming it, never loaded)
+            return image_chip("", shown, tr_text("Image not shown: its address is not allowed"))
         return _image_html(src, shown, extra, env)
 
     def fence(tokens, idx, options, env):
@@ -1659,7 +1682,7 @@ def _part_tokens(tokens: list, begin: int, end: int, opened: list, closed: list)
     begun again (meta "continued" - an ordered list's number, a note list's,
     on from where it was cut), its own, the containers it is cut inside of
     ended (their open tokens meta "continues": no room below)."""
-    from markdown_it.token import Token
+    Token = MD.token_class()
 
     out = []
     for k, at in enumerate(opened):
@@ -1775,22 +1798,30 @@ def _paragraph_pieces(tokens: list) -> list:
             if child.type == "text" and len(child.content) > PARAGRAPH_TEXT:
                 words, at = child.content, 0
                 while at < len(words):
-                    cut = words.find(" ", at + PARAGRAPH_TEXT)
-                    cut = len(words) if cut < 0 else cut
+                    cut = words.find(" ", at + PARAGRAPH_TEXT, at + 2 * PARAGRAPH_TEXT)
+                    if cut < 0:  # (no space near: cut in the word - between two letters as they are seen;
+                        # 99,000 letters in one word held the window 1.1 s)
+                        cut = len(words) if at + 2 * PARAGRAPH_TEXT >= len(words) \
+                            else MD.cluster_end(words, at + PARAGRAPH_TEXT - 1)
                     children.append(child.copy(content=words[at:cut]))
                     at = cut
             else:
                 children.append(child)
         groups, group, depth, size = [], [], 0, 0
         for child in children:
-            if not depth and (len(group) >= PARAGRAPH_SPANS or size >= PARAGRAPH_TEXT) \
-                    and child.type in ("softbreak", "text") \
-                    and (child.type == "softbreak" or child.content[:1].isspace()):
+            full = len(group) >= PARAGRAPH_SPANS or size >= PARAGRAPH_TEXT
+            # (no space for twice as long: cut between two spans all the same - "`a" 49,500 times, 25,000
+            # code spans and not one space, held the window 17 s in Qt's layout; "$a$" 30,000 times 3 s)
+            if not depth and full and (child.type in ("softbreak", "text")
+                                       and (child.type == "softbreak" or child.content[:1].isspace())
+                                       or len(group) >= 2 * PARAGRAPH_SPANS or size >= 2 * PARAGRAPH_TEXT) \
+                    and child.nesting != -1:
                 groups.append(group)
                 group, size = [], 0
                 if child.type == "softbreak":
                     continue
-                child = child.copy(content=child.content.lstrip())
+                if child.type == "text":
+                    child = child.copy(content=child.content.lstrip())
             depth += child.nesting
             size += len(child.content or "")
             group.append(child)
@@ -1865,7 +1896,7 @@ def _table_pieces(tokens: list) -> list:
 
 def _seam_line(level: int) -> list:
     """The tokens of a line of no height between two pieces of a table ("<p>\u200b</p>")."""
-    from markdown_it.token import Token
+    Token = MD.token_class()
 
     inline = Token("inline", "", 0, content="\u200b", level=level + 1)
     inline.children = [Token("text", "", 0, content="\u200b")]
@@ -2053,8 +2084,14 @@ summary {{ cursor: pointer; font-weight: 700; }}
 
 _IMG_TAG = re.compile(r"<img\b[^<>]*>", re.IGNORECASE)
 _HREF = re.compile(r'(<a\b[^<>]*?)\s+href="([^"]*)"', re.IGNORECASE)
-#: The links a page of its own keeps (others are text there).
+#: The links a page of its own keeps (others are text there) - and a
+#: relative one (a sibling's "notes.md", "foo(and(bar))"): no scheme, no
+#: host ("//host"), no root, no backslash (a browser reads "\\\\host" as "//host").
 _KEPT_LINKS = ("http://", "https://", "mailto:", "#")
+_RELATIVE_LINK = re.compile(r"(?![A-Za-z][A-Za-z0-9+.-]*:)[^/\\\s][^\\\s]*\Z|\Z")
+#: The reader's own marks of a formula (its TeX for a copy): no part of a page of its own.
+_TEX_MARK = re.compile(r'<td><a name="axross-tex:[^"]*"></a>&#8203;</td>|<a name="axross-i?tex:[^"]*">(.*?)</a>',
+                       re.DOTALL)
 
 
 def safe_page(page: str, images: dict | None = None) -> str:
@@ -2062,7 +2099,8 @@ def safe_page(page: str, images: dict | None = None) -> str:
     as :func:`export_html`'s without counting on its policy (a word
     processor or a mail program ignores it): every image is one the viewer
     read and checked (*images*, put in as data:) or a chip naming it, every
-    link that is no http(s), mailto or #anchor link loses its target."""
+    link that is no http(s), mailto, #anchor or relative link (a sibling's
+    "notes.md") loses its target; the reader's marks of formulas go."""
     images = images or {}
     put_in = set(images.values())  # (already put in: export_html's)
 
@@ -2080,8 +2118,10 @@ def safe_page(page: str, images: dict | None = None) -> str:
 
     def link(match: re.Match) -> str:
         target = html.unescape(match.group(2)).strip()
-        return match.group(0) if target.lower().startswith(_KEPT_LINKS) else match.group(1)
+        kept = target.lower().startswith(_KEPT_LINKS) or (target and _RELATIVE_LINK.match(target))
+        return match.group(0) if kept else match.group(1)
 
+    page = _TEX_MARK.sub(lambda match: match.group(1) or "", page)
     return _QT_LINE_HEIGHT.sub(_line_height, _HREF.sub(link, _IMG_TAG.sub(image, page)))
 
 
@@ -2110,7 +2150,14 @@ def export_html(doc: MD.Document, title: str = "", dark: bool = False, images: d
     md = doc.parser
     _install_rules(md, dark)
     _mark_task_lists(doc.tokens)
-    body = md.renderer.render(doc.tokens, md.options, {"browser": True, "images": images or {}})
+    try:
+        body = md.renderer.render(doc.tokens, md.options, {"browser": True, "images": images or {}})
+    except (Exception, RecursionError) as exc:  # noqa: BLE001 - a block's fault: the text as written,
+        if not doc.source:  # never a traceback
+            raise
+        log.warning("A page could not be rendered; shown as written", exc_info=True)
+        written = MD.as_written(doc.source, exc, md)
+        body = md.renderer.render(written.tokens, md.options, {"browser": True, "images": images or {}})
     body = safe_page(_TASK.sub(_task, body), images)
     title = html.escape(MD.clean(title or (doc.headings[0].text if doc.headings else "Markdown")))
     return (f'<!DOCTYPE html>\n<html>\n<head>\n<meta charset="utf-8">\n'

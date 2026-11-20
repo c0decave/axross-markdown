@@ -28,7 +28,7 @@ DROPPED = ("platformthemes/libqgtk3.so", "networkinformation/libqglib.so",
            "platforms/libqminimal.so", "platforms/libqminimalegl.so",
            "platforms/libqvkkhrdisplay.so", "libQt6EglFSDeviceIntegration.so.6",
            "printsupport/libcupsprintersupport.so")
-DROPPED_FOLDERS = ("egldeviceintegrations",)
+DROPPED_FOLDERS = ("egldeviceintegrations", "sqldrivers")
 
 
 def dropped(path):
@@ -37,6 +37,8 @@ def dropped(path):
         return True
     return any(f in DROPPED_FOLDERS for f in path.split("/")[:-1])
 
+
+WINDOWS = sys.platform == "win32"
 
 a = Analysis(  # noqa: F821
     [os.path.join(HERE, "entry.py")],
@@ -62,9 +64,38 @@ exe = EXE(  # noqa: F821
     debug=False,
     strip=False,
     upx=False,
-    # a console program as well: --term and --html write to standard output
-    console=True,
-    icon=os.path.join(HERE, "icons", "axross-logo-256.png") if sys.platform == "win32" else None,
+    # On Windows a window program: a console program opened a console window beside the viewer.
+    # Its --term / --html / --version write into the console it was started from (entry.py attaches
+    # to it); axross-mdcat.exe below is the terminal view as a console program. Elsewhere a console
+    # program as before (no window of its own there).
+    console=not WINDOWS,
+    icon=os.path.join(HERE, "icons", "axross-logo-256.png") if WINDOWS else None,
     codesign_identity=None,
     entitlements_file=None,
 )
+
+if WINDOWS:
+    # axross-mdcat.exe: the terminal view (core.markdown_cli) on its own - a console program, no Qt
+    terminal = Analysis(  # noqa: F821
+        [os.path.join(HERE, "entry_mdcat.py")],
+        hiddenimports=collect_submodules("axross_markdown._ax.core"),
+        datas=collect_data_files("axross_markdown"),
+        excludes=["tkinter", "PyQt6"],
+        noarchive=False,
+    )
+    EXE(  # noqa: F821
+        PYZ(terminal.pure),  # noqa: F821
+        terminal.scripts,
+        options,
+        terminal.binaries,
+        terminal.datas,
+        [],
+        name="axross-mdcat",
+        debug=False,
+        strip=False,
+        upx=False,
+        console=True,
+        icon=os.path.join(HERE, "icons", "axross-logo-256.png"),
+        codesign_identity=None,
+        entitlements_file=None,
+    )

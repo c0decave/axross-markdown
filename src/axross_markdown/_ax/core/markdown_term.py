@@ -25,6 +25,7 @@ bytes and pixels; nothing is ever loaded from the network.
 from __future__ import annotations
 
 import base64
+import functools
 import io
 import os
 import posixpath
@@ -40,6 +41,9 @@ ESC = "\x1b"
 #: The most bytes / pixels of one image read for the terminal (as the viewer).
 IMAGE_LIMIT = 8 << 20
 IMAGE_PIXELS = 40_000_000
+#: The formats Pillow may open a picture as: rasters, never EPS (Ghostscript),
+#: PDF or a container that holds another picture.
+PICTURE_FORMATS = ("PNG", "JPEG", "GIF", "BMP", "WEBP", "TIFF", "PPM", "TGA")
 #: Images of one document that are drawn, and the pixels all of them may
 #: take together (as the viewer: a small PNG of 36 million pixels named
 #: 10,000 times was decoded 10,000 times; a page of 10,000 images wrote
@@ -210,10 +214,18 @@ class Painter:
         return f"{ESC}]8;;{url}{ESC}\\{text}{ESC}]8;;{ESC}\\"
 
 
+#: The longest link made a hyperlink (OSC 8): VTE's limit, and a terminal's
+#: others drop longer ones. Each line of a link carries its URL: a link of
+#: 1 MB, wrapped, wrote gigabytes and took an hour - longer ones are its text.
+HYPERLINK_CHARS = 2083
+_URL_BAD = re.compile("[\x00-\x20\x7f-\x9f]")
+
+
+@functools.lru_cache(maxsize=256)  # (once a link: each of its wrapped pieces asked again)
 def safe_url(url: str) -> bool:
     """Whether *url* may go into an escape sequence: http(s), mailto or file,
-    no control character or space."""
-    if not url or any(ord(c) < 0x21 or ord(c) == 0x7f or 0x80 <= ord(c) <= 0x9f for c in url):
+    no control character or space, at most HYPERLINK_CHARS long."""
+    if not url or len(url) > HYPERLINK_CHARS or _URL_BAD.search(url):
         return False
     return urlsplit(url).scheme.lower() in ("http", "https", "mailto", "file")
 
@@ -230,35 +242,83 @@ def wrap(spans: list[Span], width: int) -> list[list[Span]]:
     is cut); "\\n" spans are hard breaks. A word is what stands between
     spaces, whatever its styles: "(`LC_ALL`)" and "**bold**," are broken
     nowhere (a change of style was a place to break: "locale (⏎LC_ALL")."""
-    width = max(width, 1)  # (a table's column may be narrower than a paragraph: para keeps 8)
-    lines: list[list[Span]] = [[]]
-    used = 0
+    return list(wrapped(spans, width)) or [[]]
 
-    def new_line() -> None:
-        nonlocal used
-        while lines[-1] and lines[-1][-1].text == " ":
-            lines[-1].pop()
-        lines.append([])
-        used = 0
+
+def wrapped(spans: list[Span], width: int):
+    """The lines of :func:`wrap`, each as soon as it is full - a paragraph
+    of a line of 10 MB held all of its 2,000,000 words' spans before its
+    first line was written (566 MB, 21 s)."""
+    width = max(width, 1)  # (a table's column may be narrower than a paragraph: para keeps 8)
+    line: list[Span] = []
+    used, empty = 0, 0  # (empty: lines of nothing held back - none at the end)
+
+    def done(line: list[Span]):
+        nonlocal empty
+        while line and line[-1].text == " ":
+            line.pop()
+        if not line:
+            empty += 1
+            return
+        while empty:
+            empty -= 1
+            yield []
+        yield line
 
     for kind, piece in _tokens(spans):
         if kind == "break":
-            lines.append([])
-            used = 0
+            yield from done(line)
+            line, used = [], 0
+            continue
+        if kind == "run":  # (whole words of plain ASCII text, one space apart: as many as fit a line in one go)
+            text, style, url, at = piece.text, piece.style, piece.url, 0
+            while at < len(text):
+                room = width - used
+                if room <= 0:
+                    yield from done(line)
+                    line, used, room = [], 0, width
+                if at + room >= len(text):
+                    take = len(text)
+                elif text[at + room] == " ":
+                    take = at + room
+                else:
+                    take = text.rfind(" ", at, at + room)
+                if take > at:  # (words that fit)
+                    line.append(Span(text[at:take], style, url))
+                    used += take - at
+                elif used:  # (the next word does not fit: on the next line)
+                    yield from done(line)
+                    line, used = [], 0
+                    continue
+                else:  # (a word longer than a line: cut, ASCII - a column a letter)
+                    take = text.find(" ", at)
+                    take = len(text) if take < 0 else take
+                    while take - at > width:
+                        line.append(Span(text[at:at + width], style, url))
+                        yield from done(line)
+                        line, at = [], at + width
+                    line.append(Span(text[at:take], style, url))
+                    used = take - at
+                at = take
+                if at < len(text):  # (the space after it)
+                    if used < width:
+                        line.append(Span(" ", style, url))
+                        used += 1
+                    at += 1
             continue
         if kind == "space":
             # (one space between words, as the viewer shows them: a tag
             # dropped between two spaces left both)
-            if used and used < width and (lines[-1][-1].text != " " or piece.style.bg == "code_bg"):
-                lines[-1].append(Span(" ", piece.style, piece.url))
+            if used and used < width and (line[-1].text != " " or piece.style.bg == "code_bg"):
+                line.append(piece)
                 used += 1
             continue
-        sizes = [MD.cell_width(part.text) for part in piece]
-        size = sum(sizes)
+        size = MD.cell_width(piece[0].text) if len(piece) == 1 else sum(MD.cell_width(part.text) for part in piece)
         if used and used + size > width:
-            new_line()
+            yield from done(line)
+            line, used = [], 0
         if used + size <= width:
-            lines[-1].extend(piece)
+            line.extend(piece)
             used += size
             continue
         # A word longer than a line, cut from an index with its width kept
@@ -268,22 +328,19 @@ def wrap(spans: list[Span], width: int) -> list[list[Span]]:
             text, start = part.text, 0
             while start < len(text):
                 if used >= width:
-                    new_line()
+                    yield from done(line)
+                    line, used = [], 0
                 end = _cut_end(text, start, width - used)
                 chunk = text[start:end]
                 chunk_width = MD.cell_width(chunk)
                 if used and used + chunk_width > width:  # (a wide character at a line's end)
-                    new_line()
+                    yield from done(line)
+                    line, used = [], 0
                     continue
-                lines[-1].append(Span(chunk, part.style, part.url))
+                line.append(Span(chunk, part.style, part.url))
                 used += chunk_width
                 start = end
-    while lines and not lines[-1]:
-        lines.pop()
-    for line in lines:
-        while line and line[-1].text == " ":
-            line.pop()
-    return lines or [[]]
+    yield from done(line)
 
 
 def _cut(text: str, width: int) -> str:
@@ -295,6 +352,8 @@ def _cut_end(text: str, start: int, width: int) -> int:
     """Where the part of *text* from *start* that fits *width* columns ends
     (one character at least - as a reader sees one: an emoji sequence or a
     letter with its marks is never cut, core.markdown_doc.cluster_end)."""
+    if start < len(text) and text[start:start + max(width, 1) + 1].isascii():  # (a column a letter - the one
+        return min(len(text), start + max(width, 1))  # after it too: no mark of it - a link of 1 MB took 1 s)
     used, index = 0, start
     while index < len(text):
         end = MD.cluster_end(text, index)
@@ -360,30 +419,64 @@ def _tokens(spans: list[Span]):
                 word = []
             yield "break", span
             continue
-        for part in re.split(r"( +)", span.text):
-            if not part:
-                continue
-            if part.startswith(" "):
-                if word:
-                    yield "word", word
-                    word = []
-                # (code keeps its spaces, each of them: "a  b" is not "a b")
-                for _space in range(len(part) if span.style.bg == "code_bg" else 1):
-                    yield "space", Span(" ", span.style, span.url)
-            else:
-                word.append(Span(part, span.style, span.url))
+        style, url = span.style, span.url
+        code = style.bg == "code_bg"
+        text, start, end = span.text, 0, len(span.text)
+        if not code and end > RUN_CHARS and text.isascii():  # (its words between its first and last space: a
+            begin, stop = text.find(" "), text.rfind(" ")  # run wrapped lays out a line at a time - a word at a
+            after = _NOT_SPACE.search(text, begin) if begin >= 0 else None  # time, a line of 10 MB took 4 s)
+            begin = after.start() if after else -1
+            while stop > 0 and text[stop - 1] == " ":
+                stop -= 1
+            if 0 <= begin < stop:
+                yield from _words(text, 0, begin, word, style, url, code)
+                word = []
+                run = text[begin:stop]
+                yield "run", Span(_SPACE_RUNS.sub(" ", run) if "  " in run else run, style, url)
+                start = stop
+        word = yield from _words(text, start, end, word, style, url, code)
     if word:
         yield "word", word
+
+
+def _words(text: str, start: int, end: int, word: list, style, url: str, code: bool):
+    """_tokens' pieces of text[start:end] - *word* the pieces of a word before it - returning the pieces
+    of its last word (it may go on in the next span)."""
+    for found in _WORDS.finditer(text, start, end):  # (one at a time: a span of 10 MB was 4,000,000 at once)
+        part = found.group()
+        if part[0] == " ":
+            if word:
+                yield "word", word
+                word = []
+            # (code keeps its spaces, each of them: "a  b" is not "a b")
+            for _space in range(len(part) if code else 1):
+                yield "space", Span(" ", style, url)
+        else:
+            word.append(Span(part, style, url))
+    return word
+
+
+_WORDS = re.compile(r" +|[^ ]+")
+_NOT_SPACE = re.compile(r"[^ ]")
+_SPACE_RUNS = re.compile(r" {2,}")
+#: A span of plain ASCII text longer than this is laid out a line at a time (_tokens' "run").
+RUN_CHARS = 4096
 
 
 def _glue_words(line: list[Span]) -> list[Span]:
     """Neighbouring spans of the same style and link joined (fewer escapes)."""
     out: list[Span] = []
+    texts: list[str] = []
+    style, url = None, None
     for span in line:
-        if out and out[-1].style == span.style and out[-1].url == span.url:
-            out[-1] = Span(out[-1].text + span.text, span.style, span.url)
-        else:
-            out.append(Span(span.text, span.style, span.url))
+        if texts and (span.style is style or span.style == style) and span.url == url:
+            texts.append(span.text)
+            continue
+        if texts:
+            out.append(Span("".join(texts), style, url))
+        texts, style, url = [span.text], span.style, span.url
+    if texts:
+        out.append(Span("".join(texts), style, url))
     return out
 
 
@@ -490,7 +583,10 @@ def decode_picture(data: bytes, pixels: int = IMAGE_PIXELS):
         return "SVG is not drawn in the terminal"
     Image.MAX_IMAGE_PIXELS = IMAGE_PIXELS
     try:
-        image = Image.open(io.BytesIO(data))
+        # Raster formats only, told by the content: Pillow's own probing
+        # opened PostScript (a file named pic.png) as EPS, which runs
+        # Ghostscript on it, and decoded an .ico's embedded PNG in full.
+        image = Image.open(io.BytesIO(data), formats=PICTURE_FORMATS)
         if image.width * image.height > min(IMAGE_PIXELS, pixels):
             return "too big"
         image.seek(0)
@@ -630,15 +726,35 @@ class Options:
 class Renderer:
     """A parsed document as lines for the terminal (see the module docstring)."""
 
-    def __init__(self, options: Options) -> None:
+    def __init__(self, options: Options, tables: dict | None = None) -> None:
         self.o = options
+        #: a table drawn in parts (render_parts): the columns its first part was drawn with
+        self.tables = {} if tables is None else tables
+        self._goes_on = False
         self.p = Painter(options.depth, DARK if options.dark else LIGHT, options.hyperlinks)
         self.lines: list[str] = []
         self.notes: dict[str, list[str]] = {}
         #: the images drawn (IMAGES at most), the pixels they may still take
-        #: (IMAGES_PIXELS) and what each one drew ({(path, columns): lines or why})
-        self.drawn, self.pixels_left = 0, IMAGES_PIXELS
-        self.picture_cache: dict[tuple[str, int], list[str] | str] = {}
+        #: (IMAGES_PIXELS) and what each one drew ({(path, columns): lines or why}) - of the whole text,
+        #: its parts' Renderers sharing them (render_parts: each part drew 200, 6,000 images 193 MB)
+        self._images = self.tables.setdefault("images", {"drawn": 0, "left": IMAGES_PIXELS, "cache": {}})
+        self.picture_cache: dict[tuple[str, int], list[str] | str] = self._images["cache"]
+
+    @property
+    def drawn(self) -> int:
+        return self._images["drawn"]
+
+    @drawn.setter
+    def drawn(self, value: int) -> None:
+        self._images["drawn"] = value
+
+    @property
+    def pixels_left(self) -> int:
+        return self._images["left"]
+
+    @pixels_left.setter
+    def pixels_left(self, value: int) -> None:
+        self._images["left"] = value
 
     # -- inline --
 
@@ -683,6 +799,10 @@ class Renderer:
                 alt = "".join(" " if part.type in ("softbreak", "hardbreak") else part.content
                               for part in (child.children or ()) if part.type in
                               ("text", "code_inline", "softbreak", "hardbreak")) if child.children else child.content
+                if (child.meta or {}).get("refused"):  # (file:, a data: of no image: named, never read)
+                    at.spans.append(Span(f"🖼 {MD.clean(alt or '') or 'image'}", at.style.but(fg="image", bold=True)))
+                    at.spans.append(Span(" ‹address not allowed›", at.style.but(fg="muted", dim=True)))
+                    continue
                 self._image(at, MD.clean(str(child.attrGet("src") or "")), MD.clean(alt or ""))
             elif kind == "footnote_ref":
                 at.spans.append(Span(f"[{_note_number(child)}]", style.but(fg="link")))
@@ -828,8 +948,11 @@ class Renderer:
         first line, *rest* before the others (both already painted)."""
         # (the wider prefix: a table's record indents the lines after its first)
         room = max(8, width - max(MD.cell_width(_strip_ansi(first)), MD.cell_width(_strip_ansi(rest))))
-        for index, line in enumerate(wrap(spans, room)):
+        index = -1
+        for index, line in enumerate(wrapped(spans, room)):  # (each line written as it is full)
             self.emit((first if index == 0 else rest) + self.paint_line(line))
+        if index < 0:  # (nothing to wrap: its prefix still - as wrap's one empty line)
+            self.emit(first)
 
     def pictures(self, pictures: list[Picture], prefix: str, width: int) -> None:
         if self.o.images == "none":
@@ -958,7 +1081,8 @@ class Renderer:
             elif kind == "table_open":
                 close = self._close(tokens, index, end)
                 self.table(tokens, index, close, prefix, width)
-                self.blank()
+                if not self._goes_on:  # (its next part right under it)
+                    self.blank()
                 index = close + 1
             elif kind == "dl_open":
                 close = self._close(tokens, index, end)
@@ -1187,25 +1311,27 @@ class Renderer:
         it and colours are on)."""
         if self.p.depth != "none" and lang and len(text) < 200_000:
             try:
-                from pygments import highlight
+                from pygments import format as formatted
                 from pygments.formatters import (
                     Terminal256Formatter,
                     TerminalFormatter,
                     TerminalTrueColorFormatter,
                 )
-                from pygments.lexers import get_lexer_by_name
-                from pygments.util import ClassNotFound
 
-                lexer = get_lexer_by_name(lang.lower(), stripnl=False)
                 style = "github-dark" if self.o.dark else "default"
-                if self.p.depth == "truecolor":
-                    formatter = TerminalTrueColorFormatter(style=style)
-                elif self.p.depth == "256":
-                    formatter = Terminal256Formatter(style=style)
-                else:
-                    formatter = TerminalFormatter(bg="dark" if self.o.dark else "light")
-                return highlight(text, lexer, formatter).rstrip("\n").split("\n")
-            except (ImportError, ClassNotFound):
+                # (lexed in a child: a lexer's pattern stuck in backtracking held the terminal for ever -
+                # too slow, the block plain: core.markdown_doc.code_tokens)
+                tokens = MD.code_tokens(text if text.endswith("\n") else text + "\n", lang,
+                                        style if self.p.depth in ("truecolor", "256") else "default")
+                if tokens is not None:
+                    if self.p.depth == "truecolor":
+                        formatter = TerminalTrueColorFormatter(style=style)
+                    elif self.p.depth == "256":
+                        formatter = Terminal256Formatter(style=style)
+                    else:
+                        formatter = TerminalFormatter(bg="dark" if self.o.dark else "light")
+                    return formatted(tokens, formatter).rstrip("\n").split("\n")
+            except ImportError:
                 pass
             except Exception:  # noqa: BLE001 - a style missing in an old Pygments: plain
                 pass
@@ -1229,14 +1355,17 @@ class Renderer:
                 continue
             close = self._close(tokens, index, end)
             task = self._task(tokens, index, close)
-            if task is not None:
-                mark = self.p.paint("☑" if task else "☐", Style(fg="mark" if task else "open", bold=True))
-                bullet_width = 2
-            elif ordered:
+            if ordered:  # (every item counts - a task's too, its box after its number: "1. ☐ a", as GitHub)
                 label = f"{number}."
                 mark = self.p.paint(label, Style(fg="muted", bold=True))
                 bullet_width = len(label) + 1
                 number += 1
+                if task is not None:
+                    mark += " " + self.p.paint("☑" if task else "☐", Style(fg="mark" if task else "open", bold=True))
+                    bullet_width += 2
+            elif task is not None:
+                mark = self.p.paint("☑" if task else "☐", Style(fg="mark" if task else "open", bold=True))
+                bullet_width = 2
             else:
                 mark = self.p.paint(BULLETS[depth % len(BULLETS)], Style(fg="muted"))
                 bullet_width = 2
@@ -1332,10 +1461,17 @@ class Renderer:
                     aligns.append(align)
                 spans, _pictures = self.inline(tokens[index + 1], Style(bold=in_head, fg="h1" if in_head else ""))
                 row.append((spans, align))
-        self.draw_table(rows, header_rows, prefix, width)
+        marks = rows[0][0][0][0].text[:2] if rows and rows[0] and rows[0][0][0] else ""
+        continued, later = GOES_ON in marks, GOES_ON_LATER in marks
+        if continued or later:  # (a part of a table drawn in parts: _stream_tables)
+            first = rows[0][0][0][0]
+            rows[0][0][0][0] = Span(first.text.lstrip(GOES_ON + GOES_ON_LATER).lstrip(), first.style, first.url)
+        self.draw_table(rows, header_rows, prefix, width, continued=continued, later=later)
+        self._goes_on = later
         self._table_notes(prefix)
 
-    def draw_table(self, rows: list, header_rows: int, prefix: str, width: int, spans=()) -> None:
+    def draw_table(self, rows: list, header_rows: int, prefix: str, width: int, spans=(), continued: bool = False,
+                   later: bool = False) -> None:
         """Rows of cells - (spans, alignment) - as a table drawn with box
         characters (a Markdown table's, a raw-HTML one's). *spans*: raw
         HTML's cells spanning columns (core.markdown_doc.span_grid) - each as
@@ -1357,9 +1493,18 @@ class Renderer:
             extra = max(0, length(rows[row][column]) - sum(natural[column:column + count]) - 3 * (count - 1))
             for n in range(count):
                 natural[column + n] += extra // count + (1 if n < extra % count else 0)
+        if later and not continued and self.tables.get("natural"):  # (a table's first part: all of its rows'
+            whole = self.tables["natural"].pop(0)  # columns - _stream_tables)
+            if len(whole) == columns:
+                natural = [max(a, b) for a, b in zip(natural, whole)]
         widths = fit_columns(natural, width - MD.cell_width(_strip_ansi(prefix)) - (3 * columns + 1))
+        if continued and "widths" in self.tables:  # (a table's next part: its first part's columns)
+            widths = self.tables["widths"] if self.tables["widths"] is None \
+                or len(self.tables["widths"]) == columns else widths
+        if later and not continued:
+            self.tables["widths"] = widths
         if widths is None:
-            self.records(rows, header_rows, prefix, width)
+            self.records(rows, header_rows, prefix, width, continued)
             return
         border = Style(fg="border")
 
@@ -1376,8 +1521,11 @@ class Renderer:
                     out += both if c in top and c in under else up if c in top else down if c in under else line
             return prefix + self.p.paint(out + right, border)
 
-        self.emit(rule("┌", "┐", None, 0, both="┬", up="─"))
+        if not continued:
+            self.emit(rule("┌", "┐", None, 0, both="┬", up="─"))
         for number, cells in enumerate(rows):
+            if continued and number < header_rows:  # (its heading: over its first part only)
+                continue
             pieces = []  # (start column, width, spans, alignment) of each cell drawn
             for c, (cell_spans, align) in enumerate(cells):
                 if (number, c) in inside:
@@ -1398,9 +1546,10 @@ class Renderer:
                 self.emit(prefix + "".join(out))
             if number == header_rows - 1 and number < len(rows) - 1:
                 self.emit(rule("╞", "╡", number, number + 1, line="═", both="╪", up="╧", down="╤"))
-        self.emit(rule("└", "┘", len(rows) - 1, None, both="┴", down="─"))
+        if not later:
+            self.emit(rule("└", "┘", len(rows) - 1, None, both="┴", down="─"))
 
-    def records(self, rows, header_rows: int, prefix: str, width: int) -> None:
+    def records(self, rows, header_rows: int, prefix: str, width: int, continued: bool = False) -> None:
         """A table whose columns do not fit the width (each at least
         :data:`MIN_COLUMN`): a row after the other, each cell behind its
         column's heading. (Drawn wider, the terminal broke every line of it
@@ -1412,7 +1561,7 @@ class Renderer:
         if not body:  # (a table of headings only: the headings, not each behind itself)
             body, heads = rows[:header_rows], []
         for number, cells in enumerate(body):
-            if number:
+            if number or continued:  # (a table's next part: a line between it and the part before too)
                 self.emit(rule)
             for column, (spans, _align) in enumerate(cells):
                 head = heads[column] if column < len(heads) else ""
@@ -1466,10 +1615,26 @@ def _strip_ansi(text: str) -> str:
 #: (as in every view: core.markdown_doc.LIST_DEPTH).
 LIST_DEPTH = MD.LIST_DEPTH
 #: A text longer than this is rendered in parts of about STREAM_LINES lines
-#: (render_parts: markdown-it parses 100,000 list items in 7 s - the
-#: terminal showed nothing meanwhile).
-STREAM_CHARS = 500_000
+#: or STREAM_PART_CHARS characters, whichever comes first (render_parts:
+#: markdown-it parses 100,000 list items in 7 s - the terminal showed
+#: nothing meanwhile; 200 display formulas of 200 fractions each, 560 KB in
+#: 800 lines, were one part: 1.5 s before the window showed any).
+STREAM_CHARS = 200_000
 STREAM_LINES = 2000
+STREAM_PART_CHARS = 100_000
+#: ... and a text of more lines than this, however short (50,000 task items
+#: of 400 KB were one part: 5 s before the window showed any).
+STREAM_ROWS = 4 * STREAM_LINES
+#: A line of a paragraph's text and nothing else (no block begins with it,
+#: no code, formula, table cell or tag goes on past it): a paragraph of more
+#: than LONG_PARAGRAPH of them in a row may be cut there - into two
+#: paragraphs (one of 100,000 lines was one part: 15 s before the window
+#: showed any).
+LONG_PARAGRAPH = 2000
+_PLAIN_ROW = re.compile(r"(?![#>=`$<\[]|[-+*_](?:[ \t]|[-+*_ \t]*\Z)|\d{1,9}[.)](?:[ \t]|\Z)|[:~][ \t])"
+                        r"[^\s|$`<][^|$`<]*\Z")
+#: The labels a part refers to ("[label]": a link's, a reference's, an image's).
+_LABEL = re.compile(r"\[([^\[\]]{1,999})\]")
 _FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 _REFERENCE = re.compile(r"^ {0,3}\[[^\]]+\]:\s*\S")
 _TOP_ITEM = re.compile(r"^(?:[-+*]|\d{1,9}[.)])(?:[ \t]|$)")
@@ -1478,6 +1643,87 @@ _TOP_ITEM = re.compile(r"^(?:[-+*]|\d{1,9}[.)])(?:[ \t]|$)")
 #: An item of a top-level ordered list: its number.
 _NUMBERED_ITEM = re.compile(r"^(\d{1,9})[.)](?:[ \t]|$)")
 _FRONT_LINE = re.compile(r"^ {0,3}(?:-{3,}|\+{3,})[ \t]*\Z")
+
+
+#: The label an inline note (^[...]) gets when a long text is parted (labeled_inline_notes).
+INLINE_NOTE_LABEL = "axross-inline-"
+_BLOCK_START = re.compile(r"[#>\-+*=|~:<]|\d{1,9}[.)](?:\s|$)")
+_NOTE_STOPS = re.compile(r"\\.|`|\^\[|\[|\]")
+
+
+def labeled_inline_notes(text: str) -> str:
+    """*text* - long enough to be parsed in parts - with each inline note
+    (``^[...]``) a footnote of its own: a reference where it stands, its
+    definition at the end. markdown-it numbers both as they come, so the
+    page is the same; a text with inline notes was one part (3.8 MB with
+    1,500: nothing in the window for 10 s, in the terminal for a minute).
+    Only where it is sure: a note on one line, outside code, without code
+    or a line end in it - else *text* as it is (one part, as before)."""
+    if "^[" not in text or INLINE_NOTE_LABEL in text \
+            or (len(text) <= STREAM_CHARS and text.count("\n") <= STREAM_ROWS):
+        return text
+    lines, out, notes, fence, code = text.split("\n"), [], [], None, 0
+    for line in lines:
+        opened = _FENCE.match(line)
+        if fence is not None:
+            if opened and opened.group(1)[0] == fence[0] and len(opened.group(1)) >= len(fence):
+                fence = None
+            out.append(line)
+            continue
+        if opened:
+            fence = opened.group(1)
+            out.append(line)
+            continue
+        if not line.strip():
+            code = 0  # (a code span never goes past an empty line)
+        if "^[" not in line:
+            out.append(line)
+            code = (code + line.count("`")) % 2 if "`" in line else code
+            continue
+        if line[:1] in "\t<" or line.startswith("    ") or code:  # (indented code, raw HTML, a code span open)
+            return text
+        made, at, opened, depth, outer = [], 0, -1, 0, 0
+        for found in _NOTE_STOPS.finditer(line):  # (its marks only: a line of 3 KB was read a letter at a time)
+            mark = found.group(0)
+            if mark[0] == "\\":
+                continue
+            if mark == "`":
+                return text  # (code on a line with a note: not sure where it ends)
+            if opened < 0:
+                if mark == "^[":
+                    if outer:  # (in a link's text: a reference there is no note - "[x [^a]](u)" no link)
+                        return text
+                    opened, depth = found.start(), 0
+                elif mark == "[":
+                    outer += 1
+                elif outer:
+                    outer -= 1
+                continue
+            if mark in ("[", "^["):
+                depth += 1
+            elif mark == "]" and depth:
+                depth -= 1
+            elif mark == "]":
+                content = line[opened + 2:found.start()].strip()
+                if not content:
+                    return text
+                block = _BLOCK_START.match(content)
+                if block:  # (its first mark no block's in the definition: "- a" was a list)
+                    if content[0].isdigit():
+                        digits = len(re.match(r"\d+", content).group(0))
+                        content = content[:digits] + "\\" + content[digits:]
+                    else:
+                        content = "\\" + content
+                notes.append(content)
+                made.append(line[at:opened] + f"[^{INLINE_NOTE_LABEL}{len(notes)}]")
+                at, opened = found.end(), -1
+        if opened >= 0:
+            return text  # (a note going on past its line)
+        out.append("".join(made) + line[at:])
+    if not notes or fence is not None:
+        return text
+    return "\n".join(out).rstrip("\n") + "\n\n" + "".join(
+        f"[^{INLINE_NOTE_LABEL}{number}]: {content}\n" for number, content in enumerate(notes, 1))
 
 
 def text_parts(text: str, lines: int | None = None) -> list[str]:
@@ -1496,6 +1742,99 @@ def notes_of(text: str) -> list[str] | None:
     return (MD.note_labels(text) or None) if "[^" in text else None
 
 
+#: A table of more rows than this is drawn in parts of so many (render_parts:
+#: the terminal wrote nothing of a table of 100,000 rows for 46 s, and held
+#: all of it - 795 MB): one table to see, the first part's columns for all.
+TABLE_PART_ROWS = 500
+#: Columns of a table drawn at most - wider, it is shown as written, as the
+#: window shows it (ui.markdown_view.TABLE_COLUMNS).
+TABLE_COLUMNS = 64
+#: Mark a table's part (at its first heading): it goes on from the part before
+#: - no heading, no top line - and another part of it comes after - no line
+#: under it. Private-use characters, never a text's own.
+GOES_ON, GOES_ON_LATER = "\ue066", "\ue067"
+_TABLE_DELIMITER = re.compile(r"^ {0,3}\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)*\|?\s*$")
+
+
+_CELL_APART = re.compile(r"(?<!\\)\|")
+_CELL_LINK = re.compile(r"!?\[([^\[\]]*)\]\([^()\s]*\)")
+
+
+def _column_widths(rows: list[str], columns: int) -> list[int]:
+    """How wide each column of a table's *rows* (as written) is at most - a
+    link as its text and its note's number ("[12]"), the rest as written:
+    the columns of a table drawn in parts (its first part's alone were too
+    narrow for the rows after it)."""
+    widths = [0] * columns
+    for row in rows:
+        cells = _CELL_APART.split(row.strip().strip("|") if not row.strip().endswith("\\|")
+                                  else row.strip().lstrip("|"))
+        for column, cell in enumerate(cells[:columns]):
+            cell = cell.strip()
+            size = MD.cell_width(_CELL_LINK.sub(lambda m: m.group(1) + "[000]", cell)) if cell else 0
+            if size > widths[column]:
+                widths[column] = size
+    return widths
+
+
+def _stream_tables(text: str, widths: list | None = None) -> tuple[str, bool]:
+    """(*text* with each table of the top level longer than TABLE_PART_ROWS
+    rows in parts of so many - its heading again over each, marked GOES_ON
+    and GOES_ON_LATER -, each wider than TABLE_COLUMNS columns in a fenced
+    block as written; whether one was). *widths*: each table in parts' the
+    columns of all of its rows are appended to (_column_widths)."""
+    if "|" not in text or "-" not in text:
+        return text, False
+    lines = text.split("\n")
+    out, fence, wide, index, changed = [], None, False, 0, False
+    while index < len(lines):
+        line = lines[index]
+        opened = _FENCE.match(line)
+        if fence is not None:  # (code: as it is)
+            if opened and opened.group(1)[0] == fence[0] and len(opened.group(1)) >= len(fence):
+                fence = None
+            out.append(line)
+            index += 1
+            continue
+        if opened:
+            fence = opened.group(1)
+            out.append(line)
+            index += 1
+            continue
+        if "|" in line and line[:1] not in " \t>" and index + 1 < len(lines) \
+                and _TABLE_DELIMITER.match(lines[index + 1]) and "|" in lines[index + 1] + line:
+            end = index + 2
+            while end < len(lines) and lines[end].strip():
+                end += 1
+            columns = max(1, lines[index + 1].strip().strip("|").count("|") + 1)
+            body = lines[index + 2:end]
+            if columns > TABLE_COLUMNS:
+                longest = max((len(run) for row in lines[index:end] for run in re.findall(r"`{3,}", row)), default=2)
+                out += ["`" * (longest + 1) + "text", *lines[index:end], "`" * (longest + 1)]
+                wide = changed = True
+            elif len(body) > TABLE_PART_ROWS:
+                changed = True
+                if widths is not None:
+                    widths.append(_column_widths([lines[index], *body], columns))
+                for first in range(0, len(body), TABLE_PART_ROWS):
+                    marks = (GOES_ON if first else "") + (GOES_ON_LATER if first + TABLE_PART_ROWS < len(body)
+                                                          else "")
+                    head = lines[index]
+                    lead = len(head) - len(head.lstrip())
+                    head = (head[:lead + 1] + marks + head[lead + 1:] if head.lstrip().startswith("|")
+                            else head[:lead] + marks + head[lead:])
+                    if first:
+                        out.append("")
+                    out += [head, lines[index + 1], *body[first:first + TABLE_PART_ROWS]]
+            else:
+                out += lines[index:end]
+            index = end
+            continue
+        out.append(line)
+        index += 1
+    return ("\n".join(out) if changed else text), wide
+
+
 def _text_parts(text: str, lines: int | None = None) -> list[tuple[str, bool, int | None]]:
     """*text* in parts of about *lines* lines that read as the whole does:
     cut only before a list item or a block of the top level (after an empty
@@ -1505,7 +1844,7 @@ def _text_parts(text: str, lines: int | None = None) -> list[tuple[str, bool, in
     - a text with them was one part, 5 s before the page or the terminal
     showed anything of 1 MB. (An inline note, ^[...]: one part still.)"""
     lines = STREAM_LINES if lines is None else lines  # (read now: a test may make the parts small)
-    if len(text) <= STREAM_CHARS:
+    if len(text) <= STREAM_CHARS and text.count("\n") <= STREAM_ROWS:
         return [(text, False, 0)]
     plan = MD.note_plan(text) if "[^" in text else None
     if plan is None and "^[" in text:
@@ -1514,7 +1853,7 @@ def _text_parts(text: str, lines: int | None = None) -> list[tuple[str, bool, in
     if plan is not None:  # (the notes' definitions: a part of their own, the last - never cut)
         text, notes, _labels, noted = plan
     rows = text.split("\n")
-    cuts, fence, since, ordinal = [0], None, 0, None
+    cuts, fence, since, ordinal, plain, size = [0], None, 0, None, 0, 0
     # (a footnote's definition no link's: all again in the last part - note_plan)
     definitions = [row for row in rows if _REFERENCE.match(row) and not row.lstrip().startswith("[^")]
     for number, row in enumerate(rows):
@@ -1525,29 +1864,58 @@ def _text_parts(text: str, lines: int | None = None) -> list[tuple[str, bool, in
             continue
         if opened:
             fence = opened.group(1)
+            plain = 0
             continue
         since += 1
+        size += len(row) + 1
+        plain = plain + 1 if _PLAIN_ROW.match(row) else 0
         numbered = _NUMBERED_ITEM.match(row)
         if numbered:  # (a top-level ordered list's item: the number it is shown with)
             ordinal = int(numbered.group(1)) if ordinal is None else ordinal + 1
         elif row.strip() and row[:1] not in " \t":
             ordinal = None  # (the list has ended)
-        if since >= lines and number and row[:1] not in " \t>|" and row.strip() and not _FRONT_LINE.match(row) \
-                and (_TOP_ITEM.match(row) or not rows[number - 1].strip()) and number not in noted:
+        if (since >= lines or size >= STREAM_PART_CHARS) and number and row.strip() \
+                and (row[:1] not in " \t>|" or GOES_ON in row[:2]) \
+                and not _FRONT_LINE.match(row) \
+                and (_TOP_ITEM.match(row) or not rows[number - 1].strip()
+                     or plain > LONG_PARAGRAPH  # (a paragraph of thousands of lines: cut in it)
+                     or (_REFERENCE.match(row) and _REFERENCE.match(rows[number - 1]))) \
+                and number not in noted:  # (... and between definitions)
             cuts.append(number)
-            since = 0
+            since = size = 0
             if numbered and ordinal is not None:  # (a part beginning in a list: numbered on - "1997." then "1.")
                 rows[number] = f"{ordinal}{row[numbered.end(1):]}"
     cuts.append(len(rows))
-    tail = ("\n\n" + "\n".join(definitions) + "\n") if definitions else ""
+    # (each part with the definitions it refers to - all of them in each, 50,000 were parsed again with
+    # every part: the first one came after 19 s)
+    defined: dict[str, list[str]] = {}
+    for row in definitions:
+        defined.setdefault(_label_key(row[row.index("[") + 1:row.index("]:")]), []).append(row)
+    escaped = [label for label in defined if "\\" in label]  # (a label of "\\]": in every part, as before)
+
+    def tail(part: list[str]) -> str:  # (the labels of what is not a definition itself)
+        if not defined:
+            return ""
+        found = _LABEL.findall("\n".join(row for row in part if not _REFERENCE.match(row)))
+        wanted = [row for label in dict.fromkeys([*map(_label_key, found), *escaped])
+                  for row in defined.get(label, ())]
+        return ("\n\n" + "\n".join(wanted) + "\n") if wanted else ""
+
     # (each with whether an empty line was before it: the blank line between
     # two blocks the parts are cut between - lost at every cut - or none,
     # between two items of a list)
-    parts = [("\n".join(rows[a:b]) + tail, bool(a) and not rows[a - 1].strip(), a)
-             for a, b in zip(cuts, cuts[1:]) if a < b]
+    parts = []
+    for a, b in zip(cuts, cuts[1:]):
+        if a < b:
+            parts.append(("\n".join(rows[a:b]) + tail(rows[a:b]), bool(a) and not rows[a - 1].strip(), a))
     if notes:
-        parts.append((notes + tail, True, None))
+        parts.append((notes + tail(notes.split("\n")), True, None))
     return parts
+
+
+def _label_key(label: str) -> str:
+    """A reference's label as markdown-it matches it (normalizeReference): its spaces one, its case none."""
+    return " ".join(label.split()).lower().upper()
 
 
 def render_parts(text: str, options: Options | None = None):
@@ -1556,16 +1924,24 @@ def render_parts(text: str, options: Options | None = None):
     options = options or Options()
     text, flattened = MD.flatter(text, LIST_DEPTH)
     text, shallower = MD.quote_flatter(text)
+    tables: dict = {"natural": []}  # (a table drawn in parts: its columns - Renderer.draw_table)
+    text, wide = _stream_tables(text, tables["natural"])
+    text = labeled_inline_notes(text)  # (a text with inline notes in parts too)
     parts = _text_parts(text)
     labels = notes_of(text) if len(parts) > 1 else None
     for number, (part, apart, first) in enumerate(parts):
-        shown = Renderer(options).render(MD.parse(part, notes=(labels, number == len(parts) - 1, first)
-                                                  if labels else None))
+        doc = MD.parse(part, notes=(labels, number == len(parts) - 1, first) if labels else None)
+        try:
+            shown = Renderer(options, tables).render(doc)
+        except (Exception, RecursionError) as exc:  # noqa: BLE001 - a block's fault: the part as written,
+            shown = Renderer(options).render(MD.as_written(doc.source or part, exc))  # never a traceback
         if shown.strip():  # (a part of nothing to show - definitions, a comment: no empty lines either)
-            yield ("\n" + shown) if apart else shown
-    if flattened or shallower:
+            yield ("\n" + shown) if apart and GOES_ON not in part[:2] else shown  # (a table's next part: on)
+    if flattened or shallower or wide:
         note = " ".join(([f"(lists nested more than {LIST_DEPTH} deep are shown flatter)"] if flattened else [])
                         + ([f"(quotes nested more than {MD.QUOTE_DEPTH} deep are shown flatter)"] if shallower
+                           else [])
+                        + ([f"(tables of more than {TABLE_COLUMNS} columns are shown as written)"] if wide
                            else []))
         painter = Painter(options.depth, DARK if options.dark else LIGHT)
         import textwrap

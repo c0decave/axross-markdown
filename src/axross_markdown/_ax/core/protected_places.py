@@ -39,6 +39,7 @@ listed; the write list above is not changed by it.
 
 from __future__ import annotations
 
+import functools
 import os
 import sys
 
@@ -647,6 +648,82 @@ def _dynamic_dirs(environ, home_list: list[str]) -> list[str]:
     return out
 
 
+def _own_base() -> str:
+    """The folder holding axross's packages (``core`` among them)."""
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+@functools.lru_cache(maxsize=1)
+def own_source_folder() -> str | None:
+    """The source folder axross runs from (a checkout, ``pip install -e``),
+    or None (installed in site-packages, a one-file build). Python code put
+    anywhere below it is code of axross's next start: ``python main.py``
+    puts it first on sys.path, before the standard library (a new
+    ``json.py`` there is imported instead of the real one), a namespace
+    package stands in for a missing optional dependency, and a ``.pyc`` in
+    ``__pycache__`` stamped with its source's mtime and size is loaded
+    instead of the source."""
+    if getattr(sys, "frozen", False):
+        return None
+    base = _own_base()
+    if os.path.basename(base) in SITE_DIR_NAMES:
+        return None
+    return base
+
+
+def _code_suffixes() -> tuple[str, ...]:
+    import importlib.machinery
+
+    return tuple(s.casefold() for s in (*importlib.machinery.all_suffixes(),
+                                         ".py", ".pyw", ".pyc", ".pyo", ".pyd", ".so", ".pth"))
+
+
+def _own_new_code(ck: tuple[str, ...], source_key: tuple[str, ...] | None) -> bool:
+    """*ck* is below axross's source folder (*source_key*) and Python code
+    there: a module or extension by its suffix, or inside ``__pycache__``."""
+    if source_key is None or len(ck) <= len(source_key) or ck[:len(source_key)] != source_key:
+        return False
+    below = ck[len(source_key):]
+    if any(_fold_name(part) == "__pycache__" for part in below):
+        return True
+    return _fold_name(below[-1]).endswith(_code_suffixes())
+
+
+@functools.lru_cache(maxsize=1)
+def own_code_places() -> list[tuple[str, bool]]:
+    """``(path, is_folder)`` of the code of the axross that runs: what its
+    next start runs with the user's rights, outside any sandbox. From a
+    source folder (a checkout, ``pip install -e``) its packages (folders
+    with an ``__init__.py``), ``resources`` (extensions and scripts) and its
+    top-level ``*.py``; from site-packages that folder; a one-file build's
+    binary (and the AppImage); a venv's ``pyvenv.cfg`` and its programs."""
+    out: list[tuple[str, bool]] = []
+    if getattr(sys, "frozen", False):
+        for binary in (sys.executable, os.environ.get("APPIMAGE", "")):
+            if binary and os.path.isabs(binary):
+                out.append((os.path.abspath(binary), False))
+    else:
+        base = _own_base()
+        if os.path.basename(base) in SITE_DIR_NAMES:
+            out.append((base, True))
+        else:
+            try:
+                names = sorted(os.listdir(base))
+            except OSError:
+                names = []
+            for name in names:
+                full = os.path.join(base, name)
+                if name.endswith(".py") and os.path.isfile(full):
+                    out.append((full, False))
+                elif os.path.isdir(full) and not os.path.islink(full) and (
+                        name == "resources" or os.path.isfile(os.path.join(full, "__init__.py"))):
+                    out.append((full, True))
+    if sys.prefix != getattr(sys, "base_prefix", sys.prefix):
+        out.append((os.path.join(sys.prefix, "pyvenv.cfg"), False))
+        out.append((os.path.join(sys.prefix, "Scripts" if os.name == "nt" else "bin"), True))
+    return out
+
+
 def home_path_dirs(environ=os.environ) -> list[str]:
     """The PATH entries inside a home folder (for :data:`HOST_PATH_ENV`)."""
     home_keys = [_key(h) for h in homes(environ)]
@@ -697,6 +774,9 @@ def protected_paths(environ=os.environ, *, foreign_missing: bool = True
                 add(path, True)
     for path in _dynamic_dirs(environ, home_list):
         add(path, True)
+    # axross's own code: an agent that rewrote it would run at axross's next start
+    for path, folder in own_code_places():
+        add(path, folder)
     for folder in zdotdirs(environ):
         for name in ZSH_FILES:
             add(os.path.join(folder, name), False)
@@ -1442,6 +1522,8 @@ def write_checker(environ=os.environ, *, granted=(), members: bool = False):
         if hook_path is not None and (value.startswith("~") or os.path.isabs(value)):
             global_keys += _folded_keys(hook_path)
     repo_memo: dict[str, list[tuple[str, ...]]] = {}
+    source = own_source_folder()
+    source_key = _key(source) if source else None
     try:
         from axross_markdown._ax.core.mcp_script_pin import write_guard  # files host-run MCP servers run
     except ImportError:
@@ -1507,6 +1589,9 @@ def write_checker(environ=os.environ, *, granted=(), members: bool = False):
                 if entry and len(ck) < len(pk) and pk[:len(ck)] == ck:
                     return f"{path} holds {place}, which the agent does not change"
         for ck, candidate in keyed:
+            if _own_new_code(ck, source_key):
+                return (f"{path}: the agent does not add or change Python code in the folder "
+                        f"axross runs from ({source}): its next start would run it")
             if _git_code(ck, candidate, shape_memo):
                 return _git_message(path)
             project = _project_code(ck, grants)
@@ -1749,19 +1834,47 @@ REMOTE_SECRET_FOLDERS = {
 }
 
 
-def remote_secret_refusal(path: str) -> str | None:
+#: Secret on a remote by their name (beside :data:`SECRET_NAMES_ANYWHERE`):
+#: shell histories (passwords typed on a command line) and rclone's file of
+#: every remote's credentials.
+REMOTE_SECRET_NAMES = (".bash_history", ".zsh_history", ".sh_history", ".histfile",
+                       "rclone.conf")
+#: ... and by their path, part by part ("*" one name): a process's
+#: environment, the TLS private keys of the system.
+REMOTE_SECRET_PATHS = (("proc", "*", "environ"), ("proc", "*", "task", "*", "environ"),
+                       ("etc", "ssl", "private", "*"), ("etc", "pki", "tls", "private", "*"))
+
+
+def _remote_secret_path(parts: tuple[str, ...]) -> bool:
+    import fnmatch
+
+    for pattern in REMOTE_SECRET_PATHS:
+        if len(parts) == len(pattern) and all(
+                fnmatch.fnmatchcase(part.casefold(), want) for part, want in zip(parts, pattern)):
+            return True
+    return False
+
+
+def remote_secret_refusal(path: str, *, entry: bool = False) -> str | None:
     """Why *path* on a remote machine is a secret by its name, or None: the
     names secret anywhere (and their backup copies), the folder/file pairs
     of :data:`SECRET_PATHS_ANYWHERE`, and the files of ``.ssh`` and
     ``.gnupg`` (:data:`REMOTE_SECRET_FOLDERS`). The local rules that need
-    the home folder or the file's content cannot be applied there."""
+    the home folder or the file's content cannot be applied there.
+    *entry*: the path is moved whole - a folder whose name makes its files
+    secret (``.ssh``, ``.gnupg``, ``.kube``) would lose that name."""
     import fnmatch
 
     parts = tuple(p for p in path.replace("\\", "/").split("/") if p and p != ".")
     if not parts:
         return None
     name = parts[-1]
-    secret = _secret_anywhere(name) or _secret_path_anywhere(parts)
+    if entry and (name.casefold() in REMOTE_SECRET_FOLDERS or _secret_pair_folder(name)):
+        return (f"{path} holds secret files by its name, which the MCP server does not move "
+                "on a remote either (--mcp-allow-secret-reads hands secrets out)")
+    secret = _secret_anywhere(name) or _secret_path_anywhere(parts) \
+        or _without_backup_suffix(name).casefold() in REMOTE_SECRET_NAMES \
+        or _remote_secret_path(parts)
     for folder, allowed in REMOTE_SECRET_FOLDERS.items():
         if len(parts) >= 2 and folder in (p.casefold() for p in parts[:-1]):
             if not any(fnmatch.fnmatchcase(name.casefold(), pat) for pat in allowed):
@@ -1773,11 +1886,18 @@ def remote_secret_refusal(path: str) -> str | None:
 
 
 def _secret_path_anywhere(ck: tuple[str, ...]) -> bool:
-    """Whether *ck* ends in one of :data:`SECRET_PATHS_ANYWHERE`."""
+    """Whether *ck* ends in one of :data:`SECRET_PATHS_ANYWHERE` (or a
+    backup copy of its file: ``.aws/credentials.bak``)."""
     if len(ck) < 2:
         return False
-    tail = (ck[-2].casefold(), ck[-1].casefold())
+    tail = (ck[-2].casefold(), _without_backup_suffix(ck[-1]).casefold())
     return any(tail == (folder, name) for folder, name in SECRET_PATHS_ANYWHERE)
+
+
+def _secret_pair_folder(name: str) -> bool:
+    """*name* is the folder of a :data:`SECRET_PATHS_ANYWHERE` pair: moved
+    whole, its file would lose what makes it secret."""
+    return name.casefold() in {folder for folder, _file in SECRET_PATHS_ANYWHERE}
 
 
 def _secret_pattern():
@@ -2246,6 +2366,9 @@ def secret_checker(environ=os.environ, *, granted=()):
                 return (f"{path}: the agent does not read a process's environment, command "
                         "line, memory or open files below /proc, nor /run/secrets: they "
                         "hold API keys and tokens")
+            if entry and ck and _secret_pair_folder(ck[-1]):
+                # Renamed, ".kube/config" would be a plain "plain/config".
+                return f"{path} holds secret files, which the agent does not read"
             if ck and (_secret_anywhere(ck[-1]) or _secret_path_anywhere(ck)):
                 return (f"{path}: the agent does not read this file: by its name it holds "
                         "credentials, keys or secrets wherever it is (.env, *.env, .envrc, "

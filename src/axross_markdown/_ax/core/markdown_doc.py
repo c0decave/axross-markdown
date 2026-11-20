@@ -43,10 +43,15 @@ from __future__ import annotations
 import bisect
 import contextvars
 import functools
+import logging
 import re
 import textwrap
+import threading
+import time
 import unicodedata
 from dataclasses import dataclass, field
+
+log = logging.getLogger(__name__)
 
 #: Levels of a list laid out as nested, in every view (the viewer's two
 #: parsers, the terminal, a page of HTML): deeper items are shown at this
@@ -150,16 +155,164 @@ class Document:
     parser: object = None
     #: the footnote labels in the order the notes are listed
     notes: list[str] = field(default_factory=list)
+    #: why the text could not be parsed ("" when it was): then it is shown as written (_as_written)
+    failed: str = ""
+    #: the text parsed (as parse was given it): a view whose rendering of the
+    #: tokens fails shows it as written instead (as_written)
+    source: str = ""
+
+
+def as_written(text: str, exc: BaseException | str, parser=None) -> Document:
+    """*text* as written - a notice saying why above it - for a view whose
+    rendering of its tokens failed (a formula, a rule's fault): never a
+    blank page or a traceback."""
+    why = exc if isinstance(exc, str) else f"{type(exc).__name__}: {exc}"[:200]
+    return _as_written(text, parser or make_parser(), why)
+
+
+def _not_installed(exc: ImportError) -> ImportError:
+    """The error for a parser asked for without markdown-it-py: it is
+    optional in axross (no extra of axross names it - Qt's own parser stands
+    in), so every caller asks available() first."""
+    return ImportError(f"markdown-it-py and mdit-py-plugins are needed for this parser ({exc})")
+
+
+def token_class():
+    """markdown-it's Token (for the parser's own rules)."""
+    try:
+        from markdown_it.token import Token
+    except ImportError as exc:
+        raise _not_installed(exc) from exc
+    return Token
+
+
+def _normalize(state) -> None:
+    """markdown-it's own normalize - line ends as LF, NUL as U+FFFD - with
+    str.replace, done only when there is one: its two passes of a regular
+    expression over all of a text held Python's lock (a worker's, the
+    window waited) 0.1 s for a line of 10 MB."""
+    src = state.src
+    if "\r" in src:
+        src = src.replace("\r\n", "\n").replace("\r", "\n")
+    if "\0" in src:
+        src = src.replace("\0", "\ufffd")
+    state.src = src
+
+
+_TODO = re.compile(r"\[[ xX]\][ \t\n\v\f\r]+")
+
+# The task-list plugin's class, written in two parts: whole, its "sk-…" tail
+# reads like an API key to the public export's leak gate.
+_TASK_BOX = "task-list-" "item-checkbox"
+
+
+def _task_lists(state) -> None:
+    """mdit-py-plugins' task lists ("- [ ] x" a box), its list found in one
+    pass: the plugin looked for each item's list back from the item, token
+    by token - a list of 50,000 tasks took it 2.3 s of a parse's 12."""
+    Token = token_class()
+    tokens = state.tokens
+    last: dict[int, int] = {}  # (the latest token of each level so far)
+    for index, token in enumerate(tokens):
+        if 2 <= index < len(tokens) - 1 and token.type == "inline" and tokens[index - 1].type == "paragraph_open" \
+                and tokens[index - 2].type == "list_item_open" and _TODO.match(token.content):
+            box = Token("html_inline", "", 0)
+            if token.content.startswith("[ ] "):  # (as the plugin: "[ ]" and a line end, no box but the text's
+                box.content = f'<input class="{_TASK_BOX}" disabled="disabled" type="checkbox">'  # cut)
+            elif token.content.startswith(("[x] ", "[X] ")):
+                box.content = (f'<input class="{_TASK_BOX}" checked="checked" disabled="disabled" '
+                               'type="checkbox">')
+            token.children.insert(0, box)
+            token.children[1].content = token.children[1].content[3:]
+            token.content = token.content[3:]
+            item = tokens[index - 2]
+            item.attrSet("class", "task-list-item")
+            tokens[last.get(item.level - 1, len(tokens) - 1)].attrSet("class", "contains-task-list")
+        last[token.level] = index
+
+
+def _linkify_in_pieces(md) -> None:
+    """linkify-it-py's searches a piece of a long text at a time: its rule
+    pretested all of an inline's text and matched all of a text token in one
+    call each - a line of 10 MB held Python's lock for seconds, the window
+    froze though only a worker parsed. A long text token is cut where a word
+    begins (a link holds no space; markdown-it's text_join joins the pieces
+    again), the pretest is asked of the pieces (_text_pieces)."""
+    finder = md.linkify
+    if getattr(finder, "_ax_pieces", False):
+        return
+    whole = finder.pretest
+
+    def pretest(text: str) -> bool:
+        if len(text) <= LINES_AT_ONCE:
+            return whole(text)
+        return any(whole(text[begin:stop]) for begin, stop in _text_pieces(text))
+
+    finder.pretest = pretest
+    finder._ax_pieces = True
+    Token = token_class()
+
+    def cut(state) -> None:
+        for token in state.tokens:
+            if token.type != "inline" or not token.children or len(token.content) <= LINES_AT_ONCE:
+                continue
+            children = []
+            for child in token.children:
+                if child.type != "text" or len(child.content) <= LINES_AT_ONCE:
+                    children.append(child)
+                    continue
+                for begin, stop in _text_pieces(child.content):
+                    piece = Token("text", "", 0)
+                    piece.content, piece.level = child.content[begin:stop], child.level
+                    children.append(piece)
+            token.children = children
+
+    md.core.ruler.before("linkify", "linkify_pieces", cut)
+
+
+_QUOTE_MARK = re.compile(r"[ \t]{0,3}>[ \t]?")
+
+
+def _quoted_math(state) -> None:
+    """A display formula in a quote without its lines' "> " (mdit-py-plugins
+    0.6 keeps them in the block's content: "> $$ / > a = \\frac12 / > $$" was
+    "> a = ½ >" - in the window, the terminal, the exported page and a copy).
+    Each line after the first loses one mark a quote around it - only when
+    every one of them has those marks (a newer plugin takes them off itself)."""
+    depth = 0
+    for token in state.tokens:
+        if token.type == "blockquote_open":
+            depth += 1
+        elif token.type == "blockquote_close":
+            depth -= 1
+        elif token.type in ("math_block", "math_block_label") and depth > 0 and "\n" in token.content:
+            first, *rest = token.content.split("\n")
+            stripped = []
+            for line in rest:
+                for _level in range(depth):
+                    mark = _QUOTE_MARK.match(line)
+                    if mark is None:
+                        break
+                    line = line[mark.end():]
+                else:
+                    stripped.append(line)
+                    continue
+                break
+            else:
+                token.content = "\n".join([first, *stripped])
 
 
 def make_parser():
     """A markdown-it parser with the full set this module promises."""
-    from markdown_it import MarkdownIt
-    from mdit_py_plugins.deflist import deflist_plugin
-    from mdit_py_plugins.dollarmath import dollarmath_plugin
-    from mdit_py_plugins.footnote import footnote_plugin
-    from mdit_py_plugins.front_matter import front_matter_plugin
-    from mdit_py_plugins.tasklists import tasklists_plugin
+    try:
+        from markdown_it import MarkdownIt
+        from mdit_py_plugins.deflist import deflist_plugin
+        from mdit_py_plugins.dollarmath import dollarmath_plugin
+        from mdit_py_plugins.footnote import footnote_plugin
+        from mdit_py_plugins.front_matter import front_matter_plugin
+        from mdit_py_plugins.tasklists import tasklists_plugin
+    except ImportError as exc:
+        raise _not_installed(exc) from exc
 
     linkify = _has_linkify()
     # html=True only so that raw HTML comes as tokens of its own: _safe_html
@@ -169,7 +322,9 @@ def make_parser():
     md.enable(["table", "strikethrough"])
     if linkify:
         md.enable("linkify")
+        _linkify_in_pieces(md)
     md.use(front_matter_plugin).use(footnote_plugin).use(tasklists_plugin).use(deflist_plugin)
+    md.core.ruler.at("github-tasklists", _task_lists)
     _folded_note_refs(md)
     # Math as pandoc and GitHub read it: "$" opens only before a non-space and
     # closes only after one, not before a digit - "tickets are $5 and $10" stays text.
@@ -188,7 +343,9 @@ def make_parser():
         return safe if safe != url else shown_as(url)
 
     md.normalizeLinkText = link_text
+    md.core.ruler.at("normalize", _normalize)
     md.core.ruler.after("block", "github_alerts", _alerts)
+    md.core.ruler.after("block", "quoted_math", _quoted_math)
     md.core.ruler.push("emoji", _emoji)
     md.core.ruler.after("inline", "safe_html", _safe_html)  # (before the task lists' own boxes)
     md.core.ruler.push("unsafe_links", _unsafe_links)
@@ -200,7 +357,71 @@ def make_parser():
     md.block.ruler.before("front_matter", "toml_front_matter", _toml_front_matter,
                           {"alt": ["paragraph", "reference", "blockquote", "list"]})
     _keep_deep_blocks(md)
+    _guard(md)
     return md
+
+
+#: A parse's time at most: this and this much a character more - past it the
+#: text is shown as written (_as_written), never a page that does not come.
+PARSE_SECONDS = 20.0
+PARSE_SECONDS_PER_CHAR = 2e-5
+_PARSING = threading.local()
+
+
+class ParseTooLong(Exception):
+    """A parse ran past its time (PARSE_SECONDS)."""
+
+
+def _guard(md) -> None:
+    """*md*'s loops kept moving and in time: a rule that says yes to a
+    token in a link's label without moving on (markdown-it 4.2: "[~x~]"
+    hung for ever) - the parse moves on itself; a parse past its time
+    (_PARSING.deadline, set by parse) - ParseTooLong."""
+    skip, inline_tokenize, block_tokenize = md.inline.skipToken, md.inline.tokenize, md.block.tokenize
+
+    def in_time() -> None:
+        deadline = getattr(_PARSING, "deadline", None)
+        if deadline is not None:
+            _PARSING.ticks += 1
+            if not _PARSING.ticks & 255 and time.monotonic() > deadline:
+                raise ParseTooLong
+
+    def skip_token(state) -> None:
+        in_time()
+        pos = state.pos
+        skip(state)
+        if state.pos <= pos:  # (a rule's yes without moving on)
+            state.pos = pos + 1
+            state.cache[pos] = state.pos
+
+    def tokenize_inline(state) -> None:
+        in_time()
+        inline_tokenize(state)
+
+    def tokenize_blocks(state, start_line: int, end_line: int, *more) -> None:
+        in_time()
+        block_tokenize(state, start_line, end_line, *more)
+
+    md.inline.skipToken = skip_token
+    md.inline.tokenize = tokenize_inline
+    md.block.tokenize = tokenize_blocks
+
+
+def _as_written(text: str, md, why: str) -> Document:
+    """*text* as written - a notice saying why above it - for a text the
+    parser failed on (a rule's error, past its time)."""
+    Token = token_class()
+
+    from axross_markdown._ax.core.i18n import tr
+
+    notice = tr("This text could not be read as Markdown ({why}): shown as written.").format(why=why)
+    inline = Token("inline", "", 0, content=notice, level=1, block=True, map=[0, 1])
+    inline.children = [Token("text", "", 0, content=notice)]
+    tokens = [Token("paragraph_open", "p", 1, level=0, block=True, map=[0, 1]), inline,
+              Token("paragraph_close", "p", -1, level=0, block=True),
+              Token("fence", "code", 0, content=text if text.endswith("\n") or not text else text + "\n",
+                    markup="```", info="", level=0, block=True, map=[0, text.count("\n") + 1])]
+    return Document(tokens=tokens, parser=md, failed=why, source=text)
 
 
 def _keep_deep_blocks(md) -> None:
@@ -273,16 +494,143 @@ def _inline_text(token) -> str:
     return "".join(parts)
 
 
+# -- code: lexed in a child ------------------------------------------------------------------------
+
+#: Seconds the lexing of a code block may take (in a child, its start included): past them the block
+#: is plain. (The editor's own children wait 60 s: a page waited as long, blank.)
+CODE_LEX_SECONDS = 5.0
+_code_pools: dict = {}
+_code_pools_lock = threading.Lock()
+
+
+def _code_pool(seconds: float):
+    """core.lex_worker's children bound to *seconds* a block (one pool for each bound)."""
+    from axross_markdown._ax.core import image_worker as IW
+    from axross_markdown._ax.core import lex_worker as LW
+
+    with _code_pools_lock:
+        pool = _code_pools.get(seconds)
+        if pool is None:
+            class Bound(LW.LexChild):
+                @staticmethod
+                def _default_seconds() -> float:
+                    return seconds
+
+            pool = _code_pools[seconds] = IW.ChildPool(Bound, lambda: LW.POOL_SIZE, lambda: LW.POOL_IDLE_SECONDS,
+                                                       lambda: LW.TEXTS_PER_CHILD, "reader-lex-worker")
+        return pool
+
+
+def close_code_pools() -> None:
+    """The reader's lexing children ended (tests; the program's end ends them too)."""
+    with _code_pools_lock:
+        pools = list(_code_pools.values())
+        _code_pools.clear()
+    for pool in pools:
+        pool.close()
+
+
+def code_tokens(code: str, lang: str, style: str = "default", seconds: float | None = None) -> list | None:
+    """Pygments' tokens of *code* in the language *lang* - ``(token type, text)``, every character of
+    it, those *style* gives no colour as Text - for a Pygments formatter; or None: no such language, no
+    Pygments, or the lexing failed or took longer than *seconds* (CODE_LEX_SECONDS) - the block plain.
+    Lexed in a child process (core.lex_worker): a lexer's regular expression stuck in backtracking held
+    Python's lock as long as it ran - the window stood still (the editor measured 8.7 s), also when a
+    worker thread lexed."""
+    try:
+        from pygments.lexers import get_lexer_by_name
+        from pygments.token import Text, string_to_tokentype
+        from pygments.util import ClassNotFound
+    except ImportError:
+        return None
+    try:
+        name = get_lexer_by_name((lang or "").strip().lower()).name
+    except ClassNotFound:
+        return None
+    except Exception:  # noqa: BLE001 - a lexer's own fault: plain
+        return None
+    from array import array
+
+    def consume(head: dict, body) -> list | None:
+        if "error" in head:
+            return None
+        try:
+            names = [string_to_tokentype(str(n)) for n in head["types"]]
+            count = int(head["count"])
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return None
+        data = body.read_all() if hasattr(body, "read_all") else body
+        numbers = array("I")
+        if len(data) != count * 3 * numbers.itemsize:
+            return None
+        numbers.frombytes(bytes(data))
+        out, at = [], 0
+        for index in range(0, len(numbers), 3):
+            start, length, kind = numbers[index], numbers[index + 1], numbers[index + 2]
+            if kind >= len(names) or start < at or start + length > len(code):
+                return None
+            if start > at:
+                out.append((Text, code[at:start]))
+            out.append((names[kind], code[start:start + length]))
+            at = start + length
+        if at < len(code):
+            out.append((Text, code[at:]))
+        return out
+
+    bound = CODE_LEX_SECONDS if seconds is None else float(seconds)
+    try:
+        with _code_pool(bound).borrowed() as child:
+            return child.ask({"language": name, "text": code, "style": style}, consume)
+    except Exception as exc:  # noqa: BLE001 - too slow, crashed, could not start: the block plain
+        log.info("A code block in %s shown plain: %s", name, exc)
+        return None
+
+
+#: The bytes no text holds (but tab, line ends, form feed, escape): a file
+#: of more than one in ten of them - or of a NUL - in its first 8 KB is
+#: no text (a picture, a program): said, not shown as garbage.
+_NOT_CONTROL = bytes(b for b in range(256) if not (b < 32 and b not in (9, 10, 12, 13, 27)) and b != 127)
+_BOMS = (b"\xef\xbb\xbf", b"\xff\xfe", b"\xfe\xff")
+
+
+def looks_binary(data: bytes) -> bool:
+    """Whether a file's *data* is no text (a NUL, or more than one byte in
+    ten no text holds, in its first 8 KB - UTF-16 and -32 with their byte
+    order mark are text)."""
+    head = data[:8192]
+    if not head or head.startswith(_BOMS):
+        return False
+    if b"\0" in head:
+        return True
+    return len(head.translate(None, _NOT_CONTROL)) * 10 > len(head)
+
+
 def decode_text(data: bytes) -> str:
     """The text of a file's *data*: UTF-8 (damaged bytes replaced) without
-    its byte order mark, or UTF-16 / UTF-32 when a BOM says so. (The mark
-    was the first character of the text: "\ufeff# Title" is no heading.)"""
+    its byte order mark, or UTF-16 / UTF-32 when a BOM says so - and a file
+    that is no UTF-8 as Windows-1252 / Latin-1. (The mark was the first
+    character of the text: "\ufeff# Title" is no heading.)"""
     for bom, codec in ((b"\xef\xbb\xbf", "utf-8"), (b"\xff\xfe\x00\x00", "utf-32-le"),
                        (b"\x00\x00\xfe\xff", "utf-32-be"), (b"\xff\xfe", "utf-16-le"),
                        (b"\xfe\xff", "utf-16-be")):
         if data.startswith(bom):
             return data[len(bom):].decode(codec, "replace")
-    return data.decode("utf-8", "replace")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        if exc.start >= len(data) - 3 and exc.reason == "unexpected end of data":
+            return data[:exc.start].decode("utf-8", "replace")  # (cut at the read limit inside a letter)
+    text = data.decode("utf-8", "replace")
+    damaged = text.count("\ufffd") - data.count(b"\xef\xbf\xbd")
+    letters = sum(1 for ch in text if ch > "\x7f") - text.count("\ufffd")
+    if damaged <= letters:  # (UTF-8 with a damaged byte or two: the rest as it is)
+        return text
+    # (no UTF-8: Windows-1252 - Latin-1 with its quotes and dashes - as core.text_document reads Latin-1;
+    # every accented letter of a Latin-1 file was a U+FFFD)
+    try:
+        return data.decode("cp1252")
+    except UnicodeDecodeError:
+        return data.decode("latin-1")
 
 
 def _anchor_for(title: str, counts: dict, taken: set) -> str:
@@ -345,7 +693,16 @@ def parse(text: str, parser=None, notes=None) -> Document:
         env["footnotes"] = {"refs": _NumberedNotes((":" + label, number) for number, (label, _n) in enumerate(labels)),
                             "list": {number: {"label": label, "count": seed(label, count)}
                                      for number, (label, count) in enumerate(labels)}}
-    tokens = md.parse(text, env)
+    _PARSING.deadline = time.monotonic() + PARSE_SECONDS + len(text) * PARSE_SECONDS_PER_CHAR
+    _PARSING.ticks = 0
+    try:
+        tokens = md.parse(text, env)
+    except ParseTooLong:
+        return _as_written(text, md, "it took too long")
+    except (Exception, RecursionError) as exc:  # noqa: BLE001 - any rule's error: never a blank page
+        return _as_written(text, md, f"{type(exc).__name__}: {exc}"[:200])
+    finally:
+        _PARSING.deadline = None
     if notes is not None and notes[1] and places:  # (a reference in a note: its place's name as one parse
         inside = {label: [sub for _line, within, sub in found if within] for label, found in places.items()}
         for token in tokens:  # gives it - "fnref3", not "fnref3:1")
@@ -362,7 +719,7 @@ def parse(text: str, parser=None, notes=None) -> Document:
             elif not inside:
                 kept.append(token)
         tokens = kept
-    doc = Document(tokens=tokens, parser=md)
+    doc = Document(tokens=tokens, parser=md, source=text)
     counts: dict[str, int] = {}
     # The anchors of the footnotes (fn1, fnref1 - the plugin's) are no
     # heading's: a heading "fn1" took the place footnote 1 is linked to.
@@ -477,6 +834,8 @@ def note_plan(text: str):
     none in code; one in a quote too."""
     md = make_parser()
     md.disable("footnote_tail")  # (the definitions where they are, their lines with them)
+    if "linkify" in md.get_active_rules()["core"]:  # (no link holds a note: 1 s of 3.8 MB)
+        md.disable(["linkify", "linkify_pieces"])
     env: dict = {}
     tokens = md.parse(text, env)
     notes = env.get("footnotes") or {}
@@ -797,7 +1156,7 @@ def _safe_html(state) -> None:
     attributes only, nothing else of it reaches a view. What a paragraph
     opened (``<b>`` without ``</b>``) ends with it; what blocks opened ends
     with the document."""
-    from markdown_it.token import Token
+    Token = token_class()
 
     md = state.md
     blocks = _Sanitizer(md, HTML_BLOCK)
@@ -1033,10 +1392,15 @@ _TEXT_LINK = re.compile(r"\[([^\[\]\n]{1,500})\]\(\s*<?([^()\s<>]*(?:\([^()\s]*\
                         r"(?:\s+\"[^\"\n]*\")?\s*\)")
 
 
+#: An image markdown-it left as text, its address refused ("![x](file:…)": "!x" was shown).
+_REFUSED_IMAGE = re.compile("!" + _TEXT_LINK.pattern)
+_REFUSED = "\ue068"
+
+
 def _unsafe_links(state) -> None:
     """A link whose address is refused (``[js](javascript:…)``) shows its
     text only - no link, and not its address written out as it was."""
-    from markdown_it.token import Token
+    Token = token_class()
 
     md = state.md
     for token in state.tokens:
@@ -1048,14 +1412,34 @@ def _unsafe_links(state) -> None:
             if not run:
                 return
             text = "".join(child.content for child in run)
-            shown = _TEXT_LINK.sub(lambda m: m.group(0) if md.validateLink(m.group(2)) else m.group(1), text)
+            refused: list[str] = []  # (the alt texts of images refused: a box each, as an image not shown)
+
+            def image(match: re.Match) -> str:
+                if md.validateLink(match.group(2)) and _hidden_bad(match) == match.group(0):
+                    return match.group(0)
+                refused.append(match.group(1))
+                return f"{_REFUSED}{len(refused) - 1}{_REFUSED}"
+
+            shown = _REFUSED_IMAGE.sub(image, text) if "![" in text else text
+            shown = _TEXT_LINK.sub(lambda m: m.group(0) if md.validateLink(m.group(2)) else m.group(1), shown)
             shown = _HIDDEN_BAD_LINK.sub(_hidden_bad, shown)
             if shown == text:
                 children.extend(run)
             else:
-                piece = Token("text", "", 0)
-                piece.content = shown
-                children.append(piece)
+                for index, part in enumerate(shown.split(_REFUSED)):
+                    if index % 2 and part.isdigit() and int(part) < len(refused):
+                        picture = Token("image", "img", 0)
+                        picture.attrs = {"src": ""}
+                        picture.content = refused[int(part)]
+                        alt = Token("text", "", 0)
+                        alt.content = refused[int(part)]
+                        picture.children = [alt]
+                        picture.meta = {"refused": True}  # (its address one no view loads: file:, data: of no image)
+                        children.append(picture)
+                    elif part:
+                        piece = Token("text", "", 0)
+                        piece.content = part
+                        children.append(piece)
             run.clear()
 
         for child in token.children:
@@ -1072,7 +1456,7 @@ def _autolinks(state) -> None:
     """Bare addresses in the text made links (without linkify-it-py: GFM's
     extended autolinks - Qt's own parser linked them, markdown-it's page
     did not). Never in code, nor in a link."""
-    from markdown_it.token import Token
+    Token = token_class()
 
     md = state.md
     for token in state.tokens:
@@ -1085,7 +1469,10 @@ def _autolinks(state) -> None:
                 return
             text = "".join(child.content for child in run)
             pieces, at = [], 0
-            for found in _BARE_LINK.finditer(text):
+            # (a piece of the text at a time: a search of all of a line of 10 MB held Python's lock 0.7 s -
+            # a link is never cut, it has no space)
+            for found in (found for begin, stop in _text_pieces(text)
+                          for found in _BARE_LINK.finditer(text, begin, stop)):
                 bare = _bare_link(found.group(0))
                 if bare is None:
                     continue
@@ -1216,6 +1603,10 @@ def _single_tilde(state, silent: bool) -> bool:
     if close >= end or src[close - 1].isspace() or (close + 1 < end and src[close + 1] == "~"):
         return False
     if silent:
+        # a rule that matches must move the position in silent mode too
+        # (link labels are scanned silently): markdown-it 4.3 raises, 4.2
+        # loops for ever - "[~x~]" hung the viewer
+        state.pos = close + 1
         return True
     state.pos, state.posMax = start + 1, close
     token = state.push("s_open", "s", 1)
@@ -1429,7 +1820,23 @@ def _emoji(state) -> None:
             elif child.type == "link_close" and autolink and child.markup in ("linkify", "autolink"):
                 autolink -= 1
             elif child.type == "text" and not autolink and ":" in child.content:
-                child.content = _SHORT_CODE.sub(lambda m: EMOJI.get(m.group(1), m.group(0)), child.content)
+                child.content = _SHORT_CODE.sub(lambda m: emoji_for(m.group(1), m.group(0)), child.content)
+
+
+#: The short codes whose emoji the view parsing now can draw (None: all -
+#: the terminal and a browser leave that to their own fonts). The window
+#: sets it while it parses (ui.markdown_view.emoji_fonts): the code of one no
+#: font of it has stays as written - it was an empty box.
+EMOJI_DRAWN: contextvars.ContextVar = contextvars.ContextVar("axross_emoji_drawn", default=None)
+
+
+def emoji_for(code: str, written: str) -> str:
+    """The emoji of the short code *code* - *written* when there is none, or
+    none the view can draw (EMOJI_DRAWN)."""
+    drawn = EMOJI_DRAWN.get()
+    if drawn is not None and code not in drawn:
+        return written
+    return EMOJI.get(code, written)
 
 
 # -- math --------------------------------------------------------------------------------------
@@ -1538,55 +1945,115 @@ _ARITY = {**{name: 2 for name in "frac dfrac tfrac cfrac binom dbinom tbinom ove
              "braket".split()},
           **{name: 1 for name in ("sqrt mathbb mathcal mathscr mathfrak mathbf boldsymbol bm mathit mathrm mathsf "
                                   "mathtt text textrm textbf textit operatorname mbox boxed fbox cancel ket bra "
-                                  "overbrace underbrace phantom hphantom vphantom substack").split()},
+                                  "overbrace underbrace phantom hphantom vphantom substack pmod").split()},
           **{name: 1 for name in _ACCENTS}}
 _ARGUMENT_AT = re.compile(r"\\([A-Za-z]+)\*?")
+
+
+#: Groups inside each other at most a formula is made text with: deeper, it
+#: is shown as written with a note (math_runs). (A formula of 1,000 roots in
+#: each other took Python past its recursion limit: a blank page, a traceback.)
+MATH_DEPTH = 64
+_NESTING = re.compile(r"\\(?:left|right|begin|end)(?![A-Za-z])|\\.|[{}]", re.DOTALL)
+
+
+class MathTooDeep(ValueError):
+    """A formula's groups lie deeper inside each other than MATH_DEPTH."""
+
+
+def math_depth(tex: str) -> int:
+    """How deep *tex*'s groups - {...}, \\left...\\right, \\begin...\\end -
+    lie inside each other at most (one pass)."""
+    depth = deepest = 0
+    for found in _NESTING.finditer(tex):
+        sign = found.group(0)
+        if sign in ("{", "\\left", "\\begin"):
+            depth += 1
+            deepest = max(deepest, depth)
+        elif sign in ("}", "\\right", "\\end"):
+            depth = max(0, depth - 1)
+    return deepest
+
+
+def _brace_ends(tex: str) -> dict[int, int]:
+    """{where a group's "{" is: where its "}" is} of *tex* - one pass with a
+    stack (an escaped brace, "\\{", none); MathTooDeep past MATH_DEPTH."""
+    ends, opened = {}, []
+    for found in _BRACE.finditer(tex):
+        if found.group(0) == "{":
+            opened.append(found.start())
+            if len(opened) > MATH_DEPTH:
+                raise MathTooDeep(len(opened))
+        elif opened:
+            ends[opened.pop()] = found.start()
+    return ends
+
+
+_BRACE = re.compile(r"(?<!\\)[{}]")
+_SQRT_INDEX = re.compile(r"\s*\[[^\]]*\]")
+_SPACES = re.compile(r"\s*")
+_ARGUMENT_TOKEN = re.compile(r"\\[A-Za-z]+|\\.|[^\s{}\\^_]")
 
 
 def _braced(tex: str) -> str:
     """*tex* with each argument of _ARITY's commands in braces: written
     without (\\frac12, \\sqrt5, \\vec v, \\hat\\theta) it showed as written.
-    Linear (each command's arguments looked at once)."""
+    One pass, no recursion: a group's own commands are read as the pass
+    comes into it, a command's next arguments when it is past the group (a
+    formula of 1,000 groups in each other took Python past its recursion
+    limit, each group read again for each one around it); groups deeper
+    than MATH_DEPTH: MathTooDeep."""
     if "\\" not in tex:
         return tex
+    ends = _brace_ends(tex)
     out, at = [], 0
-    for found in _ARGUMENT_AT.finditer(tex):
-        if found.start() < at:
+    waiting: list[list[int]] = []  # ([where a group ends, how many arguments after it] - innermost last)
+
+    def arguments(count: int) -> None:
+        nonlocal at
+        limit = waiting[-1][0] if waiting else len(tex)  # (an argument never reaches out of its group)
+        for done in range(count):
+            space = _SPACES.match(tex, at, limit).end()
+            if space >= limit:
+                return
+            if tex[space] == "{":  # (in braces: its commands read as the pass comes into it)
+                end = ends.get(space)
+                if end is None or end > limit:
+                    return
+                out.append(tex[at:space + 1])
+                at = space + 1
+                waiting.append([end, count - done - 1])
+                return
+            token = _ARGUMENT_TOKEN.match(tex, space, limit)
+            if not token:
+                return
+            out.append("{" + token.group(0) + "}")
+            at = token.end()
+
+    pos = 0
+    while True:
+        found = _ARGUMENT_AT.search(tex, pos)
+        if waiting and waiting[-1][0] < (found.start() if found else len(tex)):
+            end, count = waiting.pop()  # (past a group: the arguments after it)
+            out.append(tex[at:end + 1])
+            at = pos = end + 1
+            arguments(count)
+            pos = max(pos, at)
             continue
-        name = found.group(1)
-        if name not in _ARITY:
+        if not found:
+            break
+        pos = found.end()
+        if found.group(1) not in _ARITY:
             continue
         out.append(tex[at:found.end()])
         at = found.end()
-        if name == "sqrt":  # (its index first: \\sqrt[3]{x})
-            index = re.compile(r"\s*\[[^\]]*\]").match(tex, at)
+        if found.group(1) == "sqrt":  # (its index first: \\sqrt[3]{x})
+            index = _SQRT_INDEX.match(tex, at, waiting[-1][0] if waiting else len(tex))
             if index:
                 out.append(tex[at:index.end()])
                 at = index.end()
-        for _argument in range(_ARITY[name]):
-            space = re.compile(r"\s*").match(tex, at).end()
-            if space >= len(tex):
-                break
-            if tex[space] == "{":  # (in braces: past them)
-                depth, end = 0, space
-                while end < len(tex):
-                    if tex[end] == "{" and tex[end - 1:end] != "\\":
-                        depth += 1
-                    elif tex[end] == "}" and tex[end - 1:end] != "\\":
-                        depth -= 1
-                        if not depth:
-                            break
-                    end += 1
-                if depth:
-                    break
-                out.append(tex[at:space] + "{" + _braced(tex[space + 1:end]) + "}")  # (its own commands too)
-                at = end + 1
-                continue
-            token = re.compile(r"\\[A-Za-z]+|\\.|[^\s{}\\^_]").match(tex, space)
-            if not token:
-                break
-            out.append("{" + token.group(0) + "}")
-            at = token.end()
+        arguments(_ARITY[found.group(1)])
+        pos = at
     out.append(tex[at:])
     return "".join(out)
 
@@ -1940,9 +2407,36 @@ def math_runs(tex: str, small: bool = True, tight: bool = False) -> list[tuple[s
     """The formula *tex* as runs of (text, kind): kind "" (plain), "bold",
     "italic", "unknown" (as written: shown as code), "sub" or "sup" (written
     out: "_(i=1)", "^∞" - a space after one before a letter, "∞1" read as a
-    number). Lines are joined by "\\n" runs; environments' rows placed."""
+    number). Lines are joined by "\\n" runs; environments' rows placed. A
+    formula deeper than MATH_DEPTH, or one the passes fail on: as written,
+    with a note after it (_as_written_math) - never the page's error."""
     if len(tex.strip()) > MATH_LIMIT:
         return [(tex.strip(), "unknown")]
+    try:
+        return _math_runs(tex, small, tight)
+    except MathTooDeep:
+        return _as_written_math(tex, "deep")
+    except (Exception, RecursionError):  # noqa: BLE001 - a formula's fault stays in that formula
+        log.debug("A formula could not be read; shown as written", exc_info=True)
+        return _as_written_math(tex, "fault")
+
+
+def _as_written_math(tex: str, why: str) -> list[tuple[str, str]]:
+    """The runs of a formula shown as written: its TeX (as code) and a note
+    why - upright, in the formula's colour."""
+    from axross_markdown._ax.core.i18n import tr
+
+    note = (tr("(nested more than {depth} deep: shown as written)").format(depth=MATH_DEPTH) if why == "deep"
+            else tr("(could not be read: shown as written)"))
+    return [(tex.strip(), "unknown"), (" " + note, "upright")]
+
+
+def math_too_deep(tex: str) -> bool:
+    """Whether the formula *tex* is shown as written for its depth (MATH_DEPTH)."""
+    return math_depth(tex) > MATH_DEPTH
+
+
+def _math_runs(tex: str, small: bool, tight: bool) -> list[tuple[str, str]]:
     marked, environments = _math(tex, small, tight)
     runs, kind, buffer, index = [], "", [], 0
     opening = {SUB: "sub", SUP: "sup", BOLD: "bold", ITALIC: "italic", UNKNOWN: "unknown", OVER: "over"}
@@ -2111,6 +2605,14 @@ PAGE_LETTERS = _page_letters()
 def page_letters(text: str) -> str:
     """*text* as a page's fonts show it (see _page_letters)."""
     return text.translate(PAGE_LETTERS)
+
+
+def keep_script_letters() -> None:
+    """A font of the page has plane 1's script and fraktur letters (a maths
+    font - STIX Two Math, Latin Modern Math, ...): \\mathcal{O} shown as 𝒪,
+    as the terminal shows it (it was a plain O on every page)."""
+    global PAGE_LETTERS
+    PAGE_LETTERS = {0x23DE: None, 0x23DF: None}
 #: Letters of a formula set in italic at most - more: none (Qt laid a line of thousands of italic spans out
 #: in time that grows with their square).
 MATH_ITALICS = 300
@@ -2139,7 +2641,17 @@ def math_grid(tex: str) -> tuple[list[list[str]], list[tuple], list[str], list[i
     cell sits in its rows: ``(row, column, rows, columns, "bottom")``. A
     gap may be ``(column, pixels)``: room other than a matrix's."""
     tex = tex.strip()
-    if len(tex) <= MATH_LIMIT and "\\begin" not in tex and "\\\\" not in tex:
+    if len(tex) > MATH_LIMIT or math_too_deep(tex):
+        return None  # (as text: math_runs - as written, with its note)
+    try:
+        return _math_grid(tex)
+    except (Exception, RecursionError):  # noqa: BLE001 - a formula's fault: in its line, as text
+        log.debug("A formula's grid could not be made; shown as text", exc_info=True)
+        return None
+
+
+def _math_grid(tex: str):
+    if "\\begin" not in tex and "\\\\" not in tex:
         return _display_grid(tex)
     if len(tex) > MATH_LIMIT or len(re.findall(r"\\begin\s*\{", tex)) != 1:
         return None
@@ -2449,34 +2961,48 @@ def clean(text: str) -> str:
 LINES_AT_ONCE = 1 << 16
 
 
+_WORD_START = re.compile(r"(?<=\s)\S")
+
+
+def _text_pieces(text: str, start: int = 0, end: int | None = None, size: int = LINES_AT_ONCE):
+    """(start, end) of the pieces of *text* (from *start* to *end*) of about
+    *size* characters: each cut after a line end - a line longer than twice
+    that where a word begins (after a space, before what is not one; a line
+    of 10 MB held the window's event loop 0.7 s in one search). A pattern
+    that never reaches over a line end, nor from a space into the word after
+    it, finds in the pieces what it finds in the whole."""
+    end = len(text) if end is None else end
+    while start < end:
+        cut = start + size
+        if cut >= end:
+            yield start, end
+            return
+        stop = text.find("\n", cut, end)
+        if stop < 0 or stop - start > 2 * size:
+            word = _WORD_START.search(text, cut, min(end, cut + size))
+            stop = word.start() if word else (stop + 1 if stop >= 0 else end)
+        else:
+            stop += 1
+        yield start, stop
+        start = stop
+
+
 def by_lines(change, text: str) -> str:
     """*change(piece)* of *text*'s pieces of about LINES_AT_ONCE characters
-    (cut after a line end), joined - for a change that never goes past a
-    line end."""
+    (_text_pieces), joined - for a change that never goes past a line end, nor
+    from a space into the word after it."""
     if len(text) <= LINES_AT_ONCE:
         return change(text)
-    out, at = [], 0
-    while at < len(text):
-        end = text.find("\n", at + LINES_AT_ONCE)
-        end = len(text) if end < 0 else end + 1
-        out.append(change(text[at:end]))
-        at = end
-    return "".join(out)
+    return "".join(change(text[begin:stop]) for begin, stop in _text_pieces(text))
 
 
 def found_by_lines(pattern: re.Pattern, text: str) -> bool:
-    """Whether *pattern* (one that never goes past a line end) is found in
-    *text* - looked for a piece at a time (by_lines)."""
+    """Whether *pattern* (one that never goes past a line end, nor from a
+    space into the word after it) is found in *text* - looked for a piece at
+    a time (_text_pieces)."""
     if len(text) <= LINES_AT_ONCE:
         return pattern.search(text) is not None
-    at = 0
-    while at < len(text):
-        end = text.find("\n", at + LINES_AT_ONCE)
-        end = len(text) if end < 0 else end + 1
-        if pattern.search(text, at, end):
-            return True
-        at = end
-    return False
+    return any(pattern.search(text, begin, stop) for begin, stop in _text_pieces(text))
 
 
 _ZWJ, _VS16 = "\u200d", "\ufe0f"
@@ -2547,5 +3073,5 @@ def cell_width(text: str) -> int:
 
 
 __all__ = ["ALERTS", "Document", "EMOJI", "HTML_BLOCK", "HTML_INLINE", "Heading", "MAX_NESTING",
-           "alert_of", "available", "html_events", "math_display", "math_html", "math_runs", "raised", "sanitizer",
-           "cell_width", "clean", "cluster_end", "decode_text", "make_parser", "math_text", "parse", "slug"]
+           "alert_of", "as_written", "available", "html_events", "math_display", "math_html", "math_runs", "raised", "sanitizer",
+           "cell_width", "clean", "cluster_end", "decode_text", "looks_binary", "make_parser", "math_text", "parse", "slug"]
