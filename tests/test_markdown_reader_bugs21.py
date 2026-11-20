@@ -517,7 +517,7 @@ def test_sad_clamping_images_looks_at_a_bounded_number_a_turn():
     assert until(lambda: view._unclamped >= document.characterCount() - 1, 30)
 
 
-_DEJAVU_ONLY = r"""import os, sys, time
+_EMOJI_TURNS = r"""import os, sys, time
 sys.path.insert(0, sys.argv[1])
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 from PyQt6.QtWidgets import QApplication
@@ -545,29 +545,58 @@ for full in (True, False):
 """
 
 
-def test_sad_emoji_without_a_colour_emoji_font_weigh_more(tmp_path):
-    """v0.16.5's CI: on a runner without a colour emoji font Qt looked for each emoji's glyph through the
-    families - 50,000 emoji a turn of 0.43 s (markdown-it) and 0.70 s (Qt's own parser), 20 times a colour
-    font's cost. There an emoji weighs PICTURE_WEIGHT_PLAIN letters in a paragraph's pieces: with
-    fontconfig given DejaVu alone, the window's own CPU in a turn stays far under 0.25 s."""
+#: Where a colour emoji font may be (the test of the many fonts adds one; AXROSS_EMOJI_FONT names one).
+_COLOUR_EMOJI_FONTS = ("/usr/share/fonts/**/*olor*moji*.ttf", "/usr/local/share/fonts/**/*olor*moji*.ttf",
+                       os.path.expanduser("~/.local/share/fonts/**/*olor*moji*.ttf"))
+
+
+def _fonts_conf(tmp_path, fonts: str) -> str | None:
+    """A fontconfig file of the fonts *fonts* names: "dejavu" (DejaVu alone), "system" (the machine's own,
+    all of them), "system+emoji" (those and a colour emoji font) - None: not on this machine."""
     import glob
+
+    if fonts == "system":
+        return os.environ.get("FONTCONFIG_FILE", "")
+    if fonts == "dejavu":
+        found = sorted(glob.glob("/usr/share/fonts/**/DejaVuSans.ttf", recursive=True))
+        dirs, include = [os.path.dirname(f) for f in found[:1]], ""
+    else:
+        found = [os.environ["AXROSS_EMOJI_FONT"]] if os.environ.get("AXROSS_EMOJI_FONT") else \
+            sorted(f for pattern in _COLOUR_EMOJI_FONTS for f in glob.glob(pattern, recursive=True))
+        base = os.environ.get("FONTCONFIG_FILE") or "/etc/fonts/fonts.conf"
+        dirs, include = [os.path.dirname(f) for f in found[:1]], f'  <include ignore_missing="yes">{base}</include>\n'
+    if not dirs:
+        return None
+    conf = tmp_path / f"{fonts}.conf"
+    conf.write_text('<?xml version="1.0"?>\n<!DOCTYPE fontconfig SYSTEM "fonts.dtd">\n<fontconfig>\n' + include
+                    + "".join(f"  <dir>{d}</dir>\n" for d in dirs)
+                    + f"  <cachedir>{tmp_path / ('cache-' + fonts)}</cachedir>\n</fontconfig>\n", encoding="utf-8")
+    return str(conf)
+
+
+@pytest.mark.parametrize("fonts", ["dejavu", "system", "system+emoji"])
+def test_sad_a_paragraph_of_emoji_holds_no_turn_whatever_the_fonts(tmp_path, fonts):
+    """v0.16.5's and v0.16.6's CI: 50,000 emoji in a paragraph held the runner's window 0.42 s a turn
+    (markdown-it) and 0.68 s (Qt's own parser) - with its colour emoji font among hundreds of others, an
+    emoji cost ten times what it costs here. An emoji weighs PICTURE_WEIGHT (128) letters in a paragraph's
+    pieces, whatever the fonts: with DejaVu alone, the machine's own fonts, and those with a colour emoji
+    font, the window's own CPU in a turn stays under 0.1 s, both parsers."""
     import subprocess
 
     from axross_markdown._ax.ui import markdown_html as H
 
-    found = sorted(glob.glob("/usr/share/fonts/**/DejaVuSans.ttf", recursive=True))
-    if not found:
-        pytest.skip("no DejaVu Sans")
-    conf = tmp_path / "fonts.conf"
-    conf.write_text('<?xml version="1.0"?>\n<!DOCTYPE fontconfig SYSTEM "fonts.dtd">\n<fontconfig>\n'
-                    f"  <dir>{os.path.dirname(found[0])}</dir>\n  <cachedir>{tmp_path / 'cache'}</cachedir>\n"
-                    "</fontconfig>\n", encoding="utf-8")
-    script = tmp_path / "dejavu_only.py"
-    script.write_text(_DEJAVU_ONLY, encoding="utf-8")
+    conf = _fonts_conf(tmp_path, fonts)
+    if conf is None:
+        pytest.skip(f"no fonts for {fonts!r} here")
+    script = tmp_path / "emoji_turns.py"
+    script.write_text(_EMOJI_TURNS, encoding="utf-8")
+    env = {k: v for k, v in os.environ.items() if k != "FONTCONFIG_FILE"}
+    if conf:
+        env["FONTCONFIG_FILE"] = conf
     result = subprocess.run([sys.executable, str(script), str(ROOT)], capture_output=True, text=True, timeout=400,
-                            env={**os.environ, "FONTCONFIG_FILE": str(conf)}, cwd=tmp_path)
+                            env=env, cwd=tmp_path)
     assert result.returncode == 0, result.stderr[-3000:]
     rows = [line.split() for line in result.stdout.splitlines() if line.startswith("parser")]
     assert len(rows) == 2, result.stdout
     for row in rows:
-        assert int(row[3]) == H.PICTURE_WEIGHT_PLAIN and float(row[5]) < 0.1, row
+        assert int(row[3]) == H.PICTURE_WEIGHT == 128 and float(row[5]) < 0.1, (fonts, row)

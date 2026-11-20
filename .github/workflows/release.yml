@@ -7,6 +7,8 @@
 # The heavy steps write their output to $RUNNER_TEMP/job.log as well; a
 # failed job shows the log's last lines as annotations
 # (packaging/ci_log_tail.py), readable through the API without the logs.
+# Nothing is built before axross's supply-chain gate and the tests
+# (tests.yml, called as a reusable workflow) pass.
 name: release
 
 on:
@@ -18,7 +20,13 @@ permissions:
   contents: read
 
 jobs:
+  # The supply-chain gate on requirements.lock.txt, then the tests (tests.yml):
+  # no job below starts before both pass.
+  ci:
+    uses: ./.github/workflows/tests.yml
+
   python:
+    needs: ci
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -68,6 +76,7 @@ jobs:
         if-no-files-found: error
 
   binaries:
+    needs: ci
     strategy:
       fail-fast: false
       matrix:

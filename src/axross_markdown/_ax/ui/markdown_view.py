@@ -1799,16 +1799,6 @@ def emoji_fonts() -> None:
             break
     _EMOJI_DRAWN.append(None if len(drawn) == len(missing) else frozenset(drawn))
     _EMOJI_FAMILY.append(best)
-    # (no colour emoji font: each emoji's glyph looked for through the families, about 20 times a colour
-    # font's cost - 0.3 to 0.5 s a turn on a CI runner - so an emoji weighs more in a paragraph's pieces)
-    from axross_markdown._ax.ui import markdown_html
-
-    colour = any(_COLOUR_EMOJI.search(family) for family in families if "emoji" in family.lower())
-    markdown_html.set_picture_weight(markdown_html.PICTURE_WEIGHT if colour else markdown_html.PICTURE_WEIGHT_PLAIN)
-
-
-#: The families of colour emoji fonts (Noto Color Emoji, Apple Color Emoji, Segoe UI Emoji, Twemoji, ...).
-_COLOUR_EMOJI = re.compile(r"colou?r|segoe ui emoji|twemoji|joypixels|emojione|openmoji", re.I)
 
 
 #: (emoji_fonts) the family that draws most of the emoji ("" none): the page's second font (MarkdownView) -

@@ -1783,30 +1783,22 @@ PARAGRAPH_SPANS = 200
 PARAGRAPH_TEXT = 6000
 
 
-#: Characters past U+1F000 (emoji, pictures) count as this many letters in a paragraph's pieces.
-PICTURE_WEIGHT = 8
-#: ... where no colour emoji font draws them (picture_weight): Qt looks for each one's glyph through the
-#: system's families - 50,000 emoji in a paragraph held a CI runner's window 0.3 s (markdown-it) and 0.5 s
-#: (Qt's own parser) a turn at PICTURE_WEIGHT, about 20 times a colour font's cost.
-PICTURE_WEIGHT_PLAIN = 128
+#: Characters past U+1F000 (emoji, pictures) count as this many letters in a paragraph's pieces: each costs
+#: Qt a glyph looked up and, from a colour font, a bitmap scaled - on a CI runner of hundreds of fonts, with
+#: or without a colour emoji font, 50,000 emoji in a paragraph held the window 0.3 s (markdown-it) and 0.5 s
+#: (Qt's own parser) a turn when one counted as 8 letters.
+PICTURE_WEIGHT = 128
 _PICTURE_SIGNS = re.compile("[\U0001F000-\U0010FFFF]")
-#: (set_picture_weight) the weight in use - the window's emoji_fonts sets it once from the fonts it finds.
-_WEIGHT = [PICTURE_WEIGHT]
 
 
 def picture_weight() -> int:
-    """How many letters an emoji counts as in a paragraph's pieces (PICTURE_WEIGHT; PICTURE_WEIGHT_PLAIN
-    where no colour emoji font draws them)."""
-    return _WEIGHT[0]
-
-
-def set_picture_weight(weight: int) -> None:
-    _WEIGHT[0] = weight
+    """How many letters an emoji counts as in a paragraph's pieces (PICTURE_WEIGHT, whatever the fonts)."""
+    return PICTURE_WEIGHT
 
 
 def piece_floor(weight: int) -> int:
     """The fewest characters a piece of a paragraph holds: 200 - fewer where emoji weigh more (40 at
-    PICTURE_WEIGHT_PLAIN: about 20 emoji)."""
+    PICTURE_WEIGHT: about 20 emoji)."""
     return max(40, 1600 // weight)
 
 

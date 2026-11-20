@@ -4,6 +4,20 @@ What changed in each release of axross-markdown. The code is axross's
 Markdown viewer (https://github.com/c0decave/axross), written out by axross's
 `scripts/export_standalone.py markdown`.
 
+## 0.16.7 - 2026-11-20
+
+- **A paragraph of many emoji on a host with many fonts:** 0.16.6's CI runner
+  (hundreds of fonts, a colour emoji font among them) still took 0.42 s a
+  turn for 50,000 emoji (0.68 s with Qt's own parser). An emoji now counts as
+  128 letters in a paragraph's pieces whatever the fonts, and a piece holds
+  as few as 40 characters, so each turn lays out about 14 times fewer emoji.
+  Here, with Noto Color Emoji: 0.035 and 0.043 s a turn before, 0.015 and
+  0.014 s now; with DejaVu alone 0.009 and 0.014 s.
+- **The release waits for the supply-chain gate and the tests:** release.yml
+  calls tests.yml before it builds anything, and the gate checks out
+  axross at a pinned commit (v0.15.180) instead of its default branch, which
+  can be an older release with an older baseline.
+
 ## 0.16.6 - 2026-11-20
 
 The twentieth review's fixes - each stall fixed for its whole class, and a
