@@ -1779,6 +1779,11 @@ PARAGRAPH_SPANS = 200
 PARAGRAPH_TEXT = 6000
 
 
+#: Characters past U+1F000 (emoji, pictures) count as this many letters in a paragraph's pieces.
+PICTURE_WEIGHT = 8
+_PICTURE_SIGNS = re.compile("[\U0001F000-\U0010FFFF]")
+
+
 def _paragraph_pieces(tokens: list) -> list:
     """*tokens* with a paragraph of the top level of more than
     PARAGRAPH_SPANS spans in pieces (paragraphs, meta "piece": (number,
@@ -1788,33 +1793,45 @@ def _paragraph_pieces(tokens: list) -> list:
     while index < len(tokens):
         token = tokens[index]
         inline = tokens[index + 1] if index + 2 < len(tokens) else None
+        # (an emoji, a picture sign costs a font's colour bitmap each: eight letters' worth - 3,000 colour
+        # emoji a piece held a CI runner's window 2.6 s)
+        pictures, shown = 0, 0
+        if inline is not None and inline.type == "inline" and token.type == "paragraph_open" \
+                and len(inline.content) > PARAGRAPH_TEXT // PICTURE_WEIGHT:
+            # (in the text as shown: ":tada:" is an emoji there, not in the source)
+            texts = [child.content for child in inline.children or () if child.type == "text"]
+            shown = sum(map(len, texts))
+            pictures = sum(len(_PICTURE_SIGNS.findall(text)) for text in texts)
+        step = PARAGRAPH_TEXT if not pictures else max(
+            200, int(PARAGRAPH_TEXT * shown / (shown + (PICTURE_WEIGHT - 1) * pictures)))
         if token.type != "paragraph_open" or inline is None or inline.type != "inline" \
-                or (len(inline.children or ()) <= PARAGRAPH_SPANS and len(inline.content) <= PARAGRAPH_TEXT):
+                or (len(inline.children or ()) <= PARAGRAPH_SPANS and max(len(inline.content), shown) <= step
+                    and not pictures * PICTURE_WEIGHT > step):
             out.append(token)
             index += 1
             continue
         children = []
         for child in inline.children:  # (a long text in pieces at its spaces: 1.4 MB of emoji was one)
-            if child.type == "text" and len(child.content) > PARAGRAPH_TEXT:
+            if child.type == "text" and len(child.content) > step:
                 words, at = child.content, 0
                 while at < len(words):
-                    cut = words.find(" ", at + PARAGRAPH_TEXT, at + 2 * PARAGRAPH_TEXT)
+                    cut = words.find(" ", at + step, at + 2 * step)
                     if cut < 0:  # (no space near: cut in the word - between two letters as they are seen;
                         # 99,000 letters in one word held the window 1.1 s)
-                        cut = len(words) if at + 2 * PARAGRAPH_TEXT >= len(words) \
-                            else MD.cluster_end(words, at + PARAGRAPH_TEXT - 1)
+                        cut = len(words) if at + 2 * step >= len(words) \
+                            else MD.cluster_end(words, at + step - 1)
                     children.append(child.copy(content=words[at:cut]))
                     at = cut
             else:
                 children.append(child)
         groups, group, depth, size = [], [], 0, 0
         for child in children:
-            full = len(group) >= PARAGRAPH_SPANS or size >= PARAGRAPH_TEXT
+            full = len(group) >= PARAGRAPH_SPANS or size >= step
             # (no space for twice as long: cut between two spans all the same - "`a" 49,500 times, 25,000
             # code spans and not one space, held the window 17 s in Qt's layout; "$a$" 30,000 times 3 s)
             if not depth and full and (child.type in ("softbreak", "text")
                                        and (child.type == "softbreak" or child.content[:1].isspace())
-                                       or len(group) >= 2 * PARAGRAPH_SPANS or size >= 2 * PARAGRAPH_TEXT) \
+                                       or len(group) >= 2 * PARAGRAPH_SPANS or size >= 2 * step) \
                     and child.nesting != -1:
                 groups.append(group)
                 group, size = [], 0

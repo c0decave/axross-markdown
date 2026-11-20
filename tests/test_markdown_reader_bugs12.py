@@ -284,10 +284,21 @@ def test_typo_a_binomial_is_stacked_in_parentheses(full):
 def test_typo_no_letter_a_pages_font_lacks(full):
     from tests.test_markdown_reader_bugs11 import math_page
 
+    from PyQt6.QtGui import QFont, QFontDatabase, QFontMetrics
+
+    from axross_markdown._ax.ui.markdown_html import MATH_FONTS
+
     view, _table = math_page(r"\mathcal{O}(n) + \underbrace{a+b}_{n} + \frac{1}{2}", full)
     text = view.browser.toPlainText()
-    assert not set(text) & {"\U0001d4aa", "⏟", "⏞"}, repr(text)  # (a box each with DejaVu)
-    assert "O" in text
+    # (which of them this machine's fonts draw: DejaVu none - a box each -, a maths font 𝒪; the CI's
+    # runner has such a font - the test assumed DejaVu's)
+    families = QFontDatabase.families()
+    drawn = {letter for letter in ("\U0001d4aa", "⏟", "⏞")
+             if any(QFontMetrics(QFont(family)).inFontUcs4(ord(letter)) for family in families)}
+    assert not (set(text) & {"\U0001d4aa", "⏟", "⏞"}) - drawn, (repr(text), drawn)
+    maths = any(name in families and QFontMetrics(QFont(name)).inFontUcs4(0x1D4AA) for name in MATH_FONTS)
+    assert ("\U0001d4aa" in text) == maths, (repr(text), maths)  # (𝒪 where a maths font of the page has it)
+    assert "O" in text or "\U0001d4aa" in text
 
 
 # -- 7. a raw HTML tag's address is no link -------------------------------------------------------------

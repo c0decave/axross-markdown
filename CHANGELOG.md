@@ -4,6 +4,22 @@ What changed in each release of axross-markdown. The code is axross's
 Markdown viewer (https://github.com/c0decave/axross), written out by axross's
 `scripts/export_standalone.py markdown`.
 
+## 0.16.5 - 2026-11-20
+
+The 0.16.4 release's build failed; this one carries its fixes.
+
+- **axross-mdcat.exe on Windows** no longer ends in an encoding error when its
+  output goes into a pipe or a file (the ANSI code page has no "█"): output
+  into a pipe or a file is UTF-8, and a console that cannot show a character
+  gets it replaced.
+- **Many emoji, many image chips:** a paragraph of 50,000 colour emoji held
+  the window for seconds on a host with many fonts; emoji now count more in
+  the pieces a paragraph is laid out in, and the page names the emoji font
+  after its own (no search through every installed font). 20,000 image chips
+  are fitted 2,000 a turn.
+- **Tests on other machines:** the test of letters the page's fonts lack asks
+  the installed fonts instead of assuming DejaVu's.
+
 ## 0.16.4 - 2026-11-20
 
 - **YAML code is coloured again** - in the window, the exported page and

@@ -285,6 +285,7 @@ class OutputGone(Exception):
 def _write(text: str, program: str = "axross-mdcat") -> None:
     """*text* on standard output - OutputGone once it can be written no more: a pipe closed ("| head
     -2": it rendered all the rest for nothing) or an error ("> /dev/full": a traceback), said."""
+    _encodable_output()
     try:
         sys.stdout.write(text)
         sys.stdout.flush()
@@ -295,6 +296,28 @@ def _write(text: str, program: str = "axross-mdcat") -> None:
         _quiet_stdout()
         print(f"{program}: cannot write the output: {exc.strerror or exc}", file=sys.stderr)
         raise OutputGone(1) from None
+
+
+_ENCODING_SET: list = []
+
+
+def _encodable_output() -> None:
+    """Standard output (and error) that takes every character, once: UTF-8 into a pipe or a file
+    (Windows' default there is its ANSI code page - cp1252 has no "█": axross-mdcat.exe ended in a
+    UnicodeEncodeError), a character a console cannot show replaced, never an error."""
+    if _ENCODING_SET:
+        return
+    _ENCODING_SET.append(True)
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream is None or not hasattr(stream, "reconfigure"):
+                continue
+            if stream.isatty():
+                stream.reconfigure(errors="replace")
+            else:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError, AttributeError):
+            continue
 
 
 def _quiet_stdout() -> None:

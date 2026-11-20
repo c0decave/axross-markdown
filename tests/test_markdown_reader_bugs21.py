@@ -142,3 +142,84 @@ def _blocks(document):
     while block.isValid():
         yield block
         block = block.next()
+
+
+# -- the release (v0.16.4): axross-mdcat.exe on a console or pipe of cp1252 -----------------------------
+
+def test_sad_mdcat_writes_any_character_whatever_the_outputs_encoding(tmp_path):
+    """Windows' axross-mdcat.exe ended in UnicodeEncodeError ('charmap' codec, "█"): its output into a pipe
+    was the ANSI code page. A pipe or a file gets UTF-8; a console that cannot show a character gets it
+    replaced - never an error."""
+    import subprocess
+
+    from PyQt6.QtGui import QColor, QImage
+
+    from axross_markdown._ax.core import markdown_cli
+
+    picture = QImage(20, 10, QImage.Format.Format_RGB32)
+    picture.fill(QColor("#3b5bdb"))
+    picture.save(str(tmp_path / "p.png"), "PNG")
+    page = tmp_path / "a.md"
+    page.write_text("# Title █\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n![p](p.png)\n", encoding="utf-8")
+    result = subprocess.run([sys.executable, "-m", markdown_cli.__name__, "--no-pager", "--color", "truecolor",
+                             "--images", "blocks", str(page)], cwd=ROOT, capture_output=True, timeout=120,
+                            env={**os.environ, "PYTHONIOENCODING": "cp1252"})
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")[-2000:]
+    shown = result.stdout.decode("utf-8")
+    assert "Title █" in shown and "┌" in shown and ("▀" in shown or "▄" in shown)
+
+
+# -- the release (v0.16.4): emoji and images on a CI runner's fonts -----------------------------------
+
+def test_sad_a_paragraph_of_emoji_is_laid_out_in_smaller_pieces():
+    """50,000 colour emoji in a paragraph held a CI runner's window 2.6 s (markdown-it) and 1.4 s (Qt's own
+    parser): 3,000 of them a piece. An emoji (a sign past U+1F000) counts as PICTURE_WEIGHT letters."""
+    from axross_markdown._ax.core import markdown_doc as MD
+    from axross_markdown._ax.ui import markdown_html as H
+    from axross_markdown._ax.ui import markdown_view as MV
+
+    text = "🎉 " * 20_000
+    pieces = H._paragraph_pieces(MD.parse(text).tokens)
+    sizes = [sum(len(c.content) for c in t.children) for t in pieces if t.type == "inline"]
+    assert len(sizes) > 1 and max(sizes) * H.PICTURE_WEIGHT <= 3 * H.PARAGRAPH_TEXT, max(sizes)
+    md4c = [piece for piece in MV._pieces_of(text).split("\n\n" + MV.JOINED)]
+    assert len(md4c) > 1 and max(map(len, md4c)) * H.PICTURE_WEIGHT <= 3 * MV.PARAGRAPH_CHARS
+    plain = "word " * 20_000  # (letters: as many as before)
+    assert max(sum(len(c.content) for c in t.children) for t in H._paragraph_pieces(MD.parse(plain).tokens)
+               if t.type == "inline") >= H.PARAGRAPH_TEXT
+
+
+def test_sad_the_page_font_names_the_emoji_font_after_its_own(monkeypatch):
+    """Qt looked for each emoji's font among all of the system's (hundreds of families on a CI runner);
+    the family emoji_fonts found draws them now, second in the page's font."""
+    from PyQt6.QtGui import QFont
+
+    from axross_markdown._ax.ui import markdown_view as MV
+
+    monkeypatch.setattr(MV, "_EMOJI_FAMILY", ["Some Emoji"])
+    font = MV.with_emoji_family(QFont("DejaVu Sans"))
+    assert font.families()[-1] == "Some Emoji" and font.families()[0] == "DejaVu Sans"
+    monkeypatch.setattr(MV, "_EMOJI_FAMILY", [""])
+    assert MV.with_emoji_family(QFont("DejaVu Sans")).families() in ([], ["DejaVu Sans"])
+
+
+def test_sad_clamping_images_looks_at_a_bounded_number_a_turn():
+    """20,000 image chips with Qt's own parser: clamp_images found all 14,000 laid out in one turn (0.21 s
+    here, 0.32 s on a CI runner). One call looks at CLAMPED_AT_ONCE, the next turns at the rest."""
+    from axross_markdown._ax.ui import markdown_view as MV
+
+    view = MV.MarkdownView(None)
+    view.full = False
+    view.resize(1000, 800)
+    view.show()
+    view.render(" ".join(f"![i{n}](img{n}.png)" for n in range(6000)) + "\n")
+    assert until(lambda: view._readable and view.markdown, 120)
+    view.load_rest_now()
+    until(lambda: not view.more(), 120)
+    pump(0.5)
+    document = view.browser.document()
+    assert document.toPlainText().count("\ufffc") > MV.CLAMPED_AT_ONCE
+    view._clamped_room = None
+    view.clamp_images()
+    assert view._unclamped < document.characterCount() - 1  # (stopped: the rest in the next turn)
+    assert until(lambda: view._unclamped >= document.characterCount() - 1, 30)

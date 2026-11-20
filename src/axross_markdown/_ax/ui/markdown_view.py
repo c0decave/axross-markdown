@@ -102,7 +102,7 @@ from PyQt6.QtWidgets import (
 
 from axross_markdown._ax.core import svg_gate, svg_worker
 from axross_markdown._ax.core.i18n import tr
-from axross_markdown._ax.ui.markdown_html import ANCHORS, CHIP, CODE_PART_LINES, CONTINUED, FOLD
+from axross_markdown._ax.ui.markdown_html import _PICTURE_SIGNS, ANCHORS, CHIP, CODE_PART_LINES, CONTINUED, FOLD, PICTURE_WEIGHT
 from axross_markdown._ax.ui.markdown_safe import _MARK, NOTES_MARKDOWN, _escape_html, _unmark
 
 log = logging.getLogger(__name__)
@@ -1157,14 +1157,17 @@ def paragraph_pieces(text: str) -> str:
     the top level longer than PARAGRAPH_CHARS cut in pieces where nothing
     is open (a code span, a link, emphasis, a formula, a mark of
     fallback_text's, a tag): before a space or a line end."""
-    if len(text) < PARAGRAPH_CHARS:
+    if len(text) * PICTURE_WEIGHT < PARAGRAPH_CHARS or (len(text) < PARAGRAPH_CHARS
+                                                       and not _PICTURE_SIGNS.search(text)):
         return text
     rows, out, fence, run = text.split("\n"), [], None, []
 
     def flush() -> None:
         if run:
             joined = "\n".join(run)
-            out.append(_pieces_of(joined) if len(joined) > PARAGRAPH_CHARS else joined)
+            heavy = len(joined) + (PICTURE_WEIGHT - 1) * len(_PICTURE_SIGNS.findall(joined)) \
+                if len(joined) * PICTURE_WEIGHT > PARAGRAPH_CHARS else len(joined)
+            out.append(_pieces_of(joined) if heavy > PARAGRAPH_CHARS else joined)
             run.clear()
 
     for number, line in enumerate(rows):
@@ -1191,7 +1194,11 @@ def paragraph_pieces(text: str) -> str:
 
 
 def _pieces_of(paragraph: str) -> str:
-    """*paragraph* cut in pieces (see paragraph_pieces)."""
+    """*paragraph* cut in pieces (see paragraph_pieces) - emoji and pictures counted as PICTURE_WEIGHT
+    letters each (a colour bitmap each: 50,000 emoji held a CI runner's window 1.4 s)."""
+    pictures = len(_PICTURE_SIGNS.findall(paragraph))
+    limit = PARAGRAPH_CHARS if not pictures else max(
+        200, int(PARAGRAPH_CHARS * len(paragraph) / (len(paragraph) + (PICTURE_WEIGHT - 1) * pictures)))
     from axross_markdown._ax.core.markdown_doc import cluster_end
 
     marks = {MARKS[name]: name for name in MARKS}
@@ -1205,8 +1212,8 @@ def _pieces_of(paragraph: str) -> str:
         """No space for twice as long, nothing open: cut in the run of letters before *upto* (99,000
         letters in one word, "`a" 5,000 times held the window 1.4 s and 0.7 s in Qt's layout)."""
         nonlocal begun
-        while upto - begun >= 2 * PARAGRAPH_CHARS and closed():
-            cut = max(after, begun + PARAGRAPH_CHARS)
+        while upto - begun >= 2 * limit and closed():
+            cut = max(after, begun + limit)
             if cut >= upto:
                 return
             cut = cluster_end(paragraph, cut - 1) if cut > 0 else cut
@@ -1238,7 +1245,7 @@ def _pieces_of(paragraph: str) -> str:
             if at and paragraph[at - 1] == "`":
                 continue
             spans += 1
-            if (at - begun >= 2 * PARAGRAPH_CHARS or spans > PARAGRAPH_CODE_SPANS) and closed():
+            if (at - begun >= 2 * limit or spans > PARAGRAPH_CODE_SPANS) and closed():
                 pieces.append(paragraph[begun:at])  # (before a code span: nothing open)
                 begun, spans = at, 1
             end = at
@@ -1270,9 +1277,9 @@ def _pieces_of(paragraph: str) -> str:
             stars += 1
         elif ch == "_":
             lows += 1
-        elif at - begun >= PARAGRAPH_CHARS and paragraph[at - 1:at] not in ("\\", " "):
+        elif at - begun >= limit and paragraph[at - 1:at] not in ("\\", " "):
             if depth or link or tag or stars % 2 or lows % 2:
-                if at - begun < 2 * PARAGRAPH_CHARS:
+                if at - begun < 2 * limit:
                     continue
                 # (open for that long: never closed - a mark whose partner _fewer_marks took, a lone
                 # "*" - so cut all the same: a paragraph of 60,000 formulas was one piece)
@@ -1671,21 +1678,43 @@ def emoji_fonts() -> None:
     from PyQt6.QtGui import QFont, QFontDatabase, QFontMetrics
 
     families = QFontDatabase.families()
-    # (the emoji fonts first - one usually has all; the rest only for what they lack)
+    # (the emoji fonts first - one usually has all; the rest only for what they lack - each font's metrics
+    # made when it is its turn: all of a few hundred families' at once took the first view a while)
     families = sorted(families, key=lambda family: "emoji" not in family.lower())
-    metrics = [QFontMetrics(QFont())] + [QFontMetrics(QFont(family)) for family in families]
     missing = {}
     for code, emoji in markdown_doc.EMOJI.items():
         signs = [ord(ch) for ch in emoji if ch not in _EMOJI_JOINERS]
         missing[code] = signs
-    drawn = set()
-    for metric in metrics:
-        for code in [code for code in missing if code not in drawn]:
+    drawn, best, most = set(), "", 0
+    for family in [None, *families]:
+        metric = QFontMetrics(QFont() if family is None else QFont(family))
+        found = 0
+        for code in missing:
             if all(metric.inFontUcs4(sign) for sign in missing[code]):
+                found += 1
                 drawn.add(code)
+        if family is not None and found > most:
+            best, most = family, found
         if len(drawn) == len(missing):
             break
     _EMOJI_DRAWN.append(None if len(drawn) == len(missing) else frozenset(drawn))
+    _EMOJI_FAMILY.append(best)
+
+
+#: (emoji_fonts) the family that draws most of the emoji ("" none): the page's second font (MarkdownView) -
+#: Qt looked for each emoji's font among all the system's (hundreds of families on a CI runner: 50,000
+#: emoji held the window 2.6 s), now it is the one after the page's own.
+_EMOJI_FAMILY: list = []
+
+
+def with_emoji_family(font: QFont) -> QFont:
+    """*font* with the family emoji_fonts found for emoji after its own (unchanged: none found)."""
+    family = _EMOJI_FAMILY[0] if _EMOJI_FAMILY else ""
+    if not family or family in font.families():
+        return font
+    font = QFont(font)
+    font.setFamilies([*(font.families() or [font.family()]), family])
+    return font
 
 
 #: (emoji_fonts) the short codes the window's fonts draw - None: all.
@@ -2960,6 +2989,7 @@ class MarkdownView(QWidget):
         #: the file's name, for a link to one of its headings ("README.md#install")
         self.page_name = ""
         self.browser = MarkdownBrowser(self)
+        self.browser.setFont(with_emoji_family(self.browser.font()))  # (emoji found at once: emoji_fonts)
         self.browser.setFont(reading_font(self.browser.font()))
         self.highlighter = CodeHighlighter(self.browser.document())
         self.browser.anchorClicked.connect(self.clicked)
@@ -4983,8 +5013,13 @@ class MarkdownView(QWidget):
         # of the parts laid out since the last time only, unless the room changed)
         since = self._unclamped if getattr(self, "_clamped_room", None) == room else 0
         self._clamped_room, self._unclamped = room, document.characterCount()
-        found = document.find("\ufffc", since)
+        found, seen = document.find("\ufffc", since), 0
         while not found.isNull():
+            seen += 1
+            if seen > CLAMPED_AT_ONCE:  # (the rest in the next turn: 14,000 images were 0.3 s in one)
+                self._unclamped = found.selectionStart()
+                QTimer.singleShot(0, self.clamp_images)
+                break
             piece = _Piece(found.selectionStart(), found.charFormat())
             found = document.find("\ufffc", piece.position() + 1)
             fmt = piece.charFormat()
@@ -5553,6 +5588,10 @@ class MarkdownView(QWidget):
         return max(1, round(100 * self.browser.document().defaultFont().pointSizeF() / own))
 
 
+#: Image characters clamp_images looks at in one event-loop turn (the rest in the next).
+CLAMPED_AT_ONCE = 2000
+
+
 #: Where clamp_images keeps the size an image was asked to have (0: its own).
 _ASKED_WIDTH = QTextFormat.Property.UserProperty.value + 1
 _ASKED_HEIGHT = QTextFormat.Property.UserProperty.value + 2
@@ -5609,7 +5648,7 @@ def _anchor_name(block) -> str:
 
 
 _ATX_LINE = re.compile(r" {0,3}#{1,6}(?:[ \t]|$)")
-_SETEXT_LINE = re.compile(r" {0,3}(?:=+|-+)[ \t]*$")
+_SETEXT_LINE = re.compile(r" {0,3}(?:=+|-+)[ \t]*\Z")
 
 
 def _heading_lines(rows: list[str]) -> list[int]:

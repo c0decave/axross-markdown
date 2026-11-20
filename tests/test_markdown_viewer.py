@@ -416,12 +416,16 @@ def test_happy_an_archive_member_opens_rendered(docs):
         assert FP.open_local_file_in_viewer(None, str(docs / "README.md")) == "markdown"
     opener.assert_called_once()
     # (the Text View's dialog a stand-in: a real one, left reading, showed a modal error box after the
-    # test - every test after it waited for ever)
+    # test - every test after it waited for ever). show_independent() lists the stand-in among the
+    # open windows: a list of its own, else every later main window's close met a MagicMock there.
+    VW = pytest.importorskip("axross_markdown._ax.ui.viewer_window")
     with mock.patch("axross_markdown._ax.ui.markdown_viewer.open_markdown_viewer") as opener, \
-            mock.patch("axross_markdown._ax.ui.text_editor.TextEditorDialog") as text_dialog:
+            mock.patch("axross_markdown._ax.ui.text_editor.TextEditorDialog") as text_dialog, \
+            mock.patch.object(VW, "_INDEPENDENT", []) as shown:
         assert FP.open_local_file_in_viewer(None, str(docs / "README.md"), view="text") != "markdown"
     opener.assert_not_called()
     text_dialog.assert_called_once()
+    assert shown == [text_dialog.return_value]
 
 
 def test_happy_the_editor_shows_a_live_preview(docs, tmp_path):

@@ -380,7 +380,7 @@ class ImageChild:
                 if body is None:
                     return
                 replies.put((header, body))
-        except (OSError, ValueError, struct.error):
+        except (OSError, ValueError, RecursionError, struct.error):
             return
         finally:
             replies.put(None)
