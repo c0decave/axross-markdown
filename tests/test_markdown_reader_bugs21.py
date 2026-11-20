@@ -146,7 +146,7 @@ def _blocks(document):
 
 # -- M2. the editor's preview follows the typing in a long text and in one without headings --------
 
-def _typed_into_preview(text: str, line: int):
+def _typed_into_preview(text: str, line: int, back: int = 0):
     from PyQt6.QtGui import QTextCursor
 
     from axross_markdown._ax.ui.editor_window import EditorWindow
@@ -165,6 +165,7 @@ def _typed_into_preview(text: str, line: int):
         cursor.movePosition(QTextCursor.MoveOperation.Start)
         cursor.movePosition(QTextCursor.MoveOperation.Down, n=line)
         cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock)
+        cursor.movePosition(QTextCursor.MoveOperation.Left, n=back)  # (in a table's row: before its last "|")
         tab.editor.setTextCursor(cursor)
         tab.editor.insertPlainText(" TYPEDHERE")
         assert until(lambda: "TYPEDHERE" in preview.markdown and preview._readable, 120)
@@ -262,7 +263,7 @@ def test_sad_a_heading_or_cell_past_the_cap_is_cut_and_said():
     rows = shown.split("\n")
     assert len(rows[0]) <= MV.LINE_CAP + 10 and rows[0].endswith("…")
     assert len(rows[4]) <= MV.LINE_CAP + 20 and "…" in rows[4]
-    assert "c" * 5000 in shown  # (code as it is)
+    assert "c" * 5000 in shown.replace("\n", "")  # (code all of it - in lines of LINE_CAP: bugs22's F4)
     assert str(MV.LINE_CAP) in why
     quoted = MV.renderable("> | a |\n> |---|\n> | " + "y" * 5000 + " |\n")[0]
     assert "y" * 5000 not in quoted and "…" in quoted
@@ -542,6 +543,17 @@ for full in (True, False):
     until(laid, 60)
     print("parser", full, "weight", H.picture_weight(), "worst", turns.worst(), "family", MV._EMOJI_FAMILY[0])
     view.close()
+# (what Qt itself takes to paint a view full of them - with Ubuntu's Noto Color Emoji, a bitmap font, FreeType
+# decodes each glyph's bitmap at each paint: 0.055 s, whatever the page does)
+from PyQt6.QtWidgets import QTextBrowser
+plain = QTextBrowser()
+plain.resize(1000, 800)
+plain.show()
+plain.setPlainText("\U0001F389 " * 3000)
+pump(0.3)
+began = time.thread_time()
+plain.viewport().repaint()
+print("qt paint", round(time.thread_time() - began, 3))
 """
 
 
@@ -580,7 +592,10 @@ def test_sad_a_paragraph_of_emoji_holds_no_turn_whatever_the_fonts(tmp_path, fon
     (markdown-it) and 0.68 s (Qt's own parser) - with its colour emoji font among hundreds of others, an
     emoji cost ten times what it costs here. An emoji weighs PICTURE_WEIGHT (128) letters in a paragraph's
     pieces, whatever the fonts: with DejaVu alone, the machine's own fonts, and those with a colour emoji
-    font, the window's own CPU in a turn stays under 0.1 s, both parsers."""
+    font, the window's own CPU in a turn stays under 0.1 s, both parsers - on top of what Qt takes to paint
+    a view full of emoji once (v0.16.7's CI: Ubuntu's Noto Color Emoji is a bitmap font, each glyph's bitmap
+    decoded at each layout and each paint, 67 µs an emoji - a view of them 0.055 s, whatever the page does;
+    a scroll bar hidden and shown again at each part laid out made Qt lay all of the page out anew: 0.19 s)."""
     import subprocess
 
     from axross_markdown._ax.ui import markdown_html as H
@@ -598,5 +613,6 @@ def test_sad_a_paragraph_of_emoji_holds_no_turn_whatever_the_fonts(tmp_path, fon
     assert result.returncode == 0, result.stderr[-3000:]
     rows = [line.split() for line in result.stdout.splitlines() if line.startswith("parser")]
     assert len(rows) == 2, result.stdout
-    for row in rows:
-        assert int(row[3]) == H.PICTURE_WEIGHT == 128 and float(row[5]) < 0.1, (fonts, row)
+    painted = float(next(line.split()[2] for line in result.stdout.splitlines() if line.startswith("qt paint")))
+    for row in rows:  # (the page's own time on top of Qt's paint of a view of emoji)
+        assert int(row[3]) == H.PICTURE_WEIGHT == 128 and float(row[5]) < 0.1 + painted, (fonts, row, painted)

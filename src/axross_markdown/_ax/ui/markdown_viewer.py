@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import logging
 import posixpath
+import time
 
 from PyQt6 import sip
 from PyQt6.QtCore import QFileSystemWatcher, Qt, QTimer, QUrl
@@ -52,6 +53,7 @@ from PyQt6.QtWidgets import (
 )
 
 from axross_markdown._ax.core.i18n import tr
+from axross_markdown._ax.core.markdown_cli import FOLDER_PAGES  # (the names a folder's own page goes by: a link to it opens it)
 from axross_markdown._ax.ui import markdown_view as MV
 from axross_markdown._ax.ui import viewer_window as VW
 from axross_markdown._ax.ui.close_corner import add_close_corner
@@ -70,8 +72,9 @@ STATE_NAME = "markdown"
 #: Matches find marks at most (and counts at most FIND_COUNT).
 FIND_MARKS = 1000
 FIND_COUNT = 10_000
-#: Names a folder's own page goes by (a link to the folder opens it).
-FOLDER_PAGES = ("README.md", "readme.md", "Readme.md", "README.markdown", "index.md")
+#: Seconds a search's count and marks take at most in one turn (_mark_matches): past it, "N+" - 10,000
+#: matches in a long page took 0.15 s at each Find Next.
+FIND_TURN = 0.03
 #: Images a link may name (shown at their own size).
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".svgz", ".ico")
 #: Places Back keeps.
@@ -90,6 +93,41 @@ Open a Markdown file with **Open…** (Ctrl+O), or name files on the command lin
 - find (Ctrl+F), zoom (Ctrl+Plus / Ctrl+Minus / Ctrl+0), Reload (F5), Edit (F4), Back (Alt+Left)
 - Export: HTML, PDF, Print (Ctrl+P); a file changed on disk is shown anew
 """
+
+
+def unreadable_reason(error) -> str:
+    """Why a file cannot be read, in words - not the system's error with its path again ("[Errno 2] No such
+    file or directory: '/…/gone.md'")."""
+    if isinstance(error, FileNotFoundError):
+        return tr("it does not exist")
+    if isinstance(error, PermissionError):
+        return tr("you may not read it")
+    if isinstance(error, IsADirectoryError):
+        return tr("it is a folder without a README")
+    if isinstance(error, OSError) and error.strerror:
+        return error.strerror
+    return str(error)
+
+
+#: Blocks of a page past which the top of the view is looked for by halves (_first_shown).
+HALVED_BLOCKS = 5000
+
+
+def _first_shown(browser) -> QTextCursor:
+    """A cursor at the top of what *browser* shows. On a long page found by halves over its blocks' places -
+    Qt's own hit test walks every frame before it: at the end of 50,000 code blocks, 0.09 s a search."""
+    document = browser.document()
+    if document.blockCount() <= HALVED_BLOCKS:
+        return browser.cursorForPosition(browser.viewport().rect().topLeft())
+    layout, top = document.documentLayout(), browser.verticalScrollBar().value()
+    low, high = 0, document.blockCount() - 1
+    while low < high:
+        middle = (low + high) // 2
+        if layout.blockBoundingRect(document.findBlockByNumber(middle)).bottom() < top:
+            low = middle + 1
+        else:
+            high = middle
+    return QTextCursor(document.findBlockByNumber(low))
 
 
 class MarkdownViewerDialog(QDialog):
@@ -401,12 +439,13 @@ class MarkdownViewerDialog(QDialog):
             self.loaded_once = True
             return
         if error is not None:
-            said = tr("Cannot read {path}: {error}").format(path=MV.printable(self.path), error=MV.printable(error))
+            why = unreadable_reason(error)
+            said = tr("Cannot read {path}: {error}").format(path=MV.printable(self.path), error=MV.printable(why))
             self.view.status.setText(said)
             # (said in the page too: a missing file was a blank page, the reason in the status line only)
             name = MV.printable(posixpath.basename(self.path) or self.path).replace("`", "'")
             self.view.show_text(tr("{name} cannot be read: {error}").format(
-                name="`" + name + "`", error=MV.printable(error).replace("`", "'")), anchor, scroll)
+                name="`" + name + "`", error=MV.printable(why).replace("`", "'")), anchor, scroll)
             self.view.status.setText(said)
             return
         text, self.cut = result
@@ -546,7 +585,7 @@ class MarkdownViewerDialog(QDialog):
         if cursor.hasSelection() and browser.viewport().rect().intersects(browser.cursorRect(start)):
             cursor = start
         else:  # (nothing found yet: from the top of what is shown, as a browser - it began at the end)
-            cursor = browser.cursorForPosition(browser.viewport().rect().topLeft())
+            cursor = _first_shown(browser)
             for _round in range(200):  # (a table, a picture begun above the view: its block after it)
                 if browser.cursorRect(cursor).top() >= 0 or cursor.atEnd():
                     break
@@ -559,7 +598,8 @@ class MarkdownViewerDialog(QDialog):
 
     def _mark_matches(self, needle: str) -> None:
         """Every match of *needle* marked (at most FIND_MARKS), the count of
-        them (at most FIND_COUNT) and which one is selected beside the field."""
+        them (at most FIND_COUNT, or as many as FIND_TURN finds: "N+") and
+        which one is selected beside the field."""
         browser = self.view.browser
         document = browser.document()
         marks, count, current = [], 0, 0
@@ -567,7 +607,11 @@ class MarkdownViewerDialog(QDialog):
         fmt = QTextCharFormat()
         fmt.setBackground(QColor("#f2cc60") if not MV._is_dark(self.view.palette()) else QColor("#7a5b00"))
         cursor = document.find(needle, 0)
+        deadline, capped = time.monotonic() + FIND_TURN, False
         while not cursor.isNull() and count < FIND_COUNT:
+            if count % 64 == 63 and time.monotonic() > deadline:
+                capped = True
+                break
             count += 1
             if cursor.selectionStart() == selected.selectionStart() and selected.hasSelection():
                 current = count
@@ -587,7 +631,7 @@ class MarkdownViewerDialog(QDialog):
         if not count:
             self.find_count.setText(tr("no match"))
         else:
-            total = f"{count}+" if count >= FIND_COUNT else str(count)
+            total = f"{count}+" if count >= FIND_COUNT or capped else str(count)
             # ("N+": a part of the page is not laid out yet - more may come)
             total = f"{total}+" if self.view.more() else total
             self.find_count.setText(tr("{current} of {total}").format(current=current or "–", total=total))

@@ -62,7 +62,7 @@ Every dependency is pinned and reviewed in `requirements.lock.txt`
 python -m pytest tests
 ```
 
-The tool's own tests from axross - 30 files, their imports renamed as the code's - and a test that the program starts and ends cleanly; Qt's offscreen platform, no display needed.
+The tool's own tests from axross - 32 files, their imports renamed as the code's - and a test that the program starts and ends cleanly; Qt's offscreen platform, no display needed.
 
 ## Licence
 

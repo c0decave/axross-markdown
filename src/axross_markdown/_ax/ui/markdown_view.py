@@ -430,6 +430,10 @@ def code_blocks(text: str) -> tuple[str, list[str]]:
 _ATX_HEADING = re.compile(r" {0,3}#{1,6}(?:[ \t]|$)")
 
 
+#: A thematic break ("---", "***", "___", spaced or not).
+_THEMATIC = re.compile(r" {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*\Z")
+
+
 def markdown_parts(text: str, lines: int | None = None, first: int | None = None) -> list[str]:
     """*text* in parts of about *lines* lines for Qt's own parser, cut only
     where a new block of the page's top level begins - a heading, or a line
@@ -449,8 +453,16 @@ def markdown_parts(text: str, lines: int | None = None, first: int | None = None
     # 30 s; where a part goes on with one: its line that opens it)
     reopened: dict[int, str] = {}
     opener, fenced, long = "", 0, False
+    front_end = next((k for k in range(1, len(rows)) if FRONT_LINE.match(rows[k])), len(rows)) \
+        if rows and FRONT_LINE.match(rows[0]) else 0  # (the front matter's closing line: no cut up to it)
+    # (an emoji, a picture sign weighs picture_weight() letters in a part too, as in a paragraph's pieces:
+    # 50,000 of them in pieces were 2,250 characters - 1,080 emoji - a part, 0.17 s an insert where a colour
+    # emoji font's bitmaps cost FreeType a decoding each - Ubuntu's Noto Color Emoji, the CI runner's)
+    extra = picture_weight() - 1 if _PICTURE_SIGNS.search(text) else 0
     for number, line in enumerate(rows):
         size += len(line) + 1
+        if extra and not line.isascii():
+            size += extra * len(_PICTURE_SIGNS.findall(line))
         opened = FENCE.match(line)
         if fence is not None:
             if opened and opened.group(1)[0] == fence[0] and len(opened.group(1)) >= len(fence) \
@@ -464,6 +476,11 @@ def markdown_parts(text: str, lines: int | None = None, first: int | None = None
                 since = size = fenced = 0
             continue
         if opened:
+            # (a part may begin with a code block too: 50,000 short ones after one another were one part)
+            if number and not rows[number - 1].strip() and line[:1] not in " \t" \
+                    and (since >= lines or size >= PART_CHARS):
+                cuts.append(number)
+                since = size = 0
             fence, opener, fenced = opened.group(1), line, 0
             long = _code_lines(rows, number, fence) > BOX_BLOCKS  # (a shorter one: a box of its own, whole)
             continue
@@ -477,14 +494,18 @@ def markdown_parts(text: str, lines: int | None = None, first: int | None = None
             continue
         enough = since >= (first if len(cuts) == 1 else lines) or size >= PART_CHARS * (first / max(1, lines)
                                                                                     if len(cuts) == 1 else 1)
+        # (a rule "---" after an empty line begins a block too - past the front matter: 100,000 rules, one part)
         if enough and number and (not rows[number - 1].strip() or _ATX_HEADING.match(line)) and line.strip() \
                 and (line[:1] not in " \t>|" or table) and not LIST_ITEM.match(line) \
-                and not REFERENCE.match(line) and not FRONT_LINE.match(line):
+                and not REFERENCE.match(line) and (not FRONT_LINE.match(line)
+                                                   or (number > front_end and _THEMATIC.match(line))):
             cuts.append(number)
             since = size = 0
     cuts.append(len(rows))
     parts = []
     for a, b in zip(cuts, cuts[1:]):
+        if a and a < b and FRONT_LINE.match(rows[a]):  # (a part begun at a rule "---": Qt's own parser took it
+            rows[a] = "***"  # for front matter, all up to the next "---" gone - the same rule, as "***")
         if a < b:
             head = [reopened[a]] if a in reopened else []
             tail = [FENCE.match(reopened[b]).group(1)] if b in reopened else []
@@ -539,6 +560,9 @@ def _label(text: str) -> str:
 CHUNK = "\ue05d"
 #: Cells of a table laid out at all (in parts); a table beyond is shown as written.
 TABLE_CELLS_MAX = 300_000
+#: Characters of a table's part (renderable; ui.markdown_html's _table_pieces - in a container: CONTAINED_CHARS):
+#: a part of many long cells is cut sooner than its cells' count says.
+TABLE_PART_CHARS = 30_000
 #: Columns of a table laid out (wider: shown as written - a grid of 1,000
 #: columns is read by no one, and each row of it is a part of its own).
 TABLE_COLUMNS = 64
@@ -585,23 +609,41 @@ _SETEXT_UNDER = re.compile(r"(?:=+|-+)[ \t]*\Z")
 _UNESCAPED_PIPE = re.compile(r"(?<!\\)\|")
 
 
+def _letters(text: str) -> int:
+    """*text*'s length, an emoji or a picture sign picture_weight() letters (as in a paragraph's pieces)."""
+    if text.isascii():
+        return len(text)
+    return len(text) + (picture_weight() - 1) * len(_PICTURE_SIGNS.findall(text))
+
+
 def _cut_text(text: str, cap: int) -> str:
-    """*text* at most *cap* characters - at a space near the end when there is one - and "…"."""
-    if len(text) <= cap:
+    """*text* at most *cap* characters (_letters: a heading of 1,000 emoji was 0.4 s to lay out with a
+    colour emoji font of bitmaps, a table cell of them 0.8 s) - at a space near the end when there is one -
+    and "…"."""
+    if _letters(text) <= cap:
         return text
+    if not text.isascii():  # (where its letters reach *cap*)
+        weight, total, at = picture_weight(), 0, 0
+        for at, ch in enumerate(text):
+            total += weight if _PICTURE_SIGNS.match(ch) else 1
+            if total > cap:
+                break
+        cap = max(1, at)
     space = text.rfind(" ", cap - cap // 10, cap)
     return text[:space if space > 0 else cap].rstrip() + " …"
 
 
 def _capped_lines(text: str) -> tuple[str, int]:
     """(*text* with each heading's and table cell's text past LINE_CAP characters cut - in any container
-    of the page, never in code -, how many were cut). Linear; nothing to do for most texts."""
+    of the page, never in code; a longer code line in lines of LINE_CAP -, how many were cut). Linear;
+    nothing to do for most texts."""
     from axross_markdown._ax.core.markdown_doc import found_by_lines
 
-    if not found_by_lines(_LONG_LINE, text):
+    pictures = _PICTURE_SIGNS.search(text) is not None
+    if not pictures and not found_by_lines(_LONG_LINE, text):
         return text, 0
     rows = text.split("\n")
-    fence, table, cut = None, False, 0
+    fence, table, cut, broken = None, False, 0, False
     for number, row in enumerate(rows):
         lead = _CONTAINER_LEAD.match(row).group(0)
         rest = row[len(lead):]
@@ -609,6 +651,10 @@ def _capped_lines(text: str) -> tuple[str, int]:
         if fence is not None:
             if opened and opened.group(1)[0] == fence[0] and len(opened.group(1)) >= len(fence):
                 fence = None
+            elif len(rest) > LINE_CAP:  # (a code line of 80,000 characters: one block, 0.6 to 0.7 s - in lines
+                # of LINE_CAP characters, all of it kept)
+                rows[number] = "\n".join(lead + rest[at:at + LINE_CAP] for at in range(0, len(rest), LINE_CAP))
+                broken = True
             continue
         if opened:
             fence = opened.group(1)
@@ -622,11 +668,11 @@ def _capped_lines(text: str) -> tuple[str, int]:
         if not table and number + 1 < len(rows):  # (a table's header: the row above its delimiter)
             after = rows[number + 1]
             after = after[len(_CONTAINER_LEAD.match(after).group(0)):]
-            if "|" in rest and "|" in after and TABLE_DELIMITER.match(after) and len(row) > LINE_CAP:
+            if "|" in rest and "|" in after and TABLE_DELIMITER.match(after) and _letters(row) > LINE_CAP:
                 rows[number] = lead + "|".join(_cut_text(cell, LINE_CAP) for cell in _UNESCAPED_PIPE.split(rest))
                 cut += 1
                 continue
-        if len(row) <= LINE_CAP:
+        if len(row) <= LINE_CAP and (not pictures or _letters(row) <= LINE_CAP):
             continue
         if table and "|" in rest:
             rows[number] = lead + "|".join(_cut_text(cell, LINE_CAP) for cell in _UNESCAPED_PIPE.split(rest))
@@ -638,7 +684,7 @@ def _capped_lines(text: str) -> tuple[str, int]:
                 rows[number + 1]).group(0)):]) and rows[number + 1].strip():
             rows[number] = lead + _cut_text(rest, LINE_CAP)
             cut += 1
-    return ("\n".join(rows), cut) if cut else (text, 0)
+    return ("\n".join(rows), cut) if cut or broken else (text, 0)
 
 
 def renderable(text: str, table_cells: int | None = None, keep_marks: bool = False) -> tuple[str, str]:
@@ -673,7 +719,8 @@ def renderable(text: str, table_cells: int | None = None, keep_marks: bool = Fal
         early["cut"] = _t("headings and table cells longer than {count} characters, cut (the editor shows them)",
                           count=LINE_CAP)
     deep = found_by_lines(_DEEP, text)
-    if text.count("\n") < LIST_ITEMS and not deep and not ("|" in text and text.count("|") >= table_cells) \
+    tables = "|" in text and (text.count("|") >= table_cells or len(text) >= TABLE_PART_CHARS)
+    if text.count("\n") < LIST_ITEMS and not deep and not tables \
             and not (len(text) >= LONG_RUN and found_by_lines(LONG_WORD, by_lines(lambda piece: DATA_IMAGE.sub(
                 "", piece), text))):
         return text, _why(early)  # (most texts: nothing to count)
@@ -752,6 +799,10 @@ def renderable(text: str, table_cells: int | None = None, keep_marks: bool = Fal
             if columns > WIDE_TABLE:  # (a wide table's cell costs more - each row laid out across all of them:
                 budget = budget * WIDE_TABLE // columns  # 60 columns in parts of 900 cells, 0.3 s a part)
             rows = max(1, budget // columns - 1)  # (besides its header)
+            # (and of at most TABLE_PART_CHARS characters: 300 rows of two cells of 1,800 characters were one
+            # part - 0.9 to 1.3 s; cut by the cells only)
+            sample = lines[index + 2:min(end, index + 52)]
+            rows = min(rows, max(1, TABLE_PART_CHARS * max(1, len(sample)) // max(1, sum(map(len, sample)))))
             total = (end - index - 1) * columns
             if columns > TABLE_COLUMNS:  # (no one reads it as a grid: as written)
                 why["columns"] = _t("tables of more than {count} columns", count=TABLE_COLUMNS)
@@ -813,7 +864,9 @@ _HTML_DROPPED = re.compile(r"<(script|style|template|iframe|object|embed|noscrip
 _HTML_WHOLE = re.compile(r"<(table|pre|h[1-6]|summary)\b[^<>]*>", re.IGNORECASE)
 _BLOCKS = frozenset("p div center details blockquote section article header footer nav aside figure "
                     "figcaption ul ol dl".split())
-_ALERT_LINE = re.compile(r"^([ \t]*>[ \t]?)\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\][ \t]*$",
+#: An alert's first line - of a quote of the top level only (GitHub nests none: in a list, in another
+#: quote, it is a quote saying "[!NOTE]").
+_ALERT_LINE = re.compile(r"^(>[ \t]?)\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\][ \t]*$",
                          re.IGNORECASE | re.MULTILINE)
 #: Display math: "$$" on lines of their own around it - or on one line ("$$\frac{a}{b}$$": shown raw).
 _BLOCK_MATH = re.compile(r"^\$\$[ \t]*\n(.*?)\n\$\$[ \t]*$|^ {0,3}\$\$[ \t]*(\S[^\n]*?)[ \t]*\$\$[ \t]*$",
@@ -1197,13 +1250,17 @@ def _contained_pieces(rows: list, index: int, end: int, stack: list, pos: int, k
     per = CONTAINED_LINES
     if kind == "t":
         per = max(1, MD4C_TABLE_CELLS // max(1, _cells(header[1])))
+    # (an emoji, a picture sign weighs picture_weight() letters, as in markdown_parts: a quote's paragraph of
+    # 50,000 emoji was pieces of 3,000 of them - with a colour emoji font of bitmaps, 1 s a part)
+    extra = picture_weight() - 1 if any(_PICTURE_SIGNS.search(line) for line in body) else 0
     for line in body:
-        if group and (len(group) >= per or size + len(line) > CONTAINED_CHARS) and kind != "p" or \
-                (kind == "p" and group and (size + len(line) > CONTAINED_CHARS)):
+        cost = len(line) + (extra * len(_PICTURE_SIGNS.findall(line)) if extra and not line.isascii() else 0)
+        if group and (len(group) >= per or size + cost > CONTAINED_CHARS) and kind != "p" or \
+                (kind == "p" and group and (size + cost > CONTAINED_CHARS)):
             groups.append(group)
             group, size = [], 0
         group.append(line)
-        size += len(line)
+        size += cost
     if group:
         groups.append(group)
     out = []
@@ -1775,7 +1832,7 @@ def emoji_fonts() -> None:
 
     if _EMOJI_DRAWN:
         return
-    from PyQt6.QtGui import QFont, QFontDatabase, QFontMetrics
+    from PyQt6.QtGui import QFont, QFontDatabase, QFontInfo, QFontMetrics
 
     families = QFontDatabase.families()
     # (the emoji fonts first - one usually has all; the rest only for what they lack - each font's metrics
@@ -1785,20 +1842,38 @@ def emoji_fonts() -> None:
     for code, emoji in markdown_doc.EMOJI.items():
         signs = [ord(ch) for ch in emoji if ch not in _EMOJI_JOINERS]
         missing[code] = signs
+    # (a machine without a font that has them all: every one of hundreds of families was asked for every
+    # emoji still missing, on the GUI thread - opening a Markdown file held the window for minutes. Each
+    # family is asked only for what is still missing, and the search ends after EMOJI_SCAN_SECONDS: what
+    # no font asked by then has stays as written)
+    import time
+
+    deadline = time.monotonic() + EMOJI_SCAN_SECONDS
+    total = len(missing)
     drawn, best, most = set(), "", 0
     for family in [None, *families]:
-        metric = QFontMetrics(QFont() if family is None else QFont(family))
-        found = 0
-        for code in missing:
-            if all(metric.inFontUcs4(sign) for sign in missing[code]):
-                found += 1
-                drawn.add(code)
-        if family is not None and found > most:
-            best, most = family, found
-        if len(drawn) == len(missing):
+        if family is not None and time.monotonic() > deadline:
             break
-    _EMOJI_DRAWN.append(None if len(drawn) == len(missing) else frozenset(drawn))
+        metric = QFontMetrics(QFont() if family is None else QFont(family))
+        found = [code for code, signs in missing.items()
+                 if all(metric.inFontUcs4(sign) for sign in signs)]
+        for code in found:
+            del missing[code]
+        drawn.update(found)
+        if len(found) > most:
+            # (the default font that draws the most - DejaVu Sans on a machine without a colour emoji
+            # font - is the page's emoji family too, as it was before the search asked only for what
+            # was still missing: by its resolved name)
+            best = family if family is not None else QFontInfo(QFont()).family()
+            most = len(found)
+        if not missing:
+            break
+    _EMOJI_DRAWN.append(None if len(drawn) == total else frozenset(drawn))
     _EMOJI_FAMILY.append(best)
+
+
+#: (emoji_fonts) how long the search for the installed fonts' emoji may hold the first view at most.
+EMOJI_SCAN_SECONDS = 0.25
 
 
 #: (emoji_fonts) the family that draws most of the emoji ("" none): the page's second font (MarkdownView) -
@@ -4209,14 +4284,14 @@ class MarkdownView(QWidget):
         return sorted(holes, key=lambda hole: hole[0])
 
     def _copy_more(self) -> None:
-        """(copy_selection) the next parts' text, 40 ms of it an event-loop
+        """(copy_selection) the next parts' text, COPY_TURN of it an event-loop
         turn; all of it there: on the clipboard."""
         job = getattr(self, "_copy_job", None)
         if job is None or sip.isdeleted(self) or job["generation"] != self._page_generation:
             return
         began = time.monotonic()
         pieces = job["pieces"]
-        while pieces and time.monotonic() - began < 0.04:
+        while pieces and time.monotonic() - began < COPY_TURN:
             piece = pieces.pop(0)
             if isinstance(piece, tuple) and piece[0] == "range":  # (of the page: its cursors kept their places)
                 job["out"].append(_copy_text(self.browser.document(), piece[1].position(), piece[2].position()))
@@ -4320,6 +4395,7 @@ class MarkdownView(QWidget):
         self.read_missing()
         if self._rest is None and not self._gaps:
             self._stand_in_out()
+            self._bar_kept(False)
             self._whole = False
             self._idle()
             self._run_then()
@@ -4370,6 +4446,17 @@ class MarkdownView(QWidget):
         cursor.movePosition(QTextCursor.MoveOperation.End)
         cursor.insertBlock(fmt, QTextCharFormat())
         self._stand_in = True
+        self._bar_kept(True)
+
+    def _bar_kept(self, kept: bool) -> None:
+        """The vertical scroll bar shown all along while parts are to come (*kept*), else as needed. While
+        what is laid out was shorter than the view, each stand-in taken out hid the bar and each put in
+        showed it: the view as wide again each time, and Qt laid all of the page out anew - twice a part,
+        a turn as long as the page so far (a page of colour emoji, whose glyphs cost FreeType a bitmap
+        decoded each: 0.19 s)."""
+        policy = Qt.ScrollBarPolicy.ScrollBarAlwaysOn if kept else Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        if self.browser.verticalScrollBarPolicy() != policy:
+            self.browser.setVerticalScrollBarPolicy(policy)
 
     def _stand_in_out(self) -> None:
         if not self._stand_in:
@@ -4787,8 +4874,18 @@ class MarkdownView(QWidget):
         part.setDefaultFont(document.defaultFont())
         fill(part)
         _tex_names(part)  # (before it goes into the page: see _TEX)
+        ruler = QTextFormat.Property.BlockTrailingHorizontalRulerWidth
+        first = part.begin()
+        if not first.text() and first.next().isValid() and not first.next().text() and first.textList() is None \
+                and first.next().blockFormat().hasProperty(ruler) and not first.blockFormat().hasProperty(ruler):
+            # (a part begun at a rule: Qt's own parser put an empty block before it - one the whole page has
+            # not; the rule's block first, as a part of markdown-it's begins)
+            kept = first.next().blockFormat()
+            head = QTextCursor(part)
+            head.deleteChar()
+            head.setBlockFormat(kept)
         bare = not part.begin().text()  # (an empty first block: the one before a table)
-        ruled = part.begin().blockFormat().hasProperty(QTextFormat.Property.BlockTrailingHorizontalRulerWidth)
+        ruled = part.begin().blockFormat().hasProperty(ruler)
         listed = part.begin().textList() is not None
         if listed:  # (its first block an item: one before it to go into the page's - set again, the item
             from PyQt6.QtGui import QTextBlockFormat  # lost its list)
@@ -5702,37 +5799,38 @@ class MarkdownView(QWidget):
 
     def _zoomed(self, steps: int) -> None:
         if self.zoom == 0:  # (its own size: what the level is counted from)
-            self._own_points = self.browser.document().defaultFont().pointSizeF()
+            self._own_font_points = self.browser.font().pointSizeF()
         if steps == 0:
-            if self.zoom > 0:
-                self.browser.zoomOut(self.zoom)
-            elif self.zoom < 0:
-                self.browser.zoomIn(-self.zoom)
+            self._font_points(self._own_font_points)
             self.zoom = 0
             self.fit_text()
             self.zoom_changed.emit(100)
             return
-        # (between ZOOM_RANGE of its own size: zoomed out it reached 2 %, Qt warned of a font's size)
-        now = self.browser.document().defaultFont().pointSizeF()
-        own = self._own_points or now
+        # (between ZOOM_RANGE of its own size, those reached exactly - a point a step: zoomed out it reached
+        # 2 %, Qt warned of a font's size; then it stopped at 27 %, short of the bound)
+        own = self._own_font_points or self.browser.font().pointSizeF()
+        now = self.browser.font().pointSizeF()
         low, high = ZOOM_RANGE
-        steps = max(steps, -int(max(0.0, now - own * low))) if steps < 0 else min(steps, int(max(0.0, own * high - now)))
-        if not steps:
+        target = min(own * high, max(own * low, own + round(now + steps - own)))  # (on its own size's grid)
+        if abs(target - now) < 0.001:
             return
-        if steps > 0:
-            self.browser.zoomIn(steps)
-        else:
-            self.browser.zoomOut(-steps)
-        self.zoom += steps
+        self._font_points(target)
+        self.zoom = 0 if abs(target - own) < 0.001 else (round(target - own) or (1 if target > own else -1))
         self.fit_text()  # (the text's width follows its letters' size)
         self.zoom_changed.emit(self.zoom_percent())
 
+    def _font_points(self, points: float) -> None:
+        """The view's letters *points* large (as QTextEdit.zoomIn sets them: the widget's font)."""
+        font = self.browser.font()
+        font.setPointSizeF(points)
+        self.browser.setFont(font)
+
     def zoom_percent(self) -> int:
         """The text's size in per cent of its own (100 when not zoomed)."""
-        own = getattr(self, "_own_points", 0.0)
+        own = getattr(self, "_own_font_points", 0.0)
         if not self.zoom or own <= 0:
             return 100
-        return max(1, round(100 * self.browser.document().defaultFont().pointSizeF() / own))
+        return max(1, round(100 * self.browser.font().pointSizeF() / own))
 
 
 #: How small and how large the text may be zoomed, against its own size.
@@ -7281,21 +7379,37 @@ def _high(cursor: QTextCursor) -> int:
 
 #: Characters of the page a copy takes in one event-loop turn (copy_selection).
 COPY_CHARS = 8_000
+#: ... or blocks (each line of a code block one, each its frame).
+COPY_BLOCKS = 600
+#: Seconds of pieces a copy takes in one turn (_copy_more) - with the one begun last, under 0.1 s.
+COPY_TURN = 0.025
 
 
 def _copy_ranges(document: QTextDocument, low: int, high: int) -> list:
     """*low* to *high* of the page as ("range", start, end) pieces of about
     COPY_CHARS characters (cursors: they keep their places while parts come
-    in), cut only where a block of the page's top level begins (never in a
-    table: a formula, a quote's box)."""
+    in), cut only where a block begins that _cuttable takes (never in a
+    formula, never between a table's cells)."""
     root = document.rootFrame()
     out, start = [], low
-    block = document.findBlock(low + COPY_CHARS) if high - low > COPY_CHARS else None
+
+    def next_cut(start: int):  # (COPY_CHARS on, or COPY_BLOCKS blocks on - the sooner: 50,000 short code
+        # blocks, each a frame, were 2,000 a piece - 0.1 s)
+        by_chars = document.findBlock(start + COPY_CHARS)
+        by_blocks = document.findBlockByNumber(document.findBlock(start).blockNumber() + COPY_BLOCKS)
+        if by_blocks.isValid() and (not by_chars.isValid() or by_blocks.position() < by_chars.position()):
+            return by_blocks
+        return by_chars
+
+    first = document.findBlock(low)
+    block = next_cut(low) if high - low > COPY_CHARS or (
+        document.findBlock(high).blockNumber() - first.blockNumber() > COPY_BLOCKS) else None
     while block is not None and block.isValid() and block.position() < high:
-        if block.position() - start >= COPY_CHARS and QTextCursor(block).currentFrame() == root:
+        if (block.position() - start >= COPY_CHARS or block.blockNumber() - document.findBlock(start).blockNumber()
+                >= COPY_BLOCKS) and _cuttable(block, root):
             out.append(block.position())
             start = block.position()
-            block = document.findBlock(start + COPY_CHARS)
+            block = next_cut(start)
             continue
         block = block.next()
     cuts = [low, *out, high]
@@ -7309,6 +7423,26 @@ def _copy_ranges(document: QTextDocument, low: int, high: int) -> list:
                                                                                          place(high))]
 
 
+def _cuttable(block, root) -> bool:
+    """Whether a copy's piece may begin at *block* (_copy_ranges): at a block of the page's top level, or
+    in a box of one row - a quote's, an alert's, a code block's - at a block that is not its cell's first
+    (never in a formula, never between a table's cells: 20,000 code blocks in a quote had no place to cut,
+    every block of it looked at - 0.09 s - and one piece of all of it)."""
+    from PyQt6.QtGui import QTextTable
+
+    cursor = QTextCursor(block)
+    frame = cursor.currentFrame()
+    while frame is not None and frame != root:
+        if not isinstance(frame, QTextTable):
+            return False
+        if frame.rows() != 1 or _formula_tex(frame) is not None:
+            return False
+        if frame.cellAt(block.position()).firstCursorPosition().block() == block:
+            return False
+        frame = frame.parentFrame()
+    return True
+
+
 def _copy_text(document: QTextDocument, low: int, high: int) -> str:
     """What a copy holds of *document* from *low* to *high*: its text, a
     display formula's TeX in its place ("$$...$$" on a line of its own - as
@@ -7318,8 +7452,7 @@ def _copy_text(document: QTextDocument, low: int, high: int) -> str:
     was taken for it, its text lost)."""
     if high <= low:
         return ""
-    formulas = []
-    _formulas_in(document.rootFrame(), low, high, formulas)
+    formulas = _formulas_between(document, low, high)
     out, at = [], low
     for first, last, tex in sorted(formulas):
         before = _inline_tex(document, at, max(at, first - 1))
@@ -7328,24 +7461,41 @@ def _copy_text(document: QTextDocument, low: int, high: int) -> str:
             out.append("\n")
         out.append(f"$${tex.strip()}$$\n")
         at = min(high, last + 1)
-    out.append(_inline_tex(document, at, high).lstrip("\n") if formulas else _inline_tex(document, at, high))
+    # (the text after the last formula as after any other, its line break kept: a copy in pieces dropped it
+    # after each piece's last formula - not as the copy at once did)
+    out.append(_inline_tex(document, at, high))
     return "".join(out)
 
 
-def _formulas_in(frame, low: int, high: int, found: list) -> None:
-    """(first, last, TeX) of each display formula inside *frame* between *low* and *high*."""
+def _formulas_between(document: QTextDocument, low: int, high: int) -> list:
+    """(first, last, TeX) of each display formula between *low* and *high* - inside a quote, an alert, a list
+    item too. Found from the blocks there, each frame they are in looked at once - not from every frame's
+    children: 50,000 code blocks were as many frames, a list of them made at each piece of a copy (0.13 s
+    each, 0.42 s a turn), and so were 20,000 in one quote."""
     from PyQt6.QtGui import QTextTable
 
-    for child in frame.childFrames():
-        first, last = child.firstPosition(), child.lastPosition()
-        if last < low or first > high:
-            continue
-        tex = _formula_tex(child) if isinstance(child, QTextTable) else None
-        if tex is not None:
-            if first >= low:  # (begun before the selection: not selected - its text after it is)
-                found.append((first, last, tex))
-            continue
-        _formulas_in(child, low, high, found)
+    root, found, seen = document.rootFrame(), [], set()
+    block = document.findBlock(low)
+    while block.isValid() and block.position() <= high:
+        chain, frame = [], QTextCursor(block).currentFrame()
+        while frame is not None and frame != root:
+            chain.append(frame)
+            frame = frame.parentFrame()
+        after = None
+        for frame in reversed(chain):  # (the outermost first: a formula's own cells are not looked at)
+            first, last = frame.firstPosition(), frame.lastPosition()
+            if (first, last) in seen:
+                continue
+            seen.add((first, last))
+            tex = _formula_tex(frame) if isinstance(frame, QTextTable) else None
+            if tex is not None:
+                if first >= low:  # (begun before the selection: not selected - its text after it is)
+                    found.append((first, last, tex))
+                after = last
+                break
+        following = document.findBlock(after + 1) if after is not None else block.next()
+        block = following if following.isValid() and following.position() > block.position() else block.next()
+    return found
 
 
 def _inline_tex(document: QTextDocument, low: int, high: int) -> str:

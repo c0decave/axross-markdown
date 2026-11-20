@@ -198,8 +198,9 @@ def _github_style(dark: bool):
 def _code_gap(tokens, idx: int, env) -> str:
     """Between two code blocks one after the other, a line that is no code:
     Qt joined them into one (Copy Code Block copied both)."""
-    if env.get("browser") or not idx or tokens[idx - 1].type not in ("fence", "code_block"):
-        return ""
+    after_code = idx and tokens[idx - 1].type in ("fence", "code_block")
+    if env.get("browser") or not (after_code or (tokens[idx].meta or {}).get("after_code")):
+        return ""  # (meta "after_code": a part begun between two code blocks - _part_tokens)
     return '<p class="code-gap">&nbsp;</p>\n'
 
 
@@ -1603,17 +1604,28 @@ _BLOCK_STARTS = frozenset(("fence", "code_block", "math_block", "math_block_labe
                            "safe_html_block"))
 
 
+#: What a box's frame (a code block's, a display formula's) weighs in a part, in blocks (_weight).
+BOX_WEIGHT = 3
+#: Characters of a line's text that weigh one block in a part (_weight).
+INLINE_BLOCK_CHARS = 200
+
+
 def _weight(token, blocks: int) -> int:
-    """What *token* costs to lay out, in blocks (_part_ranges)."""
-    weight = token.nesting == 1
+    """What *token* costs to lay out, in blocks (_part_ranges) - a block of no content at least one (a rule,
+    an empty code block: 100,000 rules weighed nothing, one part, 1.3 s), a box (a code block, a formula)
+    its frame too (50,000 one-line code blocks: 9 s)."""
+    weight = token.nesting == 1 or (token.block and token.nesting == 0 and token.type != "inline")
+    if token.type in ("fence", "code_block", "math_block", "math_block_label"):
+        weight += BOX_WEIGHT
     if token.type in ("math_block", "math_block_label"):  # (a display formula: tables in tables to lay out)
         weight += min(blocks, 1 + 12 * token.content.count("\\begin") + 3 * token.content.count("\\frac"))
     elif token.type in ("fence", "code_block"):  # (each of its lines a block of the page)
         weight += token.content.count("\n")
     elif token.type == "paragraph_open" and (token.meta or {}).get("piece"):
         weight += blocks  # (a long paragraph's piece: a part of its own)
-    elif token.type == "inline":
-        weight += len(token.children or ()) // 8
+    elif token.type == "inline":  # (its spans, and its letters: a line's worth a block - a quote of 300 rows of
+        # long cells was laid out a dozen of its pieces a part, 0.14 s)
+        weight += len(token.children or ()) // 8 + len(token.content) // INLINE_BLOCK_CHARS
     elif token.type == "safe_html_block":
         events = MD.html_events(token)
         weight += (len(events) + sum(event[1].count("\n") for event in events if event[0] == "text")) // 6
@@ -1666,7 +1678,11 @@ def _part_ranges(tokens: list, blocks: int, chunks: set) -> list:
         if index + 1 >= len(tokens) or weight < (blocks if ranges else first) or token.nesting == 1:
             continue
         following = tokens[index + 1]
-        if _is_code(token) and _is_code(following) and not (following.meta or {}).get("band"):
+        # (past twice the part's weight a cut between two code blocks too - the line between them goes with the
+        # second, _part_tokens: 50,000 code blocks in a row, 20,000 in a quote were one part each, 2.5 to 9 s;
+        # inside a container only a heavy one's blocks, as before - a light one is at most HEAVY)
+        forced = weight >= 2 * blocks
+        if _is_code(token) and _is_code(following) and not (following.meta or {}).get("band") and not forced:
             continue  # (not between two code blocks: the line between them - _code_gap - is the first one's part's)
         if not stack and token.level == 0:
             if following.type not in _PART_STARTS:
@@ -1702,8 +1718,12 @@ def _part_tokens(tokens: list, begin: int, end: int, opened: list, closed: list)
             meta["going_on"] = True  # (cut inside it: the part begins in the item - GOING_ON its first block)
         out.append(copy)
     ending = set(closed)
+    codes = ("fence", "code_block")
     for at in range(begin, end):
         token = tokens[at]
+        if at == begin and at and token.type in codes and tokens[at - 1].type in codes:
+            # (cut between two code blocks - past twice a part's weight: the line between them in this one)
+            token = token.copy(meta={**(token.meta or {}), "after_code": True})
         out.append(token.copy(meta={**(token.meta or {}), "continues": True}) if at in ending else token)
     for at in reversed(closed):
         token = tokens[at]
@@ -1802,6 +1822,12 @@ def piece_floor(weight: int) -> int:
     return max(40, 1600 // weight)
 
 
+#: What a span costs in a paragraph's piece beside its text, in letters (_paragraph_pieces): an image, a
+#: formula, a code span is laid out as a thing of its own.
+_SPAN_COST = {"image": 30, "math_inline": 30, "math_inline_double": 30, "code_inline": 10, "html_inline": 10,
+              "footnote_ref": 10}
+
+
 def _paragraph_pieces(tokens: list) -> list:
     """*tokens* with a paragraph of the top level of more than
     PARAGRAPH_SPANS spans in pieces (paragraphs, meta "piece": (number,
@@ -1850,23 +1876,31 @@ def _paragraph_pieces(tokens: list) -> list:
                     at = cut
             else:
                 children.append(child)
-        groups, group, depth, size = [], [], 0, 0
+        groups, group, size, wrappers = [], [], 0, []
+        Token = MD.token_class()
         for child in children:
             full = len(group) >= PARAGRAPH_SPANS or size >= step
             # (no space for twice as long: cut between two spans all the same - "`a" 49,500 times, 25,000
             # code spans and not one space, held the window 17 s in Qt's layout; "$a$" 30,000 times 3 s)
-            if not depth and full and (child.type in ("softbreak", "text")
-                                       and (child.type == "softbreak" or child.content[:1].isspace())
-                                       or len(group) >= 2 * PARAGRAPH_SPANS or size >= 2 * step) \
+            if full and (child.type in ("softbreak", "text")
+                         and (child.type == "softbreak" or child.content[:1].isspace())
+                         or len(group) >= 2 * PARAGRAPH_SPANS or size >= 2 * step) \
                     and child.nesting != -1:
+                # (inside a link, emphasis, a strike: those ended at the cut and begun again after it - cut at
+                # the top level only, "*" + 8,000 images + "*" was one piece: 5 to 6 s in Qt's setHtml)
+                group += [Token(opened.type[:-len("_open")] + "_close", opened.tag, -1, markup=opened.markup)
+                          for opened in reversed(wrappers)]
                 groups.append(group)
-                group, size = [], 0
+                group, size = [opened.copy() for opened in wrappers], 0
                 if child.type == "softbreak":
                     continue
                 if child.type == "text":
                     child = child.copy(content=child.content.lstrip())
-            depth += child.nesting
-            size += len(child.content or "")
+            if child.nesting == 1:
+                wrappers.append(child)
+            elif child.nesting == -1 and wrappers:
+                wrappers.pop()
+            size += len(child.content or "") + _SPAN_COST.get(child.type, 0)
             group.append(child)
         groups.append(group)
         end = next(k for k in range(index + 2, len(tokens)) if tokens[k].type == "paragraph_close")
@@ -1886,6 +1920,8 @@ def _paragraph_pieces(tokens: list) -> list:
 #: Cells of a table inside a container (a list item, a quote) in one piece
 #: (a table of its own, as wide as the others: _table_pieces).
 TABLE_PIECE_CELLS = 400
+#: ... and characters (ui.markdown_view.TABLE_PART_CHARS).
+TABLE_PIECE_CHARS = 30_000
 
 
 def _table_pieces(tokens: list) -> list:
@@ -1910,7 +1946,8 @@ def _table_pieces(tokens: list) -> list:
         columns = sum(1 for t in table[rows[0]:first_end] if t.type in ("th_open", "td_open")) if rows else 1
         # (the first row's: counted over the whole table, every row was a table of its own)
         body = next((k for k, t in enumerate(table) if t.type == "tbody_open"), None)
-        if body is None or (len(rows) * max(1, columns)) <= TABLE_PIECE_CELLS:
+        size = sum(len(t.content or "") for t in table if t.type == "inline")
+        if body is None or ((len(rows) * max(1, columns)) <= TABLE_PIECE_CELLS and size <= TABLE_PIECE_CHARS):
             out += table
             index = close + 1
             continue
@@ -1918,6 +1955,8 @@ def _table_pieces(tokens: list) -> list:
         head, tail = table[:body + 1], table[-2:]  # (table_open … tbody_open; tbody_close, table_close)
         body_rows = [k for k in rows if k > body]
         per = max(1, TABLE_PIECE_CELLS // max(1, columns))
+        # (and of at most TABLE_PIECE_CHARS characters: a few hundred rows of long cells were one piece)
+        per = min(per, max(1, TABLE_PIECE_CHARS * len(rows) // max(1, size)))
         for first in range(0, len(body_rows), per):
             group = body_rows[first:first + per]
             end = body_rows[first + per] if first + per < len(body_rows) else len(table) - 2

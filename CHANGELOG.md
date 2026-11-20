@@ -4,6 +4,56 @@ What changed in each release of axross-markdown. The code is axross's
 Markdown viewer (https://github.com/c0decave/axross), written out by axross's
 `scripts/export_standalone.py markdown`.
 
+## 0.16.8 - 2026-11-20
+
+The twenty-first review's fixes, and the CI's tests green again. Times are the
+window's own CPU in one event-loop turn.
+
+- **Emoji with the CI's font:** Ubuntu's Noto Color Emoji (the runner's) is a
+  bitmap font: FreeType decodes a glyph's PNG at every layout and every paint,
+  67 µs an emoji (2 µs with an outline colour font). With Qt's own parser an
+  emoji now weighs its 128 letters in a part too (a part held 1,080 of them:
+  0.31 s), in a quote or a list item as well (3,000 of them a piece: 1 s). A
+  heading or a table cell is cut by that weight too (1,000 emoji in a heading:
+  0.4 s, in a cell 0.8 s). While the laid-out page was shorter than the view,
+  the scroll bar was hidden and shown again at each part, and Qt laid the
+  whole page out again each time (0.19 s); it now stays on while parts are to
+  come. 50,000 emoji with that font: 0.31 and 0.19 s, now 0.10 s, about half
+  of it Qt painting a view full of them.
+- **Budgets by what the layout costs, not by shape:** every block weighs in a
+  part (100,000 rules: 1.3 to 3.4 s; 50,000 one-line code blocks: 2.5 to
+  9 s). A part is cut past twice its budget wherever a block begins, inside
+  any container. A paragraph is also cut inside a link, emphasis or a strike,
+  the open spans ended and begun again (8,000 images in emphasis: 4.6 s). A
+  table's part is also cut by its characters (300 rows of long cells: 1.3 s).
+  A formula longer than 4,000 characters shows as its TeX (0.6 to 0.8 s), and
+  a code line of 80,000 characters is wrapped.
+- **Find, Copy and PDF of such pages:** Find counts matches for at most
+  0.03 s a turn and shows "N+" past that (0.15 s at each Find Next). A copy
+  takes 25 ms of pieces a turn. On a page read to its end, a copy no longer
+  goes through every frame of the page at each piece, and may cut inside a
+  quote's box (50,000 code blocks: 0.42 s a turn; 20,000 in a quote: 0.12 s),
+  and Find looks for the view's top by halves (0.09 s).
+- **The editor's preview follows the typing** inside a long table or code
+  block (it stayed rows away), and 3,000 code blocks no longer stall a pause
+  in the typing (0.34 s).
+- **Opening a file no longer freezes the window while the fonts are searched
+  for emoji:** where no font had every emoji, each of hundreds of font
+  families was asked for every emoji (minutes on some machines). Each family
+  is now asked only for what is still missing, and the search ends after
+  0.25 s.
+- **Small things:** a missing file is said in words ("it does not exist"),
+  not "[Errno 2] …" with its path. A folder given to the program opens its
+  README. A cp1252 console shows boxes and rules as ASCII ("+--+"), not "?".
+  Zoom reaches exactly 25 % and 400 %. "~~~x~~~" in a line stays as written.
+  An alert in a list or in another quote is a quote, as on GitHub.
+- **CI:** a failed test run shows its pytest summary as annotations, readable
+  through the API. The build backend (setuptools) is pinned in the lock and
+  installed from it (`--no-build-isolation`). The new stress tests' budget of
+  0.1 s a turn grows with how much slower the machine lays out a fixed page
+  (at most three times), and a page of emoji may take what Qt needs to paint
+  a view of them once.
+
 ## 0.16.7 - 2026-11-20
 
 - **A paragraph of many emoji on a host with many fonts:** 0.16.6's CI runner

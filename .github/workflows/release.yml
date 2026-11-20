@@ -54,7 +54,7 @@ jobs:
         set -o pipefail
         {
           python -m pip install --require-hashes -r requirements.lock.txt
-          python -m pip install --no-deps .
+          python -m pip install --no-build-isolation --no-deps .
           python -m pip install pytest
           python -m pytest -q -rfE tests
         } 2>&1 | tee -a "$RUNNER_TEMP/job.log"
@@ -110,7 +110,7 @@ jobs:
         set -o pipefail
         {
           python -m pip install --require-hashes -r requirements.lock.txt -r packaging/requirements-pyinstaller.txt
-          python -m pip install --no-deps .
+          python -m pip install --no-build-isolation --no-deps .
         } 2>&1 | tee -a "$RUNNER_TEMP/job.log"
     - name: One-file binary (PyInstaller)
       run: |

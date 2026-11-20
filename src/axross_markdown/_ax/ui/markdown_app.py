@@ -21,6 +21,7 @@ from __future__ import annotations
 import os
 import sys
 
+from axross_markdown._ax.core.markdown_cli import folder_page as _folder_page  # (a folder given: its README, as a link opens it)
 from axross_markdown._ax.ui.standalone_app import run, smoke_ms_from_env
 
 NAME = "axross-markdown"
@@ -47,7 +48,7 @@ class MarkdownApp:
 
         opened = []
         for path in paths or [""]:
-            full = os.path.abspath(os.path.expanduser(path)) if path else ""
+            full = _folder_page(os.path.abspath(os.path.expanduser(path))) if path else ""
             viewer = open_markdown_viewer(self.backend, full, parent, opener=self.ask_open,
                                           editor=self.edit, view_menu=self.view_menu)
             self.viewers.append(viewer)

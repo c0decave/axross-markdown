@@ -182,6 +182,6 @@ again on every push (`supply-chain-gate.toml`). To install exactly those files:
 
 ```sh
 pip install --require-hashes -r requirements.lock.txt
-pip install --no-deps .
+pip install --no-build-isolation --no-deps .
 ```
 

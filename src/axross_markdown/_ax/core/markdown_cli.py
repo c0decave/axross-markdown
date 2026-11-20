@@ -37,6 +37,22 @@ MAX_WIDTH = 100
 MIN_WIDTH = 20
 
 
+#: The page of a folder: its README (a link to the folder opens it, and so does the folder given to the
+#: program).
+FOLDER_PAGES = ("README.md", "readme.md", "Readme.md", "README.markdown", "index.md")
+
+
+def folder_page(path: str) -> str:
+    """*path* - or, a folder, its first page of FOLDER_PAGES there (*path* itself: none)."""
+    if not os.path.isdir(path):
+        return path
+    for name in FOLDER_PAGES:
+        page = os.path.join(path, name)
+        if os.path.isfile(page):
+            return page
+    return path
+
+
 def _read(name: str) -> tuple[str, str]:
     """(text, "") of the file *name* ("-": standard input), or ("", why)."""
     if name == "-":
@@ -46,6 +62,11 @@ def _read(name: str) -> tuple[str, str]:
             st = os.stat(name)
         except OSError as exc:
             return "", exc.strerror or str(exc)
+        if stat.S_ISDIR(st.st_mode):  # (a folder: its README, as the window opens a link to one)
+            page = folder_page(name)
+            if page == name:
+                return "", "a folder without a README"
+            return _read(page)
         if not stat.S_ISREG(st.st_mode):
             return "", "not a regular file"
         # The file the user named is shown, as the viewer shows it (only a
@@ -301,6 +322,31 @@ def _write(text: str, program: str = "axross-mdcat") -> None:
 _ENCODING_SET: list = []
 
 
+#: The error handler of a console's encoding (_encodable_output): the box, rule and block characters
+#: a console of cp1252 lacks as ASCII ("┌─┐" as "+-+", "█" as "#") - not "???" - anything else "?".
+ASCII_ERRORS = "axross-ascii"
+_ASCII = str.maketrans({**dict.fromkeys("─━═┄┈╌", "-"), **dict.fromkeys("│┃║┆┊╎", "|"),
+                        **dict.fromkeys("┌┐└┘├┤┬┴┼╭╮╯╰┏┓┗┛┣┫┳┻╋╔╗╚╝╠╣╦╩╬", "+"),
+                        **dict.fromkeys("█▀▄▌▐▓▒░■", "#"), "•": "*", "◦": "o", "▪": "*", "…": "...",
+                        "“": '"', "”": '"', "‘": "'", "’": "'", "–": "-", "—": "--", "→": "->", "←": "<-",
+                        "✓": "v", "✔": "v", "☐": "[ ]", "☑": "[x]", "☒": "[x]", "▶": ">", "▼": "v"})
+
+
+def _register_ascii() -> None:
+    import codecs
+
+    def ascii_instead(error: UnicodeError):
+        if not isinstance(error, UnicodeEncodeError):
+            raise error
+        bad = error.object[error.start:error.end]
+        return "".join(ch.translate(_ASCII) if ch.translate(_ASCII) != ch else "?" for ch in bad), error.end
+
+    try:
+        codecs.lookup_error(ASCII_ERRORS)
+    except LookupError:
+        codecs.register_error(ASCII_ERRORS, ascii_instead)
+
+
 def _encodable_output() -> None:
     """Standard output (and error) that takes every character, once: UTF-8 into a pipe or a file
     (Windows' default there is its ANSI code page - cp1252 has no "█": axross-mdcat.exe ended in a
@@ -313,7 +359,8 @@ def _encodable_output() -> None:
             if stream is None or not hasattr(stream, "reconfigure"):
                 continue
             if stream.isatty():
-                stream.reconfigure(errors="replace")
+                _register_ascii()
+                stream.reconfigure(errors=ASCII_ERRORS)
             else:
                 stream.reconfigure(encoding="utf-8", errors="replace")
         except (OSError, ValueError, AttributeError):

@@ -421,6 +421,7 @@ def make_parser():
     # closes only after one, not before a digit - "tickets are $5 and $10" stays text.
     md.use(dollarmath_plugin, allow_space=False, allow_digits=False, double_inline=True,
            allow_blank_lines=False)
+    md.inline.ruler.before("strikethrough", "tilde_run", _tilde_run)
     md.inline.ruler.before("strikethrough", "single_tilde", _single_tilde)
     shown_as = md.normalizeLinkText
 
@@ -1652,18 +1653,36 @@ def _fewer_spans(state) -> None:
 LINE_FORMULAS = 100
 
 
+#: A formula longer than this (characters of TeX) is shown as its TeX - in a line as text, on lines of its own
+#: as a code block (_fewer_formulas): one of 80,000 was set in one piece, 0.6 to 0.8 s of the window's.
+FORMULA_CHARS = 4000
+#: ... its lines then at most this long (a code line of the window's: ui.markdown_view.LINE_CAP).
+FORMULA_LINE = 2000
+
+
 def _fewer_formulas(state) -> None:
-    """Past LINE_FORMULAS formulas in a heading, a cell or a term: their TeX
-    as text ("$x^2$")."""
+    """Past LINE_FORMULAS formulas in a heading, a cell or a term, and any formula longer than FORMULA_CHARS:
+    their TeX as text ("$x^2$"), a long display formula's as a code block."""
     tokens = state.tokens
     for index, token in enumerate(tokens):
-        if token.type != "inline" or not token.children or (index and tokens[index - 1].type == "paragraph_open"):
+        # (one too deep as well: math_runs shows it as written, with its note - as before)
+        if token.type in ("math_block", "math_block_label") and len(token.content) > FORMULA_CHARS \
+                and not math_too_deep(token.content):
+            token.type, token.tag, token.info, token.markup = "fence", "code", "tex", "```"
+            # (its long lines in lines of FORMULA_LINE characters, as a code block's: one block each)
+            token.content = "".join(
+                "\n".join(line[at:at + FORMULA_LINE] for at in range(0, len(line), FORMULA_LINE)) + "\n"
+                for line in token.content.strip("\n").split("\n"))
             continue
+        if token.type != "inline" or not token.children:
+            continue
+        line = not (index and tokens[index - 1].type == "paragraph_open")
         seen = 0
         for child in token.children:
             if child.type in ("math_inline", "math_inline_double"):
                 seen += 1
-                if seen > LINE_FORMULAS:
+                if (line and seen > LINE_FORMULAS) or (len(child.content) > FORMULA_CHARS
+                                                        and not math_too_deep(child.content)):
                     marks = "$$" if child.type == "math_inline_double" else "$"
                     child.type, child.tag, child.nesting = "text", "", 0
                     child.content = f"{marks}{child.content}{marks}"
@@ -1677,6 +1696,21 @@ def _backtick_math(state) -> None:
             if child.type == "math_inline" and len(child.content) > 2 and child.content[0] == "`" \
                     and child.content[-1] == "`" and "`" not in child.content[1:-1]:
                 child.content = child.content[1:-1]
+
+
+def _tilde_run(state, silent: bool) -> bool:
+    """A run of three tildes or more in a line is text, as GitHub shows it ("~~~x~~~": markdown-it struck
+    the x through between two tildes)."""
+    src, start, end = state.src, state.pos, state.posMax
+    if src[start] != "~" or start + 2 >= end or src[start + 1] != "~" or src[start + 2] != "~":
+        return False
+    stop = start
+    while stop < end and src[stop] == "~":
+        stop += 1
+    if not silent:
+        state.push("text", "", 0).content = src[start:stop]
+    state.pos = stop
+    return True
 
 
 def _single_tilde(state, silent: bool) -> bool:
@@ -1725,7 +1759,7 @@ def alert_of(token) -> str:
 
 
 def _alerts(state) -> None:
-    """A quote whose first line is ``[!NOTE]`` (TIP, IMPORTANT, WARNING,
+    """A quote of the top level whose first line is ``[!NOTE]`` (TIP, IMPORTANT, WARNING,
     CAUTION; any case) is that alert: the kind goes to the quote's tokens
     (:func:`alert_of`), the marker out of its text. (Before the inline rules:
     "[!NOTE]" would be a link's text.)"""
@@ -1733,7 +1767,9 @@ def _alerts(state) -> None:
     index = 0
     while index < len(tokens) - 2:
         token = tokens[index]
-        if token.type == "blockquote_open" and tokens[index + 1].type == "paragraph_open" \
+        # (a quote of the top level only: GitHub shows one in a list or another quote as a quote, its
+        # "[!NOTE]" as written)
+        if token.type == "blockquote_open" and token.level == 0 and tokens[index + 1].type == "paragraph_open" \
                 and tokens[index + 2].type == "inline":
             found = _ALERT.match(tokens[index + 2].content)
             if found:
