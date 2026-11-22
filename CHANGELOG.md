@@ -4,6 +4,37 @@ What changed in each release of axross-markdown. The code is axross's
 Markdown viewer (https://github.com/c0decave/axross), written out by axross's
 `scripts/export_standalone.py markdown`.
 
+## 0.17.2 - 2026-11-22
+
+0.17.1 was not released: 9 tests of its CI's blocking set failed. Seven of
+them showed a real fault of the reader, which a machine with a colour
+emoji font gets.
+
+- **With a colour emoji font installed, the page was set in it.** The
+  reader puts the emoji font after the page's own font family. On most
+  Linux desktops that family is a fontconfig alias such as "Sans Serif",
+  which Qt cannot find by that name in a list of families, so it took the
+  next one, the emoji font, for all of the page. To Qt's measure a letter
+  was then 2,550 pixels wide. The page lost its margins (lines of 120
+  characters instead of about 80), tables grew wider than the window, and
+  every page looked different. Since 0.16.12, which made an installed
+  Noto Color Emoji the page's emoji family, this hit every machine that
+  has it. Now the family the text is really set in comes first, and the
+  width of a line is measured in the text font alone.
+- **The golden pictures** of the tests are drawn with the test's own
+  fonts (DejaVu Sans, Sans Bold and Sans Mono, in `tests/golden/fonts`
+  with their licence), and the process that draws them sees no other
+  font. A runner's other fonts drew the signs DejaVu lacks (such as ✓, ⚠,
+  formula signs and emoji) differently. Where fontconfig does not apply
+  that file (macOS, Windows), the fonts seen differ from the record and
+  the test is skipped, with the reason.
+- **Timing tests:** two tests that measure time were missing the marker
+  `timing`: one measured the event loop's pauses with its own helper, the
+  other ran another file's heartbeat test. The check that finds such tests
+  now also catches a helper that measures a time itself, `Frozen`, a float
+  asserted after reading a clock, and a test that runs another file's
+  timing test. That brings 41 more tests into the `timing` set.
+
 ## 0.17.1 - 2026-11-22
 
 0.17.0 was not released: its CI failed. This release fixes what was ours

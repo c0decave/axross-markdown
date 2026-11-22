@@ -4,9 +4,12 @@ release - a shared runner about twice as slow failed 133 of them in 0.17.0's CI 
 rest, which do block, with ``-m "not timing"``.
 
 The scan here finds what asserts a duration: a call of the heartbeat or a turn meter (tests/
-markdown_heartbeat.py, the _Turns / Turns / within_turn / turn_for helpers, _quick), of time.process_time,
-thread_time or perf_counter, of a module's own helper that calls one, a wait asserted with a timeout of
-at most 30 s (``assert until(..., 5)``) and a deadline of at most 30 s in a test (``time.monotonic() + 5``).
+markdown_heartbeat.py and its Frozen, the _Turns / Turns / within_turn / turn_for helpers, _quick), of
+time.process_time, thread_time or perf_counter, of a helper that measures a time itself (a clock minus a
+moment: ``time.monotonic() - began``) or calls one, of another module's test that is a timing test (0.17.1's
+CI: bugs20 ran bugs17's heartbeat case), a float asserted in a test that reads a clock (``assert gap <
+0.25``), a wait asserted with a timeout of at most 30 s (``assert until(..., 5)``) and a deadline of at
+most 30 s in a test (``time.monotonic() + 5``).
 A helper that only waits for a page to be ready waits long enough (READY_SECONDS): it is no budget.
 """
 
@@ -28,7 +31,9 @@ from tests import markdown_timing as MT  # noqa: E402
 #: What measures elapsed time, by name (a call of it, or of an attribute of that name).
 SEEDS = {"Heartbeat", "assert_responsive", "gap_budget", "within_turn", "turn_for", "_Turns", "Turns",
          "_longest_turn", "_quick", "measure_again", "gaps_since", "thread_time", "process_time",
-         "perf_counter"}
+         "perf_counter", "Frozen"}
+#: The clocks an elapsed time is read from (a moment subtracted from one of them is a measured time).
+CLOCKS = ("monotonic", "time", "perf_counter", "process_time", "thread_time")
 #: The waits whose timeout, asserted, is a budget.
 WAITS = ("until", "wait_until", "_until")
 #: The longest timeout or deadline that still counts as a budget (a readiness wait is longer).
@@ -64,6 +69,34 @@ def _asserted_wait(node) -> bool:
     return False
 
 
+def _clock(node) -> bool:
+    return isinstance(node, ast.Call) and getattr(node.func, "attr", getattr(node.func, "id", "")) in CLOCKS
+
+
+def _measures(node) -> bool:
+    """A clock minus a moment (``time.monotonic() - began``, ``now - self.last`` with ``now`` a clock's) - an
+    elapsed time; a clock minus a number (``time.time() - 7200``) is a moment, no measure."""
+    read = {target.id for sub in ast.walk(node) if isinstance(sub, ast.Assign) and _clock(sub.value)
+            for target in sub.targets if isinstance(target, ast.Name)}
+    return any(isinstance(sub, ast.BinOp) and isinstance(sub.op, ast.Sub)
+               and (_clock(sub.left) or (isinstance(sub.left, ast.Name) and sub.left.id in read))
+               and not isinstance(sub.right, ast.Constant)
+               for sub in ast.walk(node))
+
+
+def _asserted_float(node) -> bool:
+    """A float compared in an assert (``assert gap < 0.25``) by a test that reads a clock."""
+    if not any(_clock(sub) for sub in ast.walk(node)):
+        return False
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Assert):
+            for compare in ast.walk(sub.test):
+                if isinstance(compare, ast.Compare) and any(isinstance(op, (ast.Lt, ast.LtE)) for op in compare.ops) \
+                        and any(isinstance(c, ast.Constant) and isinstance(c.value, float) for c in compare.comparators):
+                    return True
+    return False
+
+
 def _deadline(node) -> bool:
     for sub in ast.walk(node):
         if isinstance(sub, ast.BinOp) and isinstance(sub.op, ast.Add) and isinstance(sub.left, ast.Call) \
@@ -76,9 +109,10 @@ def scan() -> tuple[set[str], set[str], int]:
     """(the tests that measure elapsed time, the helpers that do, how many tests there are)."""
     modules = _modules()
     helpers = set(SEEDS)
-    for tree in modules.values():  # (a helper that waits a few seconds and goes on: a budget too)
+    for tree in modules.values():  # (a helper that waits a few seconds and goes on, or measures: a budget too)
         for node in tree.body:
-            if isinstance(node, ast.FunctionDef) and not node.name.startswith("test_") and _deadline(node):
+            if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and not node.name.startswith("test_") \
+                    and (_deadline(node) or _measures(node)):
                 helpers.add(node.name)
     grew = True
     while grew:  # (helpers calling helpers, across the modules: they import each other's)
@@ -90,12 +124,22 @@ def scan() -> tuple[set[str], set[str], int]:
                     helpers.add(node.name)
                     grew = True
     found, count = set(), 0
-    for module, tree in modules.items():
-        for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef) and node.name.startswith("test_"):
-                count += 1
-                if _names(node) & helpers or _asserted_wait(node) or _deadline(node):
-                    found.add(f"{module}::{node.name}")
+    tests = [(module, node) for module, tree in modules.items() for node in ast.walk(tree)
+             if isinstance(node, ast.FunctionDef) and node.name.startswith("test_")]
+    for module, node in tests:
+        count += 1
+        if _names(node) & helpers or _asserted_wait(node) or _deadline(node) or _measures(node) \
+                or _asserted_float(node):
+            found.add(f"{module}::{node.name}")
+    grew = True
+    while grew:  # (a test that runs a timing test of another module: one too)
+        grew = False
+        timing = {name.split("::", 1)[1] for name in found}
+        for module, node in tests:
+            name = f"{module}::{node.name}"
+            if name not in found and (_names(node) - {node.name}) & timing:
+                found.add(name)
+                grew = True
     return found, helpers, count
 
 
@@ -110,7 +154,10 @@ def test_sad_every_listed_test_is_there():
     modules = _modules()
     tests = {f"{module}::{node.name}" for module, tree in modules.items() for node in ast.walk(tree)
              if isinstance(node, ast.FunctionDef) and node.name.startswith("test_")}
-    gone = sorted((MT.TIMING | set(MT.BY_HAND)) - tests)
+    listed = MT.TIMING | set(MT.BY_HAND)
+    if not (ROOT / "ui").is_dir():  # (an export carries some of axross's test modules: the others' names wait)
+        listed = {name for name in listed if name.split("::", 1)[0] in modules}
+    gone = sorted(listed - tests)
     assert not gone, gone
     assert all(why.strip() for why in MT.BY_HAND.values())
     assert not set(MT.BY_HAND) & MT.TIMING  # (the scan finds it: no reason by hand needed)

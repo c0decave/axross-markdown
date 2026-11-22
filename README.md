@@ -64,7 +64,7 @@ Every dependency is pinned and reviewed in `requirements.lock.txt`
 python -m pytest tests
 ```
 
-The tool's own tests from axross - 44 files, their imports renamed as the code's - and a test that the program starts and ends cleanly; Qt's offscreen platform, no display needed.
+The tool's own tests from axross - 45 files, their imports renamed as the code's - and a test that the program starts and ends cleanly; Qt's offscreen platform, no display needed.
 
 Tests that pass or fail by elapsed time - the window's heartbeat and turn budgets, waits that are the assertion, the freeze sweep, the stress grids - carry the marker `timing` (`tests/markdown_timing.py`; `tests/test_markdown_timing_marks.py` fails when a test that asserts a duration lacks it). The CI runs them in a job of their own that blocks nothing (`-m timing`, its failures as warnings: a shared runner about twice as slow fails them without a bug) and the rest with `-m "not timing"`; a release waits for the rest only.
 

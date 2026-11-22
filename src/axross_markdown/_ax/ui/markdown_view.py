@@ -2806,12 +2806,31 @@ _EMOJI_FAMILY: list = []
 
 
 def with_emoji_family(font: QFont) -> QFont:
-    """*font* with the family emoji_fonts found for emoji after its own (unchanged: none found)."""
+    """*font* with the family emoji_fonts found for emoji after its own (unchanged: none found) - the family
+    the font is really set in first: a default font's family is often a fontconfig alias ("Sans Serif"),
+    which Qt finds no family of that name for in a list of families - it took the next, the emoji font, for
+    all of the page (a CI runner with Noto Color Emoji: letters of 2,550 pixels on average to Qt's metrics,
+    no margins, 120 characters a line, every layout and picture different)."""
+    from PyQt6.QtGui import QFontInfo
+
     family = _EMOJI_FAMILY[0] if _EMOJI_FAMILY else ""
     if not family or family in font.families():
         return font
+    real = QFontInfo(font).family()
+    own = [name for name in (font.families() or [font.family()]) if name != real]
     font = QFont(font)
-    font.setFamilies([*(font.families() or [font.family()]), family])
+    font.setFamilies(list(dict.fromkeys(name for name in (real, *own, family) if name)))
+    return font
+
+
+def text_font(font: QFont) -> QFont:
+    """*font* without the families after its first (the emoji font with_emoji_family adds): what the text is
+    measured in."""
+    families = font.families()
+    if len(families) <= 1:
+        return font
+    font = QFont(font)
+    font.setFamilies(families[:1])
     return font
 
 
@@ -6835,8 +6854,10 @@ class MarkdownView(QWidget):
         margins)."""
         # (of the letters before zoom: a zoom step is one relayout - its width
         # changed with it, two, 0.69 s on a page of formulas)
-        if not hasattr(self, "_char_width"):
-            self._char_width = self.browser.fontMetrics().averageCharWidth()
+        if not hasattr(self, "_char_width"):  # (of the text's font: the emoji family after it is no letter's)
+            from PyQt6.QtGui import QFontMetrics
+
+            self._char_width = QFontMetrics(text_font(self.browser.font())).averageCharWidth()
         return max(320, self._char_width * 80)
 
     def clamp_images(self) -> None:
