@@ -1272,4 +1272,4 @@ def init_registry() -> None:
     )
 
     # Availability is resolved lazily, on first read (see _ImportProbe).
-    log.info("Backend registry initialized: %d backends", len(_registry))
+    log.debug("Backend registry initialized: %d backends", len(_registry))

@@ -92,7 +92,8 @@ def _viewer(path: Path, backend=None):
 
     viewer = MarkdownViewerDialog(backend or LocalFS(), str(path))
     viewer.show()
-    assert wait_until(lambda: viewer.loaded_once)
+    # (shown: a page with code is made on a worker - its coloured by a child the GUI thread never waits for)
+    assert wait_until(lambda: viewer.loaded_once and viewer.view._readable)
     return viewer
 
 

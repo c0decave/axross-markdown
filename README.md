@@ -7,13 +7,13 @@
 - **GitHub Markdown, complete** - CommonMark, tables, task lists, footnotes, alerts, definition lists, front matter.
 - **Math without a browser** - `$...$` and `$$...$$`: fractions, integrals, sums, matrices and cases, drawn as text.
 - **An outline beside the text** - every heading one click away; find (Ctrl+F) marks every match.
-- **Highlighted code** - fenced blocks coloured by Pygments, in light and dark themes.
+- **Twelve themes** - Light, Dark, Sepia, Solar, Arctic, Retro, Slate, Paper, High Contrast and more; code coloured by Pygments in each; every one WCAG AA.
 - **Local images** - the pictures beside the file, clickable when linked, bounded in size.
 - **Shown, never run** - no scripts, styles, frames or forms; nothing is loaded from the network.
 - **Links that ask first** - a Markdown link opens in the window; a web link only after a question showing its real address.
 - **Edit with a live preview** - F4 opens an editor with the rendering beside the text, following the typing.
 - **In the terminal too** - `axross-mdcat`: colours, box-drawn tables, links and pictures, no Qt needed.
-- **Export** - the page as HTML with its images inside, as PDF, or printed.
+- **Export, and signed updates** - the page as HTML, PDF or printed; the one-file programs update themselves from signed releases.
 
 ## Contents
 
@@ -22,6 +22,7 @@
   - [Export and print](https://github.com/c0decave/axross-markdown/blob/main/docs/README-extended.md#export-and-print)
   - [Themes](https://github.com/c0decave/axross-markdown/blob/main/docs/README-extended.md#themes)
   - [In the terminal: axross-mdcat](https://github.com/c0decave/axross-markdown/blob/main/docs/README-extended.md#in-the-terminal-axross-mdcat)
+  - [Updates](https://github.com/c0decave/axross-markdown/blob/main/docs/README-extended.md#updates)
   - [The security model](https://github.com/c0decave/axross-markdown/blob/main/docs/README-extended.md#the-security-model)
   - [Limits](https://github.com/c0decave/axross-markdown/blob/main/docs/README-extended.md#limits)
   - [Install options](https://github.com/c0decave/axross-markdown/blob/main/docs/README-extended.md#install-options)
@@ -51,7 +52,8 @@ axross-markdown --html notes.md > notes.html   # the page for a web browser
 ```
 
 Or a one-file program without Python - Linux (also as an AppImage), macOS (also as a disk
-image) and Windows - from the [latest release](https://github.com/c0decave/axross-markdown/releases/latest).
+image) and Windows - from the [latest release](https://github.com/c0decave/axross-markdown/releases/latest);
+it updates itself from the signed releases ([how](https://github.com/c0decave/axross-markdown/blob/main/docs/README-extended.md#updates)).
 
 Every dependency is pinned and reviewed in `requirements.lock.txt`
 ([how to install exactly those](https://github.com/c0decave/axross-markdown/blob/main/docs/README-extended.md#the-exact-reviewed-dependencies)).
@@ -62,9 +64,14 @@ Every dependency is pinned and reviewed in `requirements.lock.txt`
 python -m pytest tests
 ```
 
-The tool's own tests from axross - 32 files, their imports renamed as the code's - and a test that the program starts and ends cleanly; Qt's offscreen platform, no display needed.
+The tool's own tests from axross - 42 files, their imports renamed as the code's - and a test that the program starts and ends cleanly; Qt's offscreen platform, no display needed.
 
 ## Licence
 
 Apache-2.0, as [axross](https://github.com/c0decave/axross): the same code, written out by axross's
 `scripts/export_standalone.py`. Everything in detail: the [extended README](https://github.com/c0decave/axross-markdown/blob/main/docs/README-extended.md).
+
+The one-file programs of the releases contain PyQt6 (GPL-3.0) and Qt (LGPL-3.0): each is a combined work,
+distributed under the **GPL-3.0**. [THIRD_PARTY_LICENSES.txt](https://github.com/c0decave/axross-markdown/blob/main/THIRD_PARTY_LICENSES.txt) - beside them on every release page,
+inside them, and in the program under Help → About - lists what they contain with the licence
+texts, and where the source code of each part is.

@@ -192,6 +192,9 @@ def test_guard_one_huge_block_never_holds_up_the_window(bomb, full):
     timer = QTimer()
     timer.timeout.connect(beat)
     timer.start(5)
+    from tests.markdown_heartbeat import Heartbeat, assert_responsive
+
+    heart = Heartbeat()  # (the gap: the window's wall time but its own wait for a CPU another job had)
     view.render(BOMBS[bomb]())
     assert until(lambda: view._readable and view.markdown, 120)
     def laid() -> bool:  # (as far as it goes at once)
@@ -203,8 +206,13 @@ def test_guard_one_huge_block_never_holds_up_the_window(bomb, full):
     pump(0.5)
     until(laid, 30)
     timer.stop()
+    _turn, gap = heart.stop()
     worst = sorted(turns, reverse=True)[:3]
     assert worst[0][0] < 0.3, worst
+    # (the window frozen by a worker holding Python's lock: wall time, not the GUI thread's - but the time
+    # it waited for a CPU the machine gave another job: the raw wall time between two beats failed the
+    # suite in one process under load, 0.16.11 as 0.16.12 - review 25's R9)
+    assert_responsive(gap, "the longest gap between two beats")
 
 
 # -- 5. reference links in Qt's own parser ------------------------------------------------------------

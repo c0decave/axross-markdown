@@ -90,6 +90,9 @@ def _viewer(path: Path, width: int = 900, height: int = 600):
     viewer.resize(width, height)
     viewer.show()
     assert wait_until(lambda: viewer.loaded_once)
+    # (and laid out: a page with fenced code is prepared on a worker that waits for its lexing child - on a
+    # busy machine a child's start alone took longer than the pump, the page empty when the test scrolled)
+    wait_until(lambda: viewer.view._readable and not viewer.view._scheduled, 30)
     pump(0.1)
     return viewer
 
@@ -343,9 +346,11 @@ def test_edge_the_cells_laid_out_at_once_follow_the_parser_that_lays_them_out():
     table = "| a |\n|---|\n" + "".join(f"| {n} |\n" for n in range(rows))
     assert MV.renderable(table, rows + 1) == (table, "")
     part, why = MV.renderable(table, MV.MD4C_TABLE_CELLS)
-    assert not why and part.count(MV.CHUNK) == 1  # (two parts, laid out one after the other)
-    first = part.split(MV.CHUNK, 1)[0]
-    assert first.count("\n| ") == MV.MD4C_TABLE_CELLS - 1
+    # (three parts, laid out one after the other: the first a quarter as long - the page's first part)
+    assert not why and part.count(MV.CHUNK) == 2
+    first, second = part.split(MV.CHUNK)[:2]
+    assert first.count("\n| ") == (MV.MD4C_TABLE_CELLS - 1) // 4
+    assert second.count("\n| ") == MV.MD4C_TABLE_CELLS - 1  # (a full part after it, its header again)
 
 
 # -- keyboard -----------------------------------------------------------------------------------

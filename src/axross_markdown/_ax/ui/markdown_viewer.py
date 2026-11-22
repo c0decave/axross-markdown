@@ -33,13 +33,16 @@ go through the files and places visited:
 
 from __future__ import annotations
 
+import bisect
 import logging
+import os
 import posixpath
+import re
 import time
 
 from PyQt6 import sip
-from PyQt6.QtCore import QFileSystemWatcher, Qt, QTimer, QUrl
-from PyQt6.QtGui import QColor, QKeySequence, QShortcut, QTextCharFormat, QTextCursor, QTextDocument
+from PyQt6.QtCore import QFileSystemWatcher, QPoint, Qt, QTimer, QUrl
+from PyQt6.QtGui import QColor, QImage, QKeySequence, QShortcut, QTextCharFormat, QTextCursor, QTextDocument
 from PyQt6.QtWidgets import (
     QDialog,
     QFileDialog,
@@ -75,6 +78,8 @@ FIND_COUNT = 10_000
 #: Seconds a search's count and marks take at most in one turn (_mark_matches): past it, "N+" - 10,000
 #: matches in a long page took 0.15 s at each Find Next.
 FIND_TURN = 0.03
+#: Marks of matches set on the page at most: those near what the view shows (_show_marks).
+MARKS_SHOWN = 150
 #: Images a link may name (shown at their own size).
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".svgz", ".ico")
 #: Places Back keeps.
@@ -111,15 +116,23 @@ def unreadable_reason(error) -> str:
 
 #: Blocks of a page past which the top of the view is looked for by halves (_first_shown).
 HALVED_BLOCKS = 5000
+#: (_write) characters of an exported page encoded and written at a time.
+WRITTEN_AT_ONCE = 1 << 20
 
 
 def _first_shown(browser) -> QTextCursor:
     """A cursor at the top of what *browser* shows. On a long page found by halves over its blocks' places -
     Qt's own hit test walks every frame before it: at the end of 50,000 code blocks, 0.09 s a search."""
+    return _shown_at(browser, 0)
+
+
+def _shown_at(browser, offset: int) -> QTextCursor:
+    """A cursor at *offset* pixels below the top of what *browser* shows (above it: negative) - found as
+    _first_shown finds the top."""
     document = browser.document()
     if document.blockCount() <= HALVED_BLOCKS:
-        return browser.cursorForPosition(browser.viewport().rect().topLeft())
-    layout, top = document.documentLayout(), browser.verticalScrollBar().value()
+        return browser.cursorForPosition(browser.viewport().rect().topLeft() + QPoint(0, offset))
+    layout, top = document.documentLayout(), browser.verticalScrollBar().value() + offset
     low, high = 0, document.blockCount() - 1
     while low < high:
         middle = (low + high) // 2
@@ -134,17 +147,20 @@ class MarkdownViewerDialog(QDialog):
     """The Markdown file *path* of *backend*, rendered. *source_pane*: the
     pane it was opened from (Edit opens the editor of its window).
 
-    For a program of its own (ui.markdown_app): *opener(viewer)* adds Open…
-    (Ctrl+O); *editor(backend, path)* is what Edit does; *view_menu(menu)*
-    fills a View button's menu (the program's theme); an empty *path*
-    shows :data:`WELCOME` until a file is opened."""
+    The View button's menu has the page's Theme (ui.markdown_theme_ui: kept,
+    every open page in it at once). For a program of its own
+    (ui.markdown_app): *opener(viewer)* adds Open… (Ctrl+O); *editor(backend,
+    path)* is what Edit does; *view_menu(menu)* adds to the View menu (the
+    window's theme); *help_menu(menu)* fills a Help button's menu (the
+    updates, About: the licences); an empty *path* shows :data:`WELCOME` until a file is opened."""
 
     def __init__(self, backend, path: str, parent=None, *, source_pane=None,
-                 opener=None, editor=None, view_menu=None) -> None:
+                 opener=None, editor=None, view_menu=None, help_menu=None) -> None:
         super().__init__(parent)
         set_window_icon(self, "markdown")
         self.backend, self.path, self.source_pane = backend, path, source_pane
         self._opener, self._editor, self._view_menu = opener, editor, view_menu
+        self._help_menu = help_menu
         self.cut = False
         self.loaded_once = False
         self._generation = 0
@@ -223,13 +239,23 @@ class MarkdownViewerDialog(QDialog):
         if _print_support() is not None:
             menu.addAction(tr("Print…"), self.print_page)
         self.export_button.setMenu(menu)
-        self.view_button = None
+        from axross_markdown._ax.ui.markdown_theme_ui import add_theme_menu
+
+        self.view_button = QPushButton(tr("&View"))  # (Alt+V opens it)
+        self.view_button.setToolTip(tr("The theme of the page") if self._view_menu is None
+                                    else tr("The theme of the page and of the window"))
+        menu = QMenu(self.view_button)
+        self.theme_menu = add_theme_menu(menu)
         if self._view_menu is not None:
-            self.view_button = QPushButton(tr("&View"))  # (Alt+V opens it)
-            self.view_button.setToolTip(tr("The theme of the window"))
-            menu = QMenu(self.view_button)
             self._view_menu(menu)
-            self.view_button.setMenu(menu)
+        self.view_button.setMenu(menu)
+        self.help_button = None
+        if self._help_menu is not None:
+            self.help_button = QPushButton(tr("&Help"))  # (Alt+H opens it)
+            self.help_button.setToolTip(tr("Updates of axross-markdown, and About"))
+            menu = QMenu(self.help_button)
+            self._help_menu(menu)
+            self.help_button.setMenu(menu)
         self.find_field = QLineEdit()
         self.find_field.setPlaceholderText(tr("Find (Ctrl+F, Enter: next, Shift+Enter: back)"))
         self.find_field.setClearButtonEnabled(True)
@@ -257,6 +283,8 @@ class MarkdownViewerDialog(QDialog):
         self.setMinimumWidth(MINIMUM_WIDTH)
         self._fold_toolbar()
         self.view = MV.MarkdownView(MV.ImageSource(self.backend, self.path), parent=self)
+        self.view.browser.verticalScrollBar().valueChanged.connect(self._show_marks)  # (the marks near the view)
+        self.view.shown.connect(self._page_anew)  # (Find's marks and count: the new page's)
         self.view.navigator = self
         self.view.link.connect(self.follow)
         self.view.zoom_changed.connect(lambda percent: self.zoom_reset.setText(f"{percent}%"))
@@ -375,9 +403,10 @@ class MarkdownViewerDialog(QDialog):
         for layout in (self._bar, self._find_bar):
             while layout.count():
                 layout.takeAt(0)  # (the widgets stay: put in again below)
-        first = self._buttons + ([] if not wide else self._zoom) + [self.export_button] \
-            + ([self.view_button] if self.view_button is not None else [])
-        second = [] if wide else self._zoom
+        menus = [button for button in (self.view_button, self.help_button) if button is not None]
+        # (narrow: View and Help in the second row - beside the first's buttons they made it 510 pixels)
+        first = self._buttons + ([] if not wide else self._zoom) + [self.export_button] + (menus if wide else [])
+        second = [] if wide else self._zoom + menus
         for widget in first:
             self._bar.addWidget(widget)
         self._bar.addStretch(1)
@@ -388,11 +417,11 @@ class MarkdownViewerDialog(QDialog):
         target.addWidget(self.find_count)
 
     def _update_title(self) -> None:
-        self.view.page_name = posixpath.basename(self.path) if self.path else ""
+        self.view.page_name = self._name() if self.path else ""
         if not self.path:
             self.setWindowTitle(tr("Markdown Viewer"))
             return
-        name = posixpath.basename(self.path) or self.path
+        name = self._name() or self.path
         self.setWindowTitle(tr("{name} – Markdown Viewer").format(name=MV.printable(name)))
 
     def done(self, result: int) -> None:  # noqa: D401 - Qt override
@@ -432,7 +461,7 @@ class MarkdownViewerDialog(QDialog):
         if generation != self._generation or sip.isdeleted(self):
             return  # a newer Reload is on its way
         if isinstance(error, MV.BinaryFile):  # (a picture, a program: said in the page - it was garbage)
-            name = MV.printable(posixpath.basename(self.path) or self.path)
+            name = MV.printable(self._name() or self.path)
             self.view.show_text(tr("{name} is not a text file: it holds binary data, so it is not shown.").format(
                 name="`" + name.replace("`", "'") + "`"), anchor, scroll)
             self.view.status.setText("")
@@ -443,7 +472,7 @@ class MarkdownViewerDialog(QDialog):
             said = tr("Cannot read {path}: {error}").format(path=MV.printable(self.path), error=MV.printable(why))
             self.view.status.setText(said)
             # (said in the page too: a missing file was a blank page, the reason in the status line only)
-            name = MV.printable(posixpath.basename(self.path) or self.path).replace("`", "'")
+            name = MV.printable(self._name() or self.path).replace("`", "'")
             self.view.show_text(tr("{name} cannot be read: {error}").format(
                 name="`" + name + "`", error=MV.printable(why).replace("`", "'")), anchor, scroll)
             self.view.status.setText(said)
@@ -451,7 +480,8 @@ class MarkdownViewerDialog(QDialog):
         text, self.cut = result
         if self.shown_as == "text":
             text = as_code(text, self.path)
-        self.view.status.setText("")  # ("Reading…" done)
+        if self.view.status.text() == tr("Reading…"):  # ("Reading…" done - what was said since, a link
+            self.view.status.setText("")  # followed meanwhile "Not opened (…)", stays)
         self.view.show_text(text, anchor, scroll)
         self.loaded_once = True
         # (said once the page is made: "Rendering…" stays meanwhile - cleared
@@ -605,9 +635,28 @@ class MarkdownViewerDialog(QDialog):
         marks, count, current = [], 0, 0
         selected = browser.textCursor()
         fmt = QTextCharFormat()
-        fmt.setBackground(QColor("#f2cc60") if not MV._is_dark(self.view.palette()) else QColor("#7a5b00"))
-        cursor = document.find(needle, 0)
+        fmt.setBackground(QColor("#f2cc60") if not self.view.dark else QColor("#7a5b00"))  # (the page's theme)
         deadline, capped = time.monotonic() + FIND_TURN, False
+        places = self.view.laid_matches(needle)
+        if places is not None:  # (the page's text looked in, not Qt's find: it read every block of the page
+            # when the needle was not there - a code block of 1,000,000 lines, 0.3 s a search)
+            for at in places:
+                if count >= FIND_COUNT:
+                    break
+                if count % 64 == 63 and time.monotonic() > deadline:
+                    capped = True
+                    break
+                count += 1
+                if at == selected.selectionStart() and selected.hasSelection():
+                    current = count
+                if len(marks) < FIND_MARKS:
+                    cursor = QTextCursor(document)
+                    cursor.setPosition(at)
+                    cursor.setPosition(at + len(needle), QTextCursor.MoveMode.KeepAnchor)
+                    mark = QTextEdit.ExtraSelection()
+                    mark.cursor, mark.format = cursor, fmt
+                    marks.append(mark)
+        cursor = document.find(needle, 0) if places is None else QTextCursor()
         while not cursor.isNull() and count < FIND_COUNT:
             if count % 64 == 63 and time.monotonic() > deadline:
                 capped = True
@@ -622,7 +671,9 @@ class MarkdownViewerDialog(QDialog):
             if cursor.selectionEnd() == cursor.selectionStart():
                 break  # (never: an empty needle is not searched)
             cursor = document.find(needle, cursor)
-        browser.setExtraSelections(marks)
+        self._marks = marks
+        self._marks_shown = None
+        self._show_marks()
         # (the matches in a folded <details> count too, in their place - find goes into them)
         for at, _number, inside in self.view.folds_holding(needle):
             count += inside
@@ -631,13 +682,56 @@ class MarkdownViewerDialog(QDialog):
         if not count:
             self.find_count.setText(tr("no match"))
         else:
-            total = f"{count}+" if count >= FIND_COUNT or capped else str(count)
-            # ("N+": a part of the page is not laid out yet - more may come)
-            total = f"{total}+" if self.view.more() else total
+            # ("N+": counted for at most FIND_TURN, FIND_COUNT matches - or a part of the page is not laid
+            # out yet: more may come; one "+" either way, "2495++" said both)
+            total = f"{count}+" if count >= FIND_COUNT or capped or self.view.more() else str(count)
             self.find_count.setText(tr("{current} of {total}").format(current=current or "–", total=total))
+
+    def _page_anew(self) -> None:
+        """The page made anew (a reload, a change on disk, a zoom, a theme): Find's marks and its count were
+        the old page's - its matches marked again and counted (the count said "1 of 959+" of a file that no
+        longer had the word, the marks were set again at every scroll, empty)."""
+        if not getattr(self, "_marks", None) and not self.find_count.text():
+            return
+        self._marks, self._marks_shown = [], None
+        self.view.browser.setExtraSelections([])
+        needle = self.find_field.text()
+        if needle:
+            self._mark_matches(needle)
+        else:
+            self.find_count.setText("")
+
+    def _show_marks(self, *_args) -> None:
+        """The marks of _mark_matches the view shows (and a screen above and below it) set on the page: Qt
+        draws each of them in every turn it paints, wherever it is - 1,000 marks held each turn of a page
+        0.1 s. Again when the page is scrolled (a mark's place in the text: cheap)."""
+        marks = getattr(self, "_marks", None)
+        if not marks:
+            return
+        browser = self.view.browser
+        if marks[0].cursor.document() is not browser.document():  # (another page's: a zoom's new document)
+            self._marks, self._marks_shown = [], None
+            browser.setExtraSelections([])
+            return
+        if len(marks) <= MARKS_SHOWN:
+            shown = marks
+        else:
+            height = browser.viewport().rect().height()  # (by halves: Qt's hit test walks every frame - _first_shown)
+            low = _shown_at(browser, -height).position()
+            high = _shown_at(browser, 2 * height).position()
+            starts = [mark.cursor.selectionStart() for mark in marks]
+            first = bisect.bisect_left(starts, low)
+            shown = marks[max(0, first - 1):bisect.bisect_right(starts, high) + 1][:MARKS_SHOWN]
+        key = (id(marks), len(shown), id(shown[0]) if shown else 0)
+        if key == getattr(self, "_marks_shown", None):
+            return
+        self._marks_shown = key
+        browser.setExtraSelections(shown)
 
     def end_find(self, focus: bool = True) -> None:
         """Escape in the find field: the marks go, the text has the focus."""
+        self._marks = []
+        self._marks_shown = None
         self.view.browser.setExtraSelections([])
         self.find_count.setText("")
         if focus:
@@ -680,9 +774,13 @@ class MarkdownViewerDialog(QDialog):
         if scheme or url.toString().startswith("//"):
             return refused
         relative = url.path()
-        if not relative or relative.startswith("/") or "\0" in relative:
+        paths = self._paths()
+        if not relative or relative.startswith("/") or "\0" in relative or paths.isabs(relative) \
+                or paths.splitdrive(relative)[0]:
             return refused
-        path = posixpath.normpath(posixpath.join(posixpath.dirname(self.path) or "/", relative))
+        # (the document's own path functions: on Windows "C:\\docs\\a.md" - posixpath made its folder "/", and
+        # a link "b.md" the drive's root's)
+        path = paths.normpath(paths.join(paths.dirname(self.path) or paths.sep, relative))
         if MV.is_markdown(path):
             return "markdown", path, url.fragment()
         return "file", path, ""
@@ -731,14 +829,21 @@ class MarkdownViewerDialog(QDialog):
     def _beside(self, path: str) -> bool:
         """Whether *path* is in the document's folder or below it (its real
         place: a link through a symlink counts where it leads)."""
-        folder = posixpath.dirname(self.path) if self.path else ""
+        paths = self._paths()
+        folder = paths.dirname(self.path) if self.path else ""
         if not folder:
             return False
         if MV._is_local(self.backend):
-            import os
-
-            return MV._inside(os.path.realpath(path), os.path.realpath(folder))
+            return MV._inside(paths.realpath(path), paths.realpath(folder), paths)
         return MV._inside(posixpath.normpath(path), folder)
+
+    def _paths(self):
+        """The path functions of this window's backend (MV.path_functions): ntpath for a file on Windows."""
+        return MV.path_functions(MV._is_local(self.backend))
+
+    def _name(self, path: str | None = None) -> str:
+        """The file name of *path* (this window's file's): its last part, as the backend's paths are cut."""
+        return self._paths().basename(self.path if path is None else path)
 
     def _secret(self, path: str) -> str | None:
         if not MV._is_local(self.backend):
@@ -764,13 +869,24 @@ class MarkdownViewerDialog(QDialog):
     def navigate(self, path: str, anchor: str = "", shown_as: str = "markdown") -> None:
         """Show *path* in this window (at *anchor*), where it was remembered
         for Back; the same file: only the jump to *anchor*."""
-        if path == self.path and shown_as == self.shown_as:
+        if self._same_file(path, self.path) and shown_as == self.shown_as:
             if anchor and not self.view.go_to_anchor(anchor):
                 self.view.status.setText(tr("No heading {anchor} here.").format(
                     anchor=MV.printable("#" + anchor)))
             return
         self.remember()
         self._show(path, shown_as, anchor=anchor, scroll=0)
+
+    def _same_file(self, path: str, other: str) -> bool:
+        """Whether *path* and *other* name the same file of this window's backend - a local one's however
+        written (on Windows "C:/docs/a.md" is "C:\\docs\\A.md": a link to the file itself, written so, read
+        it again instead of jumping)."""
+        if path == other:
+            return True
+        if not path or not other or not MV._is_local(self.backend):
+            return False
+        paths = self._paths()
+        return paths.normcase(paths.normpath(path)) == paths.normcase(paths.normpath(other))
 
     def _show(self, path: str, shown_as: str, anchor: str = "", scroll: int | None = None) -> None:
         self.path, self.shown_as = path, shown_as
@@ -818,14 +934,14 @@ class MarkdownViewerDialog(QDialog):
         """A link to a file that is not Markdown: looked at on a worker
         thread - a folder opens its README, a text file is shown as its
         text, an image at its own size; anything else is named, not opened."""
-        backend, local = self.backend, MV._is_local(self.backend)
+        backend, local, paths = self.backend, MV._is_local(self.backend), self._paths()
         link_text = getattr(self.view, "last_link_text", "")
         self.view.status.setText(tr("Reading…"))
 
         def look():
             if backend.is_dir(path):
                 for name in FOLDER_PAGES:
-                    page = posixpath.join(path, name)
+                    page = paths.join(path, name)
                     if backend.exists(page):
                         return "markdown", page, None
                 return "refused", tr("Not opened (a folder without a README): {target}"), None
@@ -867,7 +983,7 @@ class MarkdownViewerDialog(QDialog):
                 self.view.say(where.replace("{target}", MV.printable(path)))
             elif kind == "image":
                 self.view.status.setText("")
-                zoom = MV.ImageZoom(image, MV.printable(posixpath.basename(where)), self)
+                zoom = MV.ImageZoom(image, MV.printable(self._name(where)), self)
                 zoom.show()
             elif where == path or self._may_open(where, link_text):  # (a folder's README: checked as a link -
                 self.navigate(where, shown_as=kind)  # one leading to a secret file opened it unasked)
@@ -879,31 +995,49 @@ class MarkdownViewerDialog(QDialog):
     def _export_name(self, suffix: str) -> str:
         import os
 
-        base = posixpath.splitext(posixpath.basename(self.path) or "page")[0] + suffix
+        base = self._paths().splitext(self._name() or "page")[0] + suffix
         if self.path and MV._is_local(self.backend):
             return os.path.join(os.path.dirname(self.path), base)
         return os.path.join(os.path.expanduser("~"), base)
 
-    def _whole_first(self, then) -> bool:
-        """Whether the page is laid out whole - else it is, then *then()*."""
-        if not self.view.more():
-            return True
-        self.view.load_rest(then)
-        return False
-
     def ask_export_html(self) -> str:
-        if not self._whole_first(self.ask_export_html):
-            return ""
+        # (the file asked for at once: the page laid out whole first took 24 s to minutes - the export works from
+        # the text, the images it shows read on a worker: _prepared)
         path, _chosen = QFileDialog.getSaveFileName(self, tr("Export HTML"), self._export_name(".html"),
                                                     tr("HTML (*.html *.htm)"))
         return self.export_html(path) if path else ""
 
     def ask_export_pdf(self) -> str:
-        if not self._whole_first(self.ask_export_pdf):
-            return ""
         path, _chosen = QFileDialog.getSaveFileName(self, tr("Export PDF"), self._export_name(".pdf"),
                                                     tr("PDF (*.pdf)"))
         return self.export_pdf(path) if path else ""
+
+    def _prepared(self, label: str):
+        """(the kind, the parts) of the page to print or export (MV.print_parts) - made on a worker thread with
+        the images they show that are not read yet (MV.image_names, the view's source), a progress window
+        with Cancel meanwhile; those images then the view's, as if the page had shown them. None when
+        cancelled. The page itself is not laid out for it."""
+        text = self.view.markdown.replace("\r\n", "\n").replace("\r", "\n")
+        full, source, read = self.view.full, self.view.source, set(self.view.originals)
+
+        def work():
+            kind, parts = MV.held_while(MV.print_parts, text, full)  # (its making: the collector held)
+            names = []
+            if source is not None:
+                names = [name for name in MV.image_names(kind, parts)
+                         if name not in read and source.kind(name)[0] in ("local", "data")][:MV.IMAGES]
+            return kind, parts, names, source.read(names) if names else {}
+
+        made = self._in_background(work, label)
+        if made is None:
+            return None
+        kind, parts, names, found = made
+        # (only what changes the page: an image it shows already as not found that is not found again is laid
+        # out again for nothing - the whole page at once, 8,000 of them in a link 0.05 s of the export's turn)
+        names = [name for name in names if name not in self.view.asked or isinstance(found.get(name), QImage)]
+        if names:
+            self.view.images_read(names, found, None)
+        return kind, parts
 
     def export_html(self, target: str) -> str:
         """The page as HTML for a web browser, written to the local file
@@ -913,21 +1047,93 @@ class MarkdownViewerDialog(QDialog):
         from axross_markdown._ax.core import markdown_doc as MD
         from axross_markdown._ax.ui import markdown_html as H
 
-        title = posixpath.basename(self.path) if self.path else tr("Markdown Viewer")
+        title = self._name() if self.path else tr("Markdown Viewer")
         if self.view.full:
             text = MD.clean(self.view.markdown.removeprefix("\ufeff"))
-            images = _embedded(self.view.originals)
+            source, originals = self.view.source, dict(self.view.originals)
+
+            def work():
+                # (parsed a piece at a time, as the page: all of it at once held every token of the text -
+                # 4 MB, 700 MiB more; the images it shows that the page has not read yet - not laid out whole
+                # first: read here, a piece's before its body is made)
+                embedded: dict = {}
+                left = [MV.IMAGES]
+
+                def docs():
+                    for doc in MV.parsed_pieces(text):
+                        if source is not None and left[0] > 0:
+                            names = [name for name in _image_sources(doc) if name not in originals
+                                     and source.kind(name)[0] in ("local", "data")][:left[0]]
+                            left[0] -= len(names)
+                            originals.update((name, image) for name, image in source.read(names).items()
+                                             if not isinstance(image, str))
+                        embedded.update(_embedded({name: image for name, image in originals.items()
+                                                   if name not in embedded}))
+                        yield doc
+
+                return MV.held_while(lambda: H.export_html_pieces(docs(), title, False, embedded))
+
             # (made on a worker thread, the window going on: big.md held it 3.2 s)
-            page = self._in_background(lambda: H.export_html(MD.parse(text), title=title, dark=False, images=images),
-                                       tr("Exporting HTML…"))
+            page = self._in_background(work, tr("Exporting HTML…"))
             if page is None:
                 return ""
         else:  # (Qt's own parser: its HTML, made as safe as the other's - not by its policy alone)
-            self.view.load_rest_now()
-            page = H.safe_page(self.view.browser.document().toHtml(), _embedded(self.view.originals))
-            page = page.replace("<head>", f'<head><meta http-equiv="Content-Security-Policy" '
-                                          f'content="{H.EXPORT_POLICY}">', 1)
-        return self._write(target, page.encode("utf-8"))
+            page = self._md4c_html(tr("Exporting HTML…"))
+            if page is None:
+                return ""
+        return self._write(target, page, tr("Exporting HTML…"))
+
+    def _md4c_html(self, label: str) -> list[str] | None:
+        """Qt's own parser's page as HTML (light colours): its parts made on a worker (_prepared), each one
+        laid out and written as HTML a turn (the page's own document whole, then toHtml and safe_page on the
+        GUI thread: 0.4 to 4.4 s in one turn), made safe on a worker a part at a time (all of it at once kept
+        Python's lock 0.3 s, 2.2 s under load) - the page in pieces, as it is written. None when cancelled."""
+        from PyQt6.QtCore import QCoreApplication
+        from PyQt6.QtWidgets import QProgressDialog
+
+        from axross_markdown._ax.ui import markdown_html as H
+
+        made = self._prepared(label)
+        if made is None:
+            return None
+        kind, parts = made
+        progress = QProgressDialog(label, tr("Cancel"), 0, len(parts), self)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(400)
+        head, bodies = "", []
+        try:
+            for number, part_text in enumerate(parts):
+                if sip.isdeleted(self) or progress.wasCanceled():
+                    return None
+                part = self.view._part_document(None, part_text, counted=False, kind=kind, dark=False, printed=True)
+                try:
+                    written = part.toHtml()
+                finally:
+                    sip.delete(part)  # (at once: deleteLater waited for the export's end - see _print_to)
+                opened = _BODY_OPEN.search(written)
+                closed = written.rfind("</body>")
+                if opened is None or closed < 0:
+                    continue
+                head = head or written[:opened.end()]
+                bodies.append(written[opened.end():closed])
+                progress.setValue(number + 1)
+                QCoreApplication.processEvents()  # (a turn between two parts: the window goes on)
+            if sip.isdeleted(self) or progress.wasCanceled():
+                return None
+        finally:
+            if not sip.isdeleted(progress):
+                progress.close()
+                progress.deleteLater()
+        head = head or "<html><head></head><body>"
+        images = dict(self.view.originals)
+
+        def safe():
+            embedded = _embedded(images)
+            first = H.safe_page(head, embedded).replace(
+                "<head>", f'<head><meta http-equiv="Content-Security-Policy" content="{H.EXPORT_POLICY}">', 1)
+            return [first, *(H.safe_page(body, embedded) for body in bodies), "</body></html>"]
+
+        return self._in_background(safe, label)
 
     def export_pdf(self, target: str) -> str:
         """The page as PDF (light colours) in the local file *target* - made
@@ -939,10 +1145,12 @@ class MarkdownViewerDialog(QDialog):
         try:
             writer = QPdfWriter(target)
             writer.setPageSize(QPageSize(QPageSize.PageSizeId.A4))
-            writer.setTitle(posixpath.basename(self.path) or tr("Markdown Viewer"))
+            writer.setTitle(self._name() or tr("Markdown Viewer"))
             done = self._print_to(writer, tr("Exporting PDF…"))
             del writer  # (the file is complete once the writer is gone)
         except Exception as exc:  # noqa: BLE001 - said, not raised
+            if sip.isdeleted(self):
+                return ""
             self.view.status.setText(tr("Export failed: {error}").format(error=MV.printable(exc)))
             return ""
         if not done:
@@ -950,7 +1158,8 @@ class MarkdownViewerDialog(QDialog):
                 os.remove(target)  # (a PDF cut short: none)
             except OSError:
                 pass
-            self.view.status.setText(tr("Export cancelled."))
+            if not sip.isdeleted(self):  # (the window closed meanwhile: cancelled, nothing to say it in)
+                self.view.status.setText(tr("Export cancelled."))
             return ""
         if not os.path.isfile(target):
             self.view.status.setText(tr("Export failed: {error}").format(error=MV.printable(target)))
@@ -964,14 +1173,18 @@ class MarkdownViewerDialog(QDialog):
         if support is None:
             return False
         printer = support.QPrinter(support.QPrinter.PrinterMode.HighResolution)
+        # (asked at once - the page laid out whole first took minutes, and a dialog made before that was left
+        # behind, a new one made the next time: the parts and their images are made after it, _print_to)
         dialog = support.QPrintDialog(printer, self)
-        if not self._whole_first(self.print_page):
-            return False
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return False
+        try:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return False
+        finally:
+            dialog.deleteLater()
         if not self._print_to(printer, tr("Printing…")):
             printer.abort()
-            self.view.status.setText(tr("Printing cancelled."))
+            if not sip.isdeleted(self):  # (the window closed meanwhile)
+                self.view.status.setText(tr("Printing cancelled."))
             return False
         return True
 
@@ -993,9 +1206,15 @@ class MarkdownViewerDialog(QDialog):
             state.update(done=True, result=result, error=error)
             loop.quit()
 
+        # (the window closed meanwhile - Escape, its close button, axross quitting -: its delivery of *done*
+        # is dropped with it, MV.in_background; the loop waited on until the program ended, then raised)
+        closed = self.destroyed.connect(loop.quit)
         MV.in_background(work, done, owner=self)
         if not state["done"]:
             loop.exec()
+        if sip.isdeleted(self):
+            return None  # (nothing of the window left to touch: the export is cancelled)
+        self.destroyed.disconnect(closed)
         progress.close()
         progress.deleteLater()
         if not state["done"]:
@@ -1014,9 +1233,7 @@ class MarkdownViewerDialog(QDialog):
         from PyQt6.QtCore import QCoreApplication
         from PyQt6.QtWidgets import QProgressDialog
 
-        text = self.view.markdown.replace("\r\n", "\n").replace("\r", "\n")
-        full = self.view.full
-        made = self._in_background(lambda: MV.print_parts(text, full), label)
+        made = self._prepared(label)
         if made is None:
             return False
         kind, parts = made
@@ -1026,28 +1243,48 @@ class MarkdownViewerDialog(QDialog):
         pages = _PagePrinter(device, self.view.browser.document().defaultFont())
         try:
             for number, part_text in enumerate(parts):
-                if progress.wasCanceled() or sip.isdeleted(self):
+                if sip.isdeleted(self) or progress.wasCanceled():  # (the window first: the progress is its child)
                     return False
+                parts[number] = None  # (let go of once drawn: all of them kept to the end, as the page's HTML)
                 part = self.view._part_document(None, part_text, counted=False, kind=kind, dark=False, printed=True)
                 try:
-                    pages.add(part)
+                    for _page in pages.add(part):  # (a turn between two pages too: a part of 16 pages, 0.2 s)
+                        QCoreApplication.processEvents()
+                        if sip.isdeleted(self) or sip.isdeleted(progress) or progress.wasCanceled():
+                            return False
                 finally:
-                    part.deleteLater()
+                    # (at once: a deleteLater is not done inside processEvents - every part's laid-out document
+                    # lived to the export's end, 1 to 2 GB for a file of 4.3 MB)
+                    if not sip.isdeleted(part):
+                        sip.delete(part)
                 progress.setValue(number + 1)
                 QCoreApplication.processEvents()  # (a turn between two parts: the window goes on)
-            return not progress.wasCanceled()
+            return not sip.isdeleted(self) and not progress.wasCanceled()
         finally:
             pages.end()
             if not sip.isdeleted(progress):
                 progress.close()
                 progress.deleteLater()
 
-    def _write(self, target: str, data: bytes) -> str:
-        try:
+    def _write(self, target: str, page: str | list[str], label: str) -> str:
+        """*page* (a string, or its pieces) written to *target* as UTF-8 - on a worker, a megabyte at a time
+        (all of it encoded and written on the GUI thread held the window). *target*, or "" (said)."""
+        pieces = [page] if isinstance(page, str) else page
+
+        def write():
             with open(target, "wb") as fh:
-                fh.write(data)
-        except OSError as exc:
-            self.view.status.setText(tr("Export failed: {error}").format(error=MV.printable(exc)))
+                for piece in pieces:
+                    for at in range(0, len(piece), WRITTEN_AT_ONCE):
+                        fh.write(piece[at:at + WRITTEN_AT_ONCE].encode("utf-8"))
+            return True
+
+        if self._in_background(write, label) is None:
+            if sip.isdeleted(self):
+                return ""
+            try:
+                os.remove(target)  # (a page cut short: none)
+            except OSError:
+                pass
             return ""
         self.view.status.setText(tr("Saved: {path}").format(path=MV.printable(target)))
         return target
@@ -1077,7 +1314,9 @@ class _PagePrinter:
                                  self.body.height() - self.margin * self.scale + ascent + 5 * self.scale)
         self.number, self.used = 0, 0.0  # (pages begun; how far down the last one is written)
 
-    def add(self, document) -> None:
+    def add(self, document):
+        """*document* drawn on the pages after the last one's (see the class) - a page at a time: a generator,
+        each step one page drawn (the caller's turn may end between two)."""
         from PyQt6.QtGui import QTextBlockFormat, QTextCharFormat
 
         if not self.painter.isActive():
@@ -1110,6 +1349,8 @@ class _PagePrinter:
                     self.device.newPage()
                 self.number += 1
             self._draw(document, index, numbered=bool(index or not going_on))
+            if index + 1 < pages:
+                yield index
         block = document.lastBlock()
         last = layout.blockBoundingRect(block)
         # (the room below the last line too: the next document's first line kept its distance; the
@@ -1157,6 +1398,28 @@ def _print_support():
     return QtPrintSupport
 
 
+_BODY_OPEN = re.compile(r"<body\b[^<>]*>", re.IGNORECASE)
+
+
+def _image_sources(doc) -> list[str]:
+    """The names of the images markdown-it's *doc* shows (Markdown's and raw HTML's <img>), each once."""
+    from axross_markdown._ax.core import markdown_doc as MD
+
+    names: dict[str, None] = {}
+    for token in doc.tokens:
+        if token.type == "safe_html_block":
+            names.update((attrs.get("src", ""), None) for kind, *rest in MD.html_events(token)
+                         if kind == "start" and rest[0] == "img" and len(rest) > 1 and (attrs := rest[1]))
+        for child in token.children or ():
+            if child.type == "image" and child.attrGet("src"):
+                names[str(child.attrGet("src"))] = None
+            elif child.type == "safe_html_inline":
+                names.update((attrs.get("src", ""), None) for kind, *rest in MD.html_events(child)
+                             if kind == "start" and rest[0] == "img" and len(rest) > 1 and (attrs := rest[1]))
+    names.pop("", None)
+    return list(names)
+
+
 def _embedded(images: dict) -> dict[str, str]:
     """The images the page read, as ``data:`` addresses ({name: address})
     for a page of its own."""
@@ -1199,11 +1462,11 @@ def _language(name: str) -> str:
 
 
 def open_markdown_viewer(backend, path: str, parent=None, *, source_pane=None, opener=None,
-                         editor=None, view_menu=None) -> MarkdownViewerDialog:
+                         editor=None, view_menu=None, help_menu=None) -> MarkdownViewerDialog:
     """Show the Markdown file *path* of *backend* in a viewer window of its
     own (non-modal)."""
     dialog = MarkdownViewerDialog(backend, path, VW.owner_window(parent), source_pane=source_pane,
-                                  opener=opener, editor=editor, view_menu=view_menu)
+                                  opener=opener, editor=editor, view_menu=view_menu, help_menu=help_menu)
     VW.show_independent(dialog)
     return dialog
 

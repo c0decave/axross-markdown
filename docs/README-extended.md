@@ -16,6 +16,7 @@ link opens in the browser only after a question that shows its real address.
 - [Export and print](#export-and-print)
 - [Themes](#themes)
 - [In the terminal: axross-mdcat](#in-the-terminal-axross-mdcat)
+- [Updates](#updates)
 - [The security model](#the-security-model)
 - [Limits](#limits)
 - [Install options](#install-options)
@@ -37,7 +38,8 @@ link opens in the browser only after a question that shows its real address.
 | F5 | Read the file and its images again (a file changed on disk is read again by itself) |
 | F4 | Edit: the file in an editor, the rendering beside the text - after a pause at the line typed at |
 | Ctrl+P | Print |
-| Alt+V | The View menu: the theme |
+| Alt+V | The View menu: the page's theme, the window's theme |
+| Alt+H | The Help menu: Check for Updates…, Updates |
 | Ctrl+M | Maximise the window, or back |
 
 A right click on a code block copies the block as written; on a heading, a link to it as
@@ -60,12 +62,40 @@ axross-markdown --html notes.md > notes.html
 
 ## Themes
 
-*View > Theme* (Alt+V): **Modern (follow system)** - light or dark as the desktop's
-colour scheme is, and anew when it changes; light when the desktop does not say - Modern
-Light, Modern Dark, Classic, Light Mode (the desktop's own palette), Hacker and Amber.
-The choice is kept in `~/.config/axross-markdown/settings.json` (`$XDG_CONFIG_HOME` when
-set); without one, the theme chosen in axross is taken, if axross is installed. The
-page, its code and its formulas follow the theme.
+*View > Theme* (Alt+V) colours the page - its ground, text, headings, links, code and the
+code's syntax, quotes, tables, alerts, formulas and the selection - in one of twelve
+themes, or **Automatic**: Light or Dark as the window is.
+
+| Theme | Ground | Text | Links |
+|---|---|---|---|
+| Light | light `#ffffff` | 15.8:1 | 5.2:1 |
+| Dark | dark `#0d1117` | 16.0:1 | 6.1:1 |
+| Sepia | light `#f4ecd8` | 11.1:1 | 6.6:1 |
+| Solar Light | light `#fdf6e3` | 5.9:1 | 5.8:1 |
+| Solar Dark | dark `#002b36` | 6.7:1 | 6.7:1 |
+| Arctic | dark `#2e3440` | 10.3:1 | 6.2:1 |
+| Retro | dark `#282828` | 10.7:1 | 5.5:1 |
+| Night Violet | dark `#282a36` | 13.4:1 | 10.3:1 |
+| High Contrast Light | light `#ffffff` | 21.0:1 | 11.5:1 (AAA) |
+| High Contrast Dark | dark `#000000` | 21.0:1 | 12.8:1 (AAA) |
+| Slate | dark `#282c34` | 8.4:1 | 6.4:1 |
+| Paper | light `#f8f6f0` | 15.9:1 | 7.5:1 |
+
+Every theme's body text and links reach WCAG AA (4.5:1) on its ground, the High Contrast
+ones AAA (7:1); the numbers are the contrast ratios (a test measures every theme, and every
+other text colour of it). The names say what a theme looks like: Solar is Solarized-like,
+Arctic Nord-like, Retro a warm Gruvbox-like palette, Night Violet Dracula-like and Slate
+One-Dark-like. Every open window changes with the choice, kept in
+`~/.config/axross-markdown/settings.json` (`page_theme`). A switch is one change: the page
+stays in its old colours until it is made anew in the new ones (no flash, no blank page
+between), and switches faster than one in 0.4 s are taken together - the last of them
+counts.
+
+*View > Window Theme*: the window's own colours - **Modern (follow system)** (light or dark
+as the desktop's colour scheme is, and anew when it changes; light when the desktop does
+not say), Modern Light, Modern Dark, Classic, Light Mode (the desktop's own palette),
+Hacker and Amber - kept in the same file (`theme`); without one, the theme chosen in
+axross is taken, if axross is installed.
 
 ## In the terminal: axross-mdcat
 
@@ -80,7 +110,9 @@ axross-markdown --term README.md        # the same, from the window's program
 |---|---|
 | `-w N`, `--width N` | Columns (default: the terminal's, at most 100; at least 20) |
 | `--color auto/always/never/truecolor/256/16` | Colours (auto follows NO_COLOR, FORCE_COLOR, COLORTERM and whether it is a terminal) |
-| `--theme auto/dark/light` | Colours for a dark or a light background (auto: COLORFGBG, else dark) |
+| `--theme NAME` | A theme of the window's (`--list-themes`), its ground painted behind the text; `auto` (the default): the terminal's own ground, colours for dark or light (COLORFGBG, else dark). Default: `$AXROSS_MDCAT_THEME`, else `terminal_theme` in the settings |
+| `--list-themes` | The themes, with the contrast of their text and links and a sample |
+| `--background auto/on/off` | Paint the theme's ground (auto: for a theme, not for `auto`) |
 | `--images auto/kitty/iterm/blocks/none` | Pictures with kitty's or iTerm2's protocol, in coloured half-blocks, or none |
 | `--image-width N` | Columns a picture may take |
 | `--no-links` | No terminal hyperlinks (OSC 8) |
@@ -88,6 +120,11 @@ axross-markdown --term README.md        # the same, from the window's program
 | `--toc` | The headings only, with their anchors |
 | `--watch` | Draw the file anew whenever it changes (Ctrl+C ends); a file not there yet is said and waited for |
 | `--version` | The version |
+| `--check-update`, `--update`, `--update-mode off/notify/auto` | The updates ([below](#updates)) |
+
+With 256 colours a theme's colours are the nearest that keep their contrast on the
+nearest ground; with 16 the terminal's own colours are used and no ground is painted;
+`NO_COLOR` (or `--color never`) means none at all.
 
 Headings, emphasis, inline and fenced code (coloured), quotes and alerts, nested and task
 lists, tables drawn with box characters (wrapped to fit; a long one drawn as it goes, a
@@ -99,6 +136,53 @@ a file can send the terminal an escape sequence of its own.
 - At most 200 pictures a text, as in the window; then a line says the rest are not drawn.
 - It stops as soon as the program it writes into has ended (`axross-mdcat big.md | head`).
 - Output that cannot be written (a full disk) is said; the exit status is 1.
+
+## Updates
+
+The one-file programs - the Linux binary and the AppImage, the macOS binary, Windows'
+`axross-markdown.exe` and `axross-mdcat.exe` - update themselves from the GitHub releases.
+*Help > Updates*: **Off**, **Tell me about new versions** (the default) or **Install new
+versions automatically**; the window asks GitHub at its start and every 24 hours, always on a
+thread of its own - it never waits for the network. *Help > Check for Updates…* asks at once.
+Without a window:
+
+```sh
+axross-markdown --check-update          # is a newer release out?
+axross-markdown --update                # install it (axross-mdcat --update on Windows)
+axross-markdown --update-mode off       # or notify, auto
+```
+
+A pip or pipx install is never replaced: it is told `pip install -U axross-markdown`. The
+terminal view asks no network itself; it says (on standard error, in a terminal) when the
+last check found a newer version. `AXROSS_MARKDOWN_NO_UPDATE_CHECK=1` keeps the automatic
+checks off whatever the setting says.
+
+Before anything is replaced:
+
+- every request and every redirect goes over https to GitHub's hosts only (`api.github.com`,
+  `github.com`, `release-assets.githubusercontent.com`, `objects.githubusercontent.com`),
+  each answer bounded in size (the program at most 400 MiB);
+- the release is strictly newer than the running program - and the file has the release's
+  version in its name (`axross-markdown-0.17.1-linux-x86_64`): an older release's file can
+  never stand for a newer one;
+- `SHA256SUMS.sig` is a valid Ed25519 signature of `SHA256SUMS` by the release key whose
+  public half the program pins (no signature, another key: refused before the program is
+  fetched); the file has its entry there, the size the release states and that SHA-256;
+- no archive is fetched or unpacked: the files are the bare programs.
+
+The new program is written beside the running one, hashed again and run once
+(`--self-test`: it must start here and say its version - a release that cannot run on this
+system never replaces this one), then put in place with one rename; the old one stays as
+`axross-markdown.previous` for a minute of the new one's running. On Windows the running
+program is renamed aside first (it may be renamed, not overwritten). The AppImage file
+itself (`$APPIMAGE`) is replaced, never by the plain binary. Should the program in place
+not be the file checked, the old one is put back. It takes effect at the next start. The
+macOS app (`axross Markdown.app`) is not changed in place - its program is part of its
+signed seal: the notice points to the release's disk image.
+
+How a release is signed: the release workflow makes a draft; the maintainer signs its
+`SHA256SUMS` on their own machine and publishes it (`scripts/sign_release.py release
+vX.Y.Z --key KEY --publish`) - the key never comes near CI.
 
 ## The security model
 
@@ -132,6 +216,9 @@ What a file holds is shown, never run:
   than 300,000 cells); lists nested more than 16 levels and quotes more than 8 are shown
   flatter.
 - Mermaid, PlantUML, GeoJSON and STL blocks are shown as their source.
+- Updates: tried against a fake GitHub (its API, its redirects, signed and badly signed
+  releases) and on Linux; the Windows replacement and the macOS binary's are not tried on
+  those systems yet. A release before 0.17.0 has no signature: 0.16.x is updated by hand once.
 - Code is coloured in a process of its own; a block that takes longer than 5 seconds is
   shown without colours.
 - An emoji short code (`:tada:`) of an emoji no installed font has stays as written.
@@ -169,8 +256,8 @@ author), ported to PyQt6 and axross's backends.
 
 It is the same code as in [axross](https://github.com/c0decave/axross), written out by
 axross's `scripts/export_standalone.py markdown`; it reads axross's settings
-(`~/.config/axross`) for the language and - until View → Theme chooses one in
-`~/.config/axross-markdown/settings.json` - the theme.
+(`~/.config/axross`) for the language and - until View → Window Theme chooses one in
+`~/.config/axross-markdown/settings.json` - the window's theme. The page's theme (View → Theme), the terminal's (`terminal_theme`) and the updates (`update_mode`) are kept in that file too.
 
 ## The exact, reviewed dependencies
 

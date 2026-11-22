@@ -89,6 +89,40 @@ def turn_for(text: str) -> float:
     return TURN + min(_PAINTED[0], TURN)  # (at most twice TURN, whatever the font)
 
 
+def within_turn(measure, text: str, label=None) -> float:
+    """*measure()* - the longest turn of something done - under turn_for(*text*); when it is not, once more:
+    the machine timed again (machine_factor now - a runner shared with another job, a second pytest beside
+    it, ran 5 % slower for a while: 0.109 s against 0.104 failed a release) and the turn measured again, the
+    better of the two against the budget of the machine as it is then. Never more than 0.1 s of the
+    calibration machine's, as fast as it is. And the window's longest wall-clock gap meanwhile (the
+    heartbeats the measure stopped - tests/markdown_heartbeat.py) under its budget, measured again likewise:
+    a worker holding Python's lock froze the window 12.6 s while the turn read 0.08 s. Returns the turn
+    that passed."""
+    from tests import markdown_heartbeat as HB
+
+    def measured() -> tuple[float, float]:
+        mark = len(HB.STOPPED)
+        HB.DEFERRED[0] += 1
+        try:
+            turn = measure()
+        finally:
+            HB.DEFERRED[0] -= 1
+        return turn, HB.gaps_since(mark)
+
+    longest, gap = measured()
+    budget, gap_budget = turn_for(text), HB.gap_budget()
+    if longest < budget and gap < gap_budget:
+        return longest
+    factor = machine_factor()
+    again, gap_again = measured()
+    budget = max(budget, budget - TURN + 0.1 * factor)
+    best = min(longest, again)
+    assert best < budget, (label, longest, again, budget)
+    assert min(gap, gap_again) < max(gap_budget, HB.GAP * factor), \
+        (label, "the window did not answer for", gap, gap_again, gap_budget)
+    return best
+
+
 @pytest.fixture(autouse=True)
 def _closed_after():
     # (what earlier tests left is kept out of the collector's way: in one process with all the tests - as the CI
@@ -164,8 +198,7 @@ def test_sad_the_reviews_cases_hold_no_turn(name, full):
     """Before (markdown-it / Qt's own parser, here): F1 4.6-4.8 s and 1.1-1.3 s; F2 code blocks 2.5-9 s,
     rules 1.3 / 3.4 s; F3 1.3-2.0 / 0.7-0.85 s; F4 0.6-0.8 s, a code line 0.6 / 0.7 s."""
     text = REVIEW_CASES[name]()
-    longest = _longest_turn(text, full)
-    assert longest < turn_for(text), (name, longest)
+    within_turn(lambda: _longest_turn(text, full), text, name)
 
 
 def test_sad_a_long_formula_shows_its_tex_and_a_long_code_line_all_of_it():
@@ -513,8 +546,7 @@ def _sampled(count: int) -> list:
 def test_sad_a_sample_of_the_grid_holds_no_turn(cell, full):
     """A seeded sample of the grid (the seed in the test's id's run: AXROSS_STRESS_SEED reruns it)."""
     text = grid_document(*cell)
-    longest = _longest_turn(text, full)
-    assert longest < turn_for(text), (SEED, cell, longest)
+    within_turn(lambda: _longest_turn(text, full), text, (SEED, cell))
 
 
 @pytest.mark.parametrize("cell", _sampled(2), ids=lambda cell: "/".join(cell))

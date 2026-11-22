@@ -4,6 +4,343 @@ What changed in each release of axross-markdown. The code is axross's
 Markdown viewer (https://github.com/c0decave/axross), written out by axross's
 `scripts/export_standalone.py markdown`.
 
+## 0.17.0 - 2026-11-21
+
+Two new features: twelve themes for the page, in the window and in the
+terminal, and updates of the one-file programs from signed releases.
+
+- **Twelve themes** - Light, Dark (the colours the reader always had),
+  Sepia, Solar Light, Solar Dark, Arctic, Retro, Night Violet, Slate, Paper,
+  High Contrast Light and High Contrast Dark. Each one sets the page's
+  ground, text, headings, links, inline and fenced code with its syntax
+  colours, quotes, tables, alerts, formulas and the selection. Every
+  theme's text and links reach WCAG AA (4.5:1), the High Contrast ones AAA
+  (7:1); a test measures each one, and every other text colour of it.
+- **View > Theme** chooses the page's theme for every open window, kept in
+  `~/.config/axross-markdown/settings.json`; **Automatic** follows the
+  window (Light or Dark as it is). The window's own theme moved to
+  *View > Window Theme*. A switch is one change: the page keeps its old
+  colours until it has been made anew in the new ones, so there is no
+  flash and no blank page in between. Switches faster than one in 0.4 s
+  are taken together, and the last one counts. On a big page the window
+  keeps answering during a switch (a heartbeat test with 6,000 sections
+  and with 20,000 lines of code).
+- **In the terminal:** `--theme NAME` uses a theme's colours and paints its
+  ground behind the text (`--background off` leaves the terminal's own).
+  `--list-themes` shows each theme with its contrast numbers.
+  `$AXROSS_MDCAT_THEME`, or `terminal_theme` in the settings, sets the
+  default. With 256 colours a theme's colours are the nearest that keep
+  their contrast; with 16 the terminal's own colours are used; `NO_COLOR`
+  means none at all. `--theme auto` (the default) looks as before.
+  `--theme dark` and `--theme light` now paint their ground;
+  `--background off` gives the old look.
+- **Signed updates** of the Linux binary and the AppImage, the macOS binary
+  and Windows' `axross-markdown.exe` and `axross-mdcat.exe`. *Help >
+  Updates* is Off, Tell me (the default) or Install automatically. The
+  window checks at its start and every 24 hours, always on a thread of its
+  own. *Help > Check for Updates…*, `--check-update`, `--update` and
+  `--update-mode` check or install without waiting for the timer. A file is
+  installed only after these checks pass: GitHub's hosts over https (every
+  redirect checked), a strictly newer version named in the file's name,
+  an Ed25519 signature over `SHA256SUMS` by the pinned release key, the
+  signed SHA-256 and size, at most 400 MiB, and no archives. The new
+  program must pass its `--self-test` before one rename puts it in place.
+  The old program is kept as `.previous` and put back if the new one is
+  not the checked file. On Windows the running program is renamed aside;
+  an AppImage replaces `$APPIMAGE` itself. The macOS app is not changed in
+  place. A pip install gets the notice `pip install -U axross-markdown`.
+- **The release** is made as a draft: the maintainer signs `SHA256SUMS` by
+  hand (`scripts/sign_release.py release vX.Y.Z --key KEY --publish`) and
+  publishes it. Next to each program the release carries the same file
+  with its version in the name, which is what the updater fetches. The
+  release workflow runs every program's `--self-test`.
+- 0.16.x cannot update itself: install 0.17.0 by hand once.
+## 0.16.12 - 2026-11-21
+
+The twenty-fifth review's fixes. "Gap" is the longest time the window did
+not answer (a heartbeat on the GUI thread); "Qt's own parser" is the page
+without markdown-it-py (the fallback here, and axross's own viewer).
+
+- **A literal `<!--` hid the rest of the page (Qt's own parser):** "Type
+  <!-- to begin a comment." showed "Type" and nothing after it, headings
+  included; a comment or `<?` opened in one paragraph and closed in a later
+  one hid the text between. Comments, processing instructions, CDATA and
+  declarations are read as GFM reads them now: an HTML block only at the
+  start of a block (never closed: to the end, as before), inline only when
+  closed in its paragraph - else the text as written. `<!-->` is a comment
+  of its own (the spec's 645), and the text after a comment block's end on
+  its line is shown as written (146).
+- **Copy after Ctrl+End stuck at "Copying… 0%":** select-all and Copy within
+  a moment of Ctrl+End waited for the text to be parsed, found the selection
+  gone and never said anything again. The copy keeps what was selected and
+  is made; a copy with nothing left to copy says so.
+- **Export PDF and Print (markdown-it):** an HTML block of 2 MB was one part
+  laid out in one turn of the window (Export PDF R1_PDF, Print R1_PRINT).
+  The text is parsed a piece at a time, as the window does, its headings'
+  anchors and footnotes numbered across the pieces; each piece's tokens are
+  let go of before the next is parsed, and each part once it is drawn.
+  Export HTML is made the same way (5,000 sections: M1_HTML).
+- **A block tag's long line (Qt's own parser):** a line of 2 MB under a
+  `<div>` or a tag alone on its line was escaped in one call that held
+  Python's lock: the window froze R2_BEFORE as the file opened (8 MB: 0.6 s,
+  and 1.4 s at each pause of the editor's preview). In pieces now (R2_AFTER).
+- **A link to a missing `#anchor` on a big page** laid out all of the page
+  before it said "No heading" (100,000 headings: minutes). The parts'
+  headings say it at once now; a heading the outline does not list (one in
+  a quote or an item, an underlined one in a text not parsed yet) is looked
+  for on a worker first.
+- **Find and zoom on a page laid out to its end:** Qt's find read every block
+  of the page when the word was not there (a code block of 200,000 lines:
+  0.12 s a press of Enter, 1,000,000 lines 0.85 s) - the page's text is
+  looked in now (0.01 s), read again from where it changed only. A zoom
+  emptied the page in one turn (10,000 sections: 0.16 to 0.195 s, 200,000
+  code lines 0.13 s): the page gets a new document and the old one is let go
+  of a piece a turn (0.05 s and 0.03 s).
+- **A resize of a big page** laid all of it out again in one turn (10,000
+  sections: 0.19 s at each step of a drag): a part a turn now, as a zoom
+  (0.07 s). **A theme switch with many image boxes** laid the page out again
+  for boxes of the same size (6,000 boxes: 0.21 s): they are painted again
+  (0.08 s). **Highlighted code** weighs its colours in a part too.
+- **A table of 1,000 rows of long cells (Qt's own parser):** Find laid out a
+  part a turn and read all of the page twice in each (0.095 s a turn, over
+  the budget under load): 0.055 s now.
+- **The emoji scan for a `©`:** a "©", "®", "™", "‼" or "ℹ" made a file wait
+  for the scan of the fonts (0.3 to 0.44 s on a machine of 2,000 fonts);
+  only a character shown as an emoji by itself, or one with U+FE0F after
+  it, does now.
+- **Find's marks and count** were the old page's after a reload, a change on
+  disk, a zoom or a theme switch ("1 of 959+" of a file without the word):
+  the new page's matches are marked and counted.
+- **Qt's own parser and the spec:** `www.google.com/search?q=commonmark&hl;`
+  keeps its `;` (the spec's 626).
+- **Licences:** the one-file programs contain PyQt6 (GPL-3.0) and Qt
+  (LGPL-3.0): each is a combined work under the GPL-3.0.
+  `THIRD_PARTY_LICENSES.txt` - every bundled package's licence text, and
+  where the source code of each part is - is inside the programs, the wheel
+  and the sdist, and on each release page beside the programs with
+  `LICENSE` and `NOTICE`. **Help > About axross-markdown…** shows the
+  version, the licence and the third-party licences.
+- **`--version`** run from a source checkout (`python -m axross_markdown` in
+  `src/`) said axross's version: the package has its own now.
+- **Tests:** numpy is in the tests' hashed lock, so the golden-image tests
+  run in CI and in the release (they were always skipped). The sweep has
+  two more shapes (after a block tag, after a tag alone on its line) and the
+  review's texts; `tests/test_markdown_reader_bugs26.py` has a regression
+  test for each fix.
+
+## 0.16.11 - 2026-11-21
+
+The twenty-fourth review's fixes, and what a sweep of generated hostile
+texts found after them. "Gap" is the longest time the window did not answer
+(a heartbeat on the GUI thread); "Qt's own parser" is the page without
+markdown-it-py (the fallback here, and axross's own viewer).
+
+- **A heading line of spaced words froze the window:** the outline's heading
+  pattern had the same name as the check of a line's heading mark, and the
+  later, quadratic one won. 30 KB of words 999 spaces apart froze the window
+  0.3 s, 2 MB 18 s (and again on Export PDF). Each pattern has its own name
+  now, the outline's is linear, and a test refuses a name defined twice.
+- **Fences never closed (Qt's own parser):** the pattern that finds fenced
+  code to colour looked for each opening line's end to the text's end:
+  "```py" 4,000 times froze the window 1.6 s, 20,000 times 24 to 32 s. A
+  line scanner finds the blocks in one pass now.
+- **Paragraphs never cut (Qt's own parser):** a paragraph whose lines began
+  with a space, a tab or `#`, or a run of `+++` lines, was laid out in one
+  turn (2 MB: 1.2 to 1.7 s). A line is paragraph text by what it is now.
+- **Export PDF and Print** kept every laid-out part until they ended (4.3 MB
+  needed 1 to 2 GB): each part is deleted once drawn.
+- **The emoji font scan** runs only for a text with an emoji or a short code
+  (a three-line file waited 0.48 s for it on a machine of 2,000 fonts), and
+  it keeps its deadline.
+- **Tables (Qt's own parser):** a header with an escaped `\|` showed the
+  table as text.
+- **Zoom on a big page read to its end** copied the page made whole in one
+  turn (0.16 to 0.19 s): the copy is made on a worker.
+- **Workers held Python's lock:** making a page safe for Export HTML in one
+  pass over all of it, writing the file on the GUI thread, Python's full
+  garbage collections during a big parse (0.43 s each) and two workers
+  making pages at once froze the window up to 2.2 s under load. The page is
+  made safe and written a piece at a time on a worker, full collections wait
+  until the page is made, and one page is made at a time.
+- **A crash the sweep found:** a big page rendered again and again (the
+  editor's preview: 200 KB of emoji headings with Qt's own parser, the third
+  time) crashed the program - the scroll bar's slots asked the layout where
+  a block of the old page was while Qt replaced it. They wait for the page
+  now. (In 0.16.10 too.)
+- **What the sweep found:** a pattern tried again from every space of a run
+  just short of 1,000 (1.1 s), another from every place of lines just short
+  of 2,000 characters (0.1 s), the emoji check's class of thousands of
+  characters (2 MB: 5 s), Find's marks painted wherever they were (0.13 s a
+  turn), an export laying an image out again that the page showed as not
+  found already, a big table's later parts (Qt lays them out the slower the
+  more of the table is laid out: 0.115 s), lists of up to 3,000 items in one
+  part (0.18 s), a text of few long lines in one part, a long word or code
+  span without a space in pieces too long for Qt to lay out letter by letter
+  (0.11 to 0.18 s), a backtick fence with a backtick after it (no fence: 30
+  KB in one block, 1.4 s), long lines of indented code and of `>` in code,
+  the parts of an export twice the page's, a line of thousands of tabs
+  (Qt lays them out in time growing with their square: 8.3 s; past 64 a
+  line they are spaces, as a page shows them), the Ogham space mark and the
+  format signs Qt shapes dearly (Arabic's number signs, Kaithi's, the
+  hieroglyphs' joiners: 0.3 to 0.8 s a part - weighed as an emoji now),
+  Unicode's line and paragraph separators (each a line of its own for Qt:
+  0.75 s), copying 30,000 formulas (0.17 s), a run of format signs taken
+  for one character that no piece could cut (a line of 30,000 shorthand
+  format controls: 0.4 s; a character holds 32 marks at most now), a code
+  fence whose closing line had text after it, and a link of an address of
+  30,000 characters (shown as written now).
+- **Qt's own parser and the GFM spec:** an item's mark followed by spaces only,
+  a reference definition over three lines, `[link](<foo\>)`, processing
+  instructions, declarations and CDATA sections (hidden, as raw HTML), and
+  the Markdown in an HTML block's lines (a block tag's, or a tag alone on its
+  line: shown as written) are read as GFM does.
+- **Windows:** a link to the file itself written another way (`C:/docs/a.md`
+  and `C:\docs\a.md`) jumps instead of reading the file again.
+- **Tests:** the heartbeat's budget is 0.15 s (it was 0.5 s, which let the
+  heading line's 0.3 s pass), it leaves out the time the window waited for
+  a CPU another job had, and a test that froze is measured again once
+  before it fails; a sweep of generated texts (every ASCII punctuation
+  character and every Unicode space and format class, at line starts, after
+  each block marker, in spans and nested, at 2 KB to 2 MB, in both parsers,
+  through open, the preview, both exports, Find and zoom) runs a sample in
+  CI; and every regular expression is timed on texts made for it at doubling
+  lengths.
+
+## 0.16.10 - 2026-11-21
+
+The twenty-third review's fixes. "Turn" is the window's own CPU in one
+event-loop turn; "gap" is the longest time the window did not answer at all,
+measured by a heartbeat on the GUI thread - what a worker thread holding
+Python's lock costs the window, which the turn does not show. "Qt's own
+parser" is the page without markdown-it-py (the fallback here, and axross's
+own viewer, which ships without it).
+
+- **A line of backticks froze the window:** the footnote pass looked for
+  code spans with a regular expression that was cubic in a run of backticks,
+  on every line. `x` and 1,200 backticks held the window 11.7 s; in a big
+  file the same pass ran on a worker but held Python's lock, so the window
+  froze 12.6 s while the turn read 0.08 s. Code spans are found in one pass
+  now (0.04 s), and the pass runs only when the text has a footnote.
+- **Every regular expression checked:** the reader's patterns were each run
+  against runs of backticks, brackets, stars, underscores, pipes,
+  backslashes, spaces and more. Also fixed: a footnote reference's pattern
+  on `[^` repeated (40 KB: 3.9 s), quotes before a `$$` block (exponential in
+  the number of `>`), the formula passes on runs of spaces (8,000 spaces:
+  1.2 s) - all linear now.
+- **Qt's own parser cuts more paragraphs and parts:** a paragraph with a `|`
+  in it (a table needs a delimiter row; 2 MB took 1.2 s), a long word in a
+  link, an autolink, a bare address or emphasis (cut and the link or the
+  emphasis begun again in each piece - same address, no markup shown; 1.3 to
+  1.5 s), list marks nested on one line (`+ ` 90,000 times 7.9 s, `1. `
+  60,000 times 4.3 s: shown 16 deep, the rest as text), lines of `=`
+  (300,000: 12 to 18 s) and a table header of 30,000 columns. All under
+  0.1 s now.
+- **Windows:** local images were never shown and a relative link went to the
+  drive's root - paths were joined with `posixpath` and compared with "/".
+  The file's own path functions are used now (`C:\docs\a.md` and
+  `C:/docs/a.md` alike); the tests simulate Windows paths on Linux.
+- **A table too wide to lay out** was shown as written in one code line that
+  was never cut: 200,000 columns took 4.6 s. Its lines are cut as a code
+  block's are (0.05 s).
+- **Parsing off the GUI thread:** texts of up to 20,000 characters were
+  parsed on the GUI thread - at every pause in the editor's typing. From
+  2,000 on they are parsed on a worker. markdown-it-py's inline HTML and
+  linkify rules were quadratic (19 KB of `<!--` or `http:// `: 0.8 to 0.9 s;
+  200 KB of them 18 to 97 s before the page showed): both are linear now.
+- **Export HTML with Qt's own parser** laid out the whole page and wrote it
+  in one turn (0.4 to 4.4 s): it now writes a part a turn and makes the page
+  safe on a worker.
+- **Export and Print ask first:** the file dialog (and the print dialog)
+  waited until the whole page was laid out in the window - 24 s to more than
+  ten minutes on a big file. They show at once; the images the export needs
+  are read on a worker, with Cancel.
+- **The emoji font scan** is under its 0.25 s deadline all of it now (the
+  default font's pass was not: 0.6 s of the first view with 2,000 fonts), and
+  the maths font check asks the font itself, not Qt's fallback fonts.
+- **Zoom on a big page read to its end** made the next scroll or Find lay all
+  of it out again (a table of 20,000 rows: 0.65 to 1.6 s). A zoom lays the
+  page out anew a part a turn, from the place read.
+- **A footnote cited twice** rendered as broken HTML (its ways back on lines
+  of their own); they are in the note's paragraph now, as GitHub shows them.
+- **Ctrl+End and Ctrl+Home** work on a page laid out whole as well.
+- **Small things:** Find without a match on a big page no longer searches
+  all of it twice at each Enter (2.7 MB: 0.185 s); a letter keeps at most 64
+  combining marks (99,000 on one letter: 0.14 s); a short text with fenced
+  code is prepared on a worker (a stuck lexer held the window 1 s - found by
+  the heartbeat); `axross-markdown --term` names itself in its messages.
+- **Qt's own parser and the GFM spec:** `<details>` is folded unless it says
+  `open`, as GitHub and markdown-it's page show it, its summary a link that
+  opens it; an autolink with a backtick, `[a](<b)c`, `Foo\` over `---`,
+  `&#10;`, a header row of more cells than its delimiter row, a heading in a
+  list item followed by a paragraph and `[foo]: <bar>(baz)` show as the spec
+  says.
+- **Release and CI:** pytest (and what it needs) is installed from
+  `packaging/requirements-test.txt`, every pin hashed, in the CI and the
+  release; the release builds the sdist and wheel before any test tool is
+  installed.
+- **Tests:** a heartbeat on the GUI thread now measures the wall-clock gap in
+  every stress test, beside the turn, so a lock held by a worker fails them.
+  The emoji test that failed once in six runs measures again before it fails
+  and prints a profile when it does.
+
+## 0.16.9 - 2026-11-20
+
+The twenty-second review's fixes. Times are the window's own CPU in one
+event-loop turn; "Qt's own parser" is the page without markdown-it-py (the
+fallback here, and axross's own viewer, which ships without it).
+
+- **A long line of raw HTML:** a block of raw HTML was cut by its elements
+  and lines, never by its characters, so a line of 2 MB in a `<div>` was one
+  piece: 1.1 s in the window, and 18 s exporting a PDF or printing (each page
+  drew the whole block again). A text in raw HTML now weighs its characters
+  and a long one is cut at a space: 0.01 s, the PDF 0.02 s.
+- **Closing the window during an export or a print:** the export waited in
+  an event loop for a result the closed window never got - until the
+  program ended, and then it raised. It now ends at once, cancelled.
+- **Qt's own parser cuts a page where a block ends without an empty line:**
+  after a heading of either kind, a fenced block, a link's definition, a
+  rule - and between the headings of a quote. 50,000 setext headings (4.2 s),
+  50,000 headings in a quote (4.1 s), a long paragraph right under a heading,
+  a fence or a definition (1.1 to 1.4 s) and 50,000 definitions with their
+  references (1.5 s): now 0.02 to 0.03 s.
+- **Every Unicode space counts in a run of spaces:** 300,000 no-break spaces
+  held the window 11 s (only spaces and tabs were cut). Now 0.004 s.
+- **Runs of brackets and tags with Qt's own parser:** "<a" 49,500 times
+  (4.1 s), "<" 99,000 times (7 s), "[a" and "[" (1 s) and "*a" (0.14 s) are
+  cut in pieces too (0.01 to 0.06 s). Its passes before the page are linear:
+  "![" 49,500 times took them 132 s, 100,000 addresses on a line 129 s; now
+  well under a second.
+- **Qt's own parser on the GFM spec:** 74 examples shown otherwise than the
+  spec's, now 51 (most of those on purpose: raw HTML is not shown). No
+  private-use mark shows in the page or a link any more; an escaped tag
+  (`\<br/>`) is text, not a line break; an image by reference with emphasis
+  in its alt shows once (`![foo *bar*]` twice before, `![foo *bar*][]` not
+  at all); a link never closed leaves no "["; a tag that is none (`<a
+  href="hi'>`) is text; `&#0;` is U+FFFD, and entities such as `&Dcaron;`
+  and `&HilbertSpace;` are their characters.
+- **No false "lists nested more than 16 deep":** code indented 33 columns or
+  more (deep JSON, YAML, HTML in a fenced block) said the page was laid out
+  flatter, and took the slow path. Only a list made flatter is said now.
+- **Big tables:** the first part of a big table is a quarter as long, a
+  table with footnotes counts its references, and a later part's cells are
+  made unbreakable before it goes into the page (there each one laid all of
+  the table out again): 20,000 rows 0.15 s, 5,000 footnoted rows 0.21 s - now
+  0.06 and 0.04 s. A PDF lays out smaller parts of a table and draws a page a
+  turn: 0.20 and 0.30 s, now 0.04 and 0.02 s.
+- **Small things:** Find says "N+" once, not "N++". A code block's label is
+  its info string unescaped (`foo\+bar` is "foo+bar", `f&ouml;&ouml;`
+  "föö"). An installed colour emoji font is the page's emoji family even
+  where Qt's fallback reaches it from the default font (that font took its
+  place). The program no longer logs "Backend registry initialized: 40
+  backends" at every start.
+- **Release and CI:** the sdist and wheel are built with build and twine from
+  `packaging/requirements-build.txt` (every pin hashed) and
+  `python -m build --no-isolation`, the backend (setuptools) from
+  `requirements.lock.txt`: nothing unpinned comes from PyPI for the
+  artifacts. A stress test over its turn budget measures the machine again
+  and runs once more before it fails (a runner shared with another job ran
+  5 % slower for a while).
+
 ## 0.16.8 - 2026-11-20
 
 The twenty-first review's fixes, and the CI's tests green again. Times are the

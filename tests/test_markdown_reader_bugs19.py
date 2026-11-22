@@ -506,7 +506,9 @@ def test_sad_view_theme_is_chosen_applied_and_kept_in_the_programs_own_settings(
     viewer = MarkdownApp().open_paths([""])[0]
     assert viewer.view_button is not None and viewer.view_button.text() == "&View"
     menu = viewer.view_button.menu()
-    theme_menu = next(action.menu() for action in menu.actions() if action.menu() is not None)
+    # (0.17.0: the page's Theme first - tests/test_markdown_themes.py -, the window's after it)
+    theme_menu = next(action.menu() for action in menu.actions()
+                      if action.menu() is not None and action.menu().objectName() == "window_theme")
     theme_menu.aboutToShow.emit()
     actions = {action.data(): action for action in theme_menu.actions()}
     assert set(actions) == {theme_id for theme_id, _label in themes.THEME_CHOICES}
