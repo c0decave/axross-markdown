@@ -48,10 +48,11 @@ Windows lets a running program be renamed, not overwritten: the running
 checked one, or not answer its self-test there, the old one is put back
 (:func:`roll_back`). It takes effect at the next start.
 
-Settings (``~/.config/axross-markdown/settings.json``, core.markdown_settings):
-``update_mode`` - "off", "notify" (the default: say so when a newer release
-is out) or "auto" (download, check and install it, say so) - and
-``update_last_check``. The window checks at its start and every 24 hours
+Settings (``~/.config/axross-markdown/settings.json``, core.markdown_settings,
+written only when the user sets it): ``update_mode`` - "off", "notify" (the
+default: say so when a newer release is out) or "auto" (download, check and
+install it, say so). The time of the last check and the newer version it found
+are the program's state (``~/.local/state/axross-markdown/state.json``). The window checks at its start and every 24 hours
 (:class:`Scheduler`), always off its thread; ``AXROSS_MARKDOWN_NO_UPDATE_CHECK=1``
 keeps those checks off whatever the setting says. ``--check-update`` and
 ``--update`` ask at once.
@@ -488,7 +489,7 @@ def check(current: str | None = None, fetcher=None) -> CheckResult:
     body = fetch(LATEST_URL, fetcher, MAX_API_BYTES)
     try:
         data = json.loads(body.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError):
+    except (UnicodeDecodeError, ValueError, RecursionError):
         raise UpdateError("GitHub's answer is no JSON") from None
     release = parse_release(data)
     return CheckResult(release, current, is_newer(release.version, current))
@@ -850,30 +851,31 @@ def set_mode(value: str, path=None) -> None:
 
 
 def last_check(path=None) -> float | None:
-    from axross_markdown._ax.core.markdown_settings import read_setting
+    from axross_markdown._ax.core.markdown_settings import read_setting, state_path
 
-    value = read_setting(SETTING_LAST, None, path)
+    value = read_setting(SETTING_LAST, None, state_path() if path is None else path)
     return float(value) if type(value) in (int, float) and value > 0 else None
 
 
 def record_check(result: CheckResult | None = None, when: float | None = None, path=None) -> None:
-    """The time of a check (and, with *result*, the newer version it found - "" when none)."""
-    from axross_markdown._ax.core.markdown_settings import write_settings
+    """The time of a check (and, with *result*, the newer version it found - "" when none): the program's
+    state (core.markdown_settings.state_path), not the user's settings."""
+    from axross_markdown._ax.core.markdown_settings import state_path, write_settings
 
     values = {SETTING_LAST: float(time.time() if when is None else when)}
     if result is not None:
         values[SETTING_SEEN] = result.release.version if result.newer else ""
     try:
-        write_settings(values, path)
+        write_settings(values, state_path() if path is None else path)
     except OSError:
         log.info("update: the time of the check is not kept (the settings cannot be written)")
 
 
 def seen_newer(current: str, path=None) -> str:
     """The newer version the last check found, if it still is newer than *current* - else ""."""
-    from axross_markdown._ax.core.markdown_settings import read_setting
+    from axross_markdown._ax.core.markdown_settings import read_setting, state_path
 
-    value = read_setting(SETTING_SEEN, "", path)
+    value = read_setting(SETTING_SEEN, "", state_path() if path is None else path)
     return value if isinstance(value, str) and is_newer(value, current) else ""
 
 

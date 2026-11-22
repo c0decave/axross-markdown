@@ -4,6 +4,41 @@ What changed in each release of axross-markdown. The code is axross's
 Markdown viewer (https://github.com/c0decave/axross), written out by axross's
 `scripts/export_standalone.py markdown`.
 
+## 0.17.1 - 2026-11-22
+
+0.17.0 was not released: its CI failed. This release fixes what was ours
+and keeps the settings file the user's.
+
+- **The settings file changes only when you choose something.** 0.17.0
+  wrote the time of every update check, and the version it found, into
+  `~/.config/axross-markdown/settings.json`, so a check at the start
+  changed the file by itself. That is the program's state now, in
+  `~/.local/state/axross-markdown/state.json` (`$XDG_STATE_HOME`). The
+  settings file holds only what you set: the page's theme, the window's
+  theme, the terminal's theme and the update mode.
+- **`AXROSS_MARKDOWN_SETTINGS`** names another settings file (a portable
+  setup, a test); the state goes beside it.
+- **The About window** has the program's icon and the [x] in its corner, as
+  every other window.
+- **A settings file or a GitHub answer nested thousands of levels deep** is
+  read as no settings or refused, never an error out of the program.
+- **CI:** 0.17.0's CI failed 133 tests on a shared runner about twice as
+  slow as a developer's machine: heartbeat and turn budgets, and waits that
+  are the assertion. They found no bug. The tests that pass or fail by
+  elapsed time now carry the pytest marker `timing`, and a test fails when
+  one that asserts a duration lacks it. CI runs them in a job of their own
+  that blocks nothing (`-m timing`, failures shown as warnings) and the rest
+  with `-m "not timing"`; a release waits for the rest only. Locally
+  `python -m pytest tests` still runs everything, at full strictness.
+- **Waits for a page, not budgets:** the test helpers that wait for a page
+  to be ready gave up after 10 to 30 s and went on with a half-made page;
+  they wait up to 120 s now and go on as soon as the page is ready.
+- **Tests:** every test gets its own home, settings and state, and the
+  page's theme goes back to Automatic after each one. A pair of tests
+  checks that one test's theme choice is not the next test's starting
+  point. The test of rapid theme switching no longer depends on how fast
+  the machine handles events.
+
 ## 0.17.0 - 2026-11-21
 
 Two new features: twelve themes for the page, in the window and in the

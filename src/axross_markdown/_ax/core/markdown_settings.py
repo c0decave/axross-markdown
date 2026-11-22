@@ -1,6 +1,11 @@
 """axross-markdown's own settings file, without Qt: ~/.config/axross-markdown/settings.json
-(``$XDG_CONFIG_HOME`` when set) - the window's and the terminal's theme (core.markdown_themes) and the
-updates (core.markdown_update). ui.standalone_app keeps the window theme of axross's in the same file.
+(``$XDG_CONFIG_HOME`` when set; ``$AXROSS_MARKDOWN_SETTINGS`` names another file - a test's, a portable
+setup's) - the window's and the terminal's theme (core.markdown_themes) and the updates' mode
+(core.markdown_update). ui.standalone_app keeps the window theme of axross's in the same file.
+
+The file is written only when the user chooses something (a menu, ``--update-mode``): what the program
+notes by itself - when it last asked for updates, the newer version it found - is its state, in
+:func:`state_path` (``$XDG_STATE_HOME``), never here.
 
 The file is hand-editable: every value is checked where it is read; a file that is no JSON object reads
 as empty. Writes keep every other key, are private (0600) and atomic (a temporary file, fsync, rename),
@@ -15,14 +20,30 @@ import threading
 from pathlib import Path
 
 NAME = "axross-markdown"
+#: Names the settings file instead of ~/.config/axross-markdown/settings.json (the state goes beside it).
+ENV = "AXROSS_MARKDOWN_SETTINGS"
 #: The most of the file that is read (a hand-edited file is no reason to read gigabytes).
 MAX_BYTES = 1 << 20
 _LOCK = threading.Lock()
 
 
 def settings_path(name: str = NAME) -> Path:
+    override = os.environ.get(ENV, "").strip()
+    if override and name == NAME:
+        return Path(override).expanduser()
     base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
     return Path(base) / name / "settings.json"
+
+
+def state_path(name: str = NAME) -> Path:
+    """What the program notes by itself (the update checks): ~/.local/state/axross-markdown/state.json
+    (``$XDG_STATE_HOME``) - beside ``$AXROSS_MARKDOWN_SETTINGS``'s file when that is set."""
+    override = os.environ.get(ENV, "").strip()
+    if override and name == NAME:
+        settings = Path(override).expanduser()
+        return settings.with_name(settings.stem + ".state.json")
+    base = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    return Path(base) / name / "state.json"
 
 
 def read_settings(path: Path | None = None) -> dict:
@@ -34,7 +55,7 @@ def read_settings(path: Path | None = None) -> dict:
         if len(data) > MAX_BYTES:
             return {}
         value = json.loads(data.decode("utf-8"))
-    except (OSError, ValueError, UnicodeDecodeError):
+    except (OSError, ValueError, UnicodeDecodeError, RecursionError):  # (nested past the limit: none)
         return {}
     return value if isinstance(value, dict) else {}
 
@@ -75,4 +96,5 @@ def write_settings(values: dict, path: Path | None = None) -> None:
             raise
 
 
-__all__ = ["NAME", "read_setting", "read_settings", "settings_path", "write_setting", "write_settings"]
+__all__ = ["ENV", "NAME", "read_setting", "read_settings", "settings_path", "state_path", "write_setting",
+           "write_settings"]

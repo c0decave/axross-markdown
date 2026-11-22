@@ -40,6 +40,8 @@ NEW = "0.18.0"
 def _own_key_and_settings(monkeypatch, tmp_path):
     monkeypatch.setattr(MU, "TRUSTED_KEYS", (base64.b64encode(PUBLIC).decode(),))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.delenv("AXROSS_MARKDOWN_SETTINGS", raising=False)
     monkeypatch.delenv(MU.NO_CHECK_ENV, raising=False)
 
 
@@ -114,7 +116,9 @@ def _program(path: Path, version: str, *, ok: bool = True, program: str = "axros
 
 def _binary(tmp_path) -> tuple[MU.Install, Path, bytes]:
     folder = tmp_path / "bin"
-    folder.mkdir()
+    folder.mkdir(exist_ok=True)  # (the heartbeat's measure_again runs a test again in the same tmp_path)
+    for left in folder.iterdir():
+        left.unlink()
     target = folder / "axross-markdown"
     old = _program(target, CURRENT)
     return MU.Install("binary", "linux", "axross-markdown", target), target, old
@@ -497,6 +501,37 @@ def test_happy_the_mode_is_notify_until_set_and_kept(tmp_path):
     assert json.loads(path.read_text())["theme"] == "modern-dark"  # (the rest of the file kept)
 
 
+def test_sad_a_check_writes_the_program_s_state_never_the_user_s_settings(tmp_path):
+    """0.17.0 kept the time of every check (and the version found) in settings.json: a check at the start
+    changed the user's settings file. It is the program's state (core.markdown_settings.state_path); the
+    settings change only when the user sets something."""
+    from axross_markdown._ax.core import markdown_settings as S
+
+    settings = S.settings_path()
+    MU.record_check(MU.CheckResult(MU.Release(NEW, f"v{NEW}"), CURRENT, True))
+    assert not settings.exists()
+    assert MU.last_check() is not None and MU.seen_newer(CURRENT) == NEW
+    assert S.state_path().is_file() and S.state_path() != settings
+    MU.set_mode("off")  # (the user's choice: the settings)
+    assert json.loads(settings.read_text()) == {"update_mode": "off"}
+
+
+def test_happy_axross_markdown_settings_names_the_settings_file(tmp_path, monkeypatch):
+    from axross_markdown._ax.core import markdown_settings as S
+
+    own = tmp_path / "portable" / "md.json"
+    monkeypatch.setenv(S.ENV, str(own))
+    assert S.settings_path() == own and S.state_path() == own.with_name("md.state.json")
+    MU.set_mode("auto")
+    MU.record_check(when=123.0)
+    assert json.loads(own.read_text()) == {"update_mode": "auto"} and MU.last_check() == 123.0
+    pytest.importorskip("PyQt6.QtWidgets")
+    from axross_markdown._ax.ui import standalone_app
+
+    assert standalone_app.settings_file("axross-markdown") == own
+    assert standalone_app.settings_file("axross-amp") != own
+
+
 def test_happy_the_scheduler_checks_at_the_start_and_every_24_hours():
     now, last, started = [1_000_000.0], [None], []
     scheduler = MU.Scheduler(lambda: started.append(threading.current_thread().name), clock=lambda: now[0],
@@ -702,7 +737,7 @@ def test_sad_a_check_and_an_update_never_run_on_the_gui_thread(tmp_path, mode):
 
     MU.set_mode(mode)
     inst, target, old = _binary(tmp_path)
-    big = _new_file(tmp_path) + b"#" * (40 << 20)
+    big = _new_file(tmp_path) + (b"#" * (40 << 20) if mode == "auto" else b"")  # (notify fetches no program)
     github = FakeGitHub(files={f"axross-markdown-{NEW}-linux-x86_64": big}, delay=0.0005)
     tested = []
     controller = UI.UpdateController(None, fetcher=github, install=inst, current=CURRENT,

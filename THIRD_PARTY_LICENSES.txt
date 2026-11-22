@@ -1,4 +1,4 @@
-axross-markdown 0.17.0: licences and source code
+axross-markdown 0.17.1: licences and source code
 ==============================================================================
 
 axross-markdown - its own code and the code of axross
@@ -39,8 +39,8 @@ Source code
 
 The complete corresponding source code of each program:
 
-* axross-markdown 0.17.0: https://github.com/c0decave/axross-markdown (git tag
-  v0.17.0) and the sdist axross_markdown-0.17.0.tar.gz on PyPI and on the
+* axross-markdown 0.17.1: https://github.com/c0decave/axross-markdown (git tag
+  v0.17.1) and the sdist axross_markdown-0.17.1.tar.gz on PyPI and on the
   release page. It holds the scripts that build the programs
   (.github/workflows/release.yml, packaging/) and the exact versions and
   SHA-256 of everything they contain (requirements.lock.txt,

@@ -22,15 +22,56 @@ for _name, _sub in (("XDG_CONFIG_HOME", ".config"), ("XDG_DATA_HOME", ".local/sh
     os.environ[_name] = os.path.join(_home, _sub)
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("AXROSS_MARKDOWN_NO_UPDATE_CHECK", "1")  # (no test asks GitHub: the updater's use a fake)
+os.environ.pop("AXROSS_MARKDOWN_SETTINGS", None)  # (a settings file of the user's is no test's)
+
+
+@pytest.fixture(autouse=True)
+def _own_configuration(tmp_path_factory, monkeypatch):
+    """Every test its own home, settings and state - a choice one test makes and keeps (a theme, an update
+    mode) is no later test's starting point: HOME, XDG_CONFIG_HOME and XDG_STATE_HOME a fresh folder each
+    (the caches - fonts - and data stay the run's), and the page's theme back to "auto" after it."""
+    home = tmp_path_factory.mktemp("home")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(home / ".local" / "state"))
+    yield
+    _reset_theme()
+
+
+def _reset_theme():
+    """The process's ThemeHub (ui.markdown_theme_ui) as a new one is: "auto", nothing pending."""
+    import time
+
+    for name, module in list(sys.modules.items()):
+        if name.endswith("ui.markdown_theme_ui") and getattr(module, "_HUB", None):
+            hub = module._HUB[0]
+            try:
+                hub._timer.stop()
+            except RuntimeError:  # (deleted with its application)
+                module._HUB.clear()
+                continue
+            hub._pending, hub._theme, hub._applied, hub.clock = None, "auto", float("-inf"), time.monotonic
+
+
+def pytest_configure(config):
+    """The marker ``timing`` (tests/markdown_timing.py)."""
+    from tests.markdown_timing import MARKER_HELP
+
+    config.addinivalue_line("markers", MARKER_HELP)
 
 
 def pytest_collection_modifyitems(config, items):
-    """axross's tests of its own export of the tool (test_packaging_*) need axross."""
+    """axross's tests of its own export of the tool (test_packaging_*) need axross; the tests that pass or
+    fail by elapsed time get the marker ``timing`` (tests/markdown_timing.py): the CI runs them in a job
+    of their own that does not block (``-m timing``), the rest with ``-m "not timing"``. Locally: all."""
     import pytest
 
     for item in items:
         if item.name.startswith("test_packaging_"):
             item.add_marker(pytest.mark.skip(reason="tests axross's export of the tool: run in axross"))
+    from tests.markdown_timing import mark
+
+    mark(items)
 
 
 @pytest.hookimpl(wrapper=True)

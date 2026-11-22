@@ -21,6 +21,9 @@ pytest.importorskip("PyQt6.QtWidgets", reason="PyQt6 not installed")
 
 from PyQt6.QtWidgets import QApplication  # noqa: E402
 
+#: The longest a helper waits for a page to be ready (it goes on as soon as it is).
+READY_SECONDS = 120
+
 APP = QApplication.instance() or QApplication([])
 ROOT = Path(__file__).resolve().parent.parent
 ANSI = re.compile(r"\x1b(\[[0-9;]*m|\]8;;[^\x1b]*\x1b\\)")
@@ -42,7 +45,7 @@ def view_of(text: str, full: bool, path: str = "", width: int = 900, height: int
     view.resize(width, height)
     view.show()
     view.render(text)
-    end = time.monotonic() + 30
+    end = time.monotonic() + READY_SECONDS  # (a wait for the page, not a budget: a slow runner's page was measured half made)
     while time.monotonic() < end and (view.status.text().startswith(MV.tr("Rendering…"))
                                       or view.asked - set(view.images)):
         APP.processEvents()

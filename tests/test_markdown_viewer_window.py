@@ -47,7 +47,7 @@ def pump(seconds: float = 0.05) -> None:
     QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete.value)
 
 
-def wait_until(predicate, timeout: float = 5.0) -> bool:
+def wait_until(predicate, timeout: float = 60.0) -> bool:  # (a wait, not a budget: it returns when true)
     end = time.time() + timeout
     while time.time() < end:
         APP.processEvents()

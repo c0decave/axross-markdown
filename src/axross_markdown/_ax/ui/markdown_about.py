@@ -60,6 +60,11 @@ class AboutDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle(tr("About {name}").format(name=NAME))
         layout = QVBoxLayout(self)
+        from axross_markdown._ax.ui.close_corner import add_close_corner
+        from axross_markdown._ax.ui.icon_provider import set_window_icon
+
+        set_window_icon(self, "markdown")  # (the program's own icon, as its viewer's)
+        add_close_corner(self)  # (the [x] in the corner, as every window with a Close button has)
         self.title = QLabel(f"{NAME} {version}")
         self.title.setTextFormat(Qt.TextFormat.PlainText)
         font = self.title.font()

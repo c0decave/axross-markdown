@@ -22,6 +22,9 @@ pytest.importorskip("PyQt6.QtWidgets", reason="PyQt6 not installed")
 
 from PyQt6.QtWidgets import QApplication  # noqa: E402
 
+#: The longest a helper waits for a page to be ready (it goes on as soon as it is).
+READY_SECONDS = 120
+
 APP = QApplication.instance() or QApplication([])
 
 
@@ -150,7 +153,7 @@ def jumped(full: bool, monkeypatch):
     view = view_of(long_text(800), full)
     bar = view.browser.verticalScrollBar()
     bar.setValue(int(bar.maximum() * 0.8))
-    end = time.monotonic() + 30
+    end = time.monotonic() + READY_SECONDS  # (a wait for the page, not a budget: a slow runner's page was measured half made)
     while time.monotonic() < end and not shown(view).strip():
         pump(0.02)
     pump(0.3)

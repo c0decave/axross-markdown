@@ -91,10 +91,13 @@ def prepare_process(*, multimedia: bool = False) -> None:
 
 def settings_file(name: str):
     """The program's own settings (its theme): ~/.config/NAME/settings.json
-    (XDG_CONFIG_HOME's when set) - not axross's session.json."""
+    (XDG_CONFIG_HOME's when set; axross-markdown's: $AXROSS_MARKDOWN_SETTINGS
+    when set, core.markdown_settings) - not axross's session.json."""
     import os
     from pathlib import Path
 
+    if name == "axross-markdown" and os.environ.get("AXROSS_MARKDOWN_SETTINGS", "").strip():
+        return Path(os.environ["AXROSS_MARKDOWN_SETTINGS"].strip()).expanduser()
     base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
     return Path(base) / name / "settings.json"
 

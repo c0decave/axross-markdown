@@ -191,7 +191,7 @@ class UpdateController(QObject):
         if kind == "current":
             return tr("axross-markdown {current} is up to date.").format(current=self.current)
         if kind == "installed" and result is not None:
-            return tr("axross-markdown {new} is installed and checked - it starts the next time.").format(
+            return tr("axross-markdown {new} is installed and checked – it starts the next time.").format(
                 new=result.release.version)
         return tr("The update was not installed: {why}").format(why=text)
 

@@ -136,6 +136,8 @@ def _no_theme_said(monkeypatch, tmp_path):
     monkeypatch.delenv(MT.ENV_TERM, raising=False)
     monkeypatch.delenv("NO_COLOR", raising=False)
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.delenv("AXROSS_MARKDOWN_SETTINGS", raising=False)
 
 
 def test_happy_theme_paints_its_ground_and_colours_in_truecolor(capsys, page):
@@ -247,18 +249,58 @@ def qt(monkeypatch):
     from PyQt6.QtWidgets import QApplication
 
     app = QApplication.instance() or QApplication([])
+    from PyQt6.QtGui import QColor, QPalette
+
     from axross_markdown._ax.ui import markdown_theme_ui as TU
 
+    # (the window's own colours as a fresh start has them - light: a test before this one may have left
+    # axross's dark theme on the application, and "Automatic" follows it, as it should)
+    palette, sheet = QPalette(app.palette()), app.styleSheet()
+    light = QPalette()
+    for role, colour in ((QPalette.ColorRole.Window, "#efefef"), (QPalette.ColorRole.Base, "#ffffff"),
+                         (QPalette.ColorRole.Text, "#000000"), (QPalette.ColorRole.WindowText, "#000000")):
+        light.setColor(role, QColor(colour))
+    app.setStyleSheet("")
+    app.setPalette(light)
     hub = TU.hub()
     hub._timer.stop()
-    hub._pending, hub._applied, hub._theme = None, float("-inf"), "auto"
+    hub._pending, hub._applied, hub._theme, hub.clock = None, float("-inf"), "auto", time.monotonic
+    TU.store_theme("auto")  # (nothing another test kept)
     yield app
     hub._timer.stop()
-    hub._pending, hub._theme = None, "auto"
+    hub._pending, hub._theme, hub.clock = None, "auto", time.monotonic
     hub._applied = float("-inf")
+    TU.store_theme("auto")
     for widget in app.topLevelWidgets():
         widget.close()
         widget.deleteLater()
+    app.setPalette(palette)
+    app.setStyleSheet(sheet)
+
+
+@pytest.fixture
+def qt_plain():
+    """An application in light colours, the theme hub as the tests before left it - for the pair below,
+    which checks that the conftests (axross's, the export's) leave nothing of one test's choice."""
+    pytest.importorskip("PyQt6.QtWidgets")
+    pytest.importorskip("markdown_it")
+    from PyQt6.QtGui import QColor, QPalette
+    from PyQt6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+    palette, sheet = QPalette(app.palette()), app.styleSheet()
+    light = QPalette()
+    for role, colour in ((QPalette.ColorRole.Window, "#efefef"), (QPalette.ColorRole.Base, "#ffffff"),
+                         (QPalette.ColorRole.Text, "#000000"), (QPalette.ColorRole.WindowText, "#000000")):
+        light.setColor(role, QColor(colour))
+    app.setStyleSheet("")
+    app.setPalette(light)
+    yield app
+    for widget in app.topLevelWidgets():
+        widget.close()
+        widget.deleteLater()
+    app.setPalette(palette)
+    app.setStyleSheet(sheet)
 
 
 def _pump(seconds: float = 0.05) -> None:
@@ -397,9 +439,8 @@ def test_sad_rapid_switching_is_rate_limited_to_one_change_a_moment(qt, tmp_path
     hub.changed.connect(seen.append)
     try:
         for theme_id in ("dark", "sepia", "arctic", "retro", "slate", "paper", "night-violet"):
-            hub.choose(theme_id)
+            hub.choose(theme_id)  # (no event handled between: a slow runner's turns are no switch's interval)
             now[0] += 0.02
-            _pump(0.01)
         assert seen == ["dark"]  # (the first at once; the rest within MIN_INTERVAL_MS: held)
         assert hub._timer.isActive()  # noqa: SLF001
         now[0] += TU.MIN_INTERVAL_MS / 1000
@@ -477,6 +518,25 @@ def test_sad_switching_the_theme_of_a_big_page_keeps_the_window_answering(qt, tm
     HB.assert_responsive(gap, ("theme switch", full))
 
 
+def test_sad_1_a_theme_chosen_and_kept_here(qt_plain):
+    """(with the next test) a choice made and kept by one test - as View > Theme keeps it ..."""
+    from axross_markdown._ax.ui import markdown_theme_ui as TU
+
+    TU.hub()._applied = float("-inf")
+    TU.hub().choose("retro")
+    assert TU.hub().theme_id() == "retro" and TU.stored_theme() == "retro"
+
+
+def test_sad_2_is_no_later_test_s_default(qt_plain, tmp_path):
+    """... is not where the next test begins - a later test's layout and turns are measured in the page's
+    own colours: "auto", none kept, the page Light."""
+    from axross_markdown._ax.ui import markdown_theme_ui as TU
+
+    assert TU.hub().theme_id() == "auto" and TU.stored_theme() == "auto"
+    viewer = _viewer(tmp_path, "# A\n\ntext\n")
+    assert viewer.view.theme is MT.THEMES["light"] and viewer.view._ground is None
+
+
 def test_happy_the_program_s_view_menu_has_the_page_theme_then_the_window_theme(qt):
     from axross_markdown._ax.ui.markdown_app import MarkdownApp
 
@@ -493,7 +553,7 @@ def test_happy_every_string_of_the_themes_and_updates_is_in_german():
         "Updates", "Off", "Tell me about new versions", "Install new versions automatically", "Install",
         "axross-markdown updates", "axross-markdown {new} is available (this is {current}).",
         "To update it: {command}", "axross-markdown {current} is up to date.",
-        "axross-markdown {new} is installed and checked - it starts the next time.",
+        "axross-markdown {new} is installed and checked – it starts the next time.",
         "The update was not installed: {why}"]
     path = ROOT / "resources" / "i18n" / "de.json"
     if not path.is_file():  # (the export: beside the code)
