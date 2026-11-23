@@ -74,7 +74,7 @@ themes, or **Automatic**: Light or Dark as the window is.
 | Solar Light | light `#fdf6e3` | 5.9:1 | 5.8:1 |
 | Solar Dark | dark `#002b36` | 6.7:1 | 6.7:1 |
 | Arctic | dark `#2e3440` | 10.3:1 | 6.2:1 |
-| Retro | dark `#282828` | 10.7:1 | 5.5:1 |
+| Retro | dark `#282828` | 10.7:1 | 5.8:1 |
 | Night Violet | dark `#282a36` | 13.4:1 | 10.3:1 |
 | High Contrast Light | light `#ffffff` | 21.0:1 | 11.5:1 (AAA) |
 | High Contrast Dark | dark `#000000` | 21.0:1 | 12.8:1 (AAA) |
@@ -183,6 +183,28 @@ signed seal: the notice points to the release's disk image.
 How a release is signed: the release workflow makes a draft; the maintainer signs its
 `SHA256SUMS` on their own machine and publishes it (`scripts/sign_release.py release
 vX.Y.Z --key KEY --publish`) - the key never comes near CI.
+
+### Checking a download by hand
+
+`SHA256SUMS.sig` is the raw Ed25519 signature (64 bytes) of the exact bytes of `SHA256SUMS`, made
+with the release key whose public half the program pins. With OpenSSL 3.0 or newer, in
+the folder with the downloads, `SHA256SUMS` and `SHA256SUMS.sig`:
+
+```sh
+cat > axross-markdown-release-key.pem <<'EOF'
+-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAG+6OeUD/+0CE1UsDsnVTl7HBOOXtphDXycrBnk6EbGQ=
+-----END PUBLIC KEY-----
+EOF
+openssl pkeyutl -verify -pubin -inkey axross-markdown-release-key.pem -rawin \
+    -in SHA256SUMS -sigfile SHA256SUMS.sig
+sha256sum --check --ignore-missing SHA256SUMS
+```
+
+OpenSSL says `Signature Verified Successfully` (else `Signature Verification Failure`, and exits
+with 1); then every file downloaded must say `OK` (on macOS: `shasum -a 256 -c --ignore-missing
+SHA256SUMS`). From 0.17.4 on each file is also attested by the release workflow: `gh
+attestation verify FILE --repo c0decave/axross-markdown`.
 
 ## The security model
 
