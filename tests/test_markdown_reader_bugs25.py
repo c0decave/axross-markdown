@@ -40,6 +40,7 @@ from tests.test_markdown_reader_bugs20 import _Turns  # noqa: E402
 from tests.test_markdown_reader_bugs22 import (  # noqa: E402,F401 - _closed_after: the fixture, used by name
     PARSERS, _closed_after, _longest_turn, turn_for, within_turn)
 from tests.test_markdown_reader_bugs24 import _opened, _shown_md4c, _viewer  # noqa: E402
+from tests import markdown_timing as TB  # noqa: E402
 
 APP = QApplication.instance() or QApplication([])
 
@@ -51,7 +52,7 @@ def _quick(call, seconds: float) -> None:
     began = time.process_time()
     call()
     took = time.process_time() - began
-    assert took < seconds * HB.machine_factor(), took
+    TB.budget(took < seconds * HB.machine_factor(), took)
 
 
 # -- H1: one name, one pattern - and the outline's heading pattern linear -----------------------------------
@@ -313,7 +314,7 @@ def test_sad_the_emoji_scan_looks_at_the_clock_at_each_short_code(monkeypatch):
     monkeypatch.setattr(QtGui, "QFontMetrics", _SlowMetrics)
     began = time.monotonic()
     MV.emoji_fonts()
-    assert time.monotonic() - began < MV.EMOJI_SCAN_SECONDS + 0.06
+    TB.budget(time.monotonic() - began < MV.EMOJI_SCAN_SECONDS + 0.06, 'time.monotonic() - began < MV.EMOJI_SCAN_SECONDS + 0.06')
     assert MV._EMOJI_DRAWN == [frozenset()]
 
 
@@ -346,7 +347,7 @@ def _shown_table(text: str) -> int:
     view.resize(900, 700)
     view.show()
     view.render(text)
-    assert until(lambda: view._readable, 30)
+    assert until(lambda: view._readable, TB.READY_SECONDS)
     until(lambda: not view._scheduled, 30)
     tables = [frame for frame in view.browser.document().rootFrame().childFrames() if isinstance(frame, QTextTable)]
     cells = sum(table.rows() * table.columns() for table in tables)
@@ -419,10 +420,10 @@ def test_sad_a_page_is_made_with_the_collector_held(monkeypatch):
     monkeypatch.setattr(MV, "renderable", lambda *a, **k: (seen.append(held()), real(*a, **k))[1])
     view = MV.MarkdownView(None)
     view.render("# A page\n\n" + "word " * 2000)  # (made on a worker)
-    assert until(lambda: view._readable, 30)
+    assert until(lambda: view._readable, TB.READY_SECONDS)
     view.close()
     MV.in_background(lambda: seen.append(("read", held())), lambda result, error: seen.append("done"))
-    assert until(lambda: "done" in seen, 10)
+    assert TB.until_within(until, lambda: "done" in seen, 10)
     assert seen[0] is True and ("read", False) in seen and gc.get_threshold() == normal, seen
     assert MV.held_while(held) is True and gc.get_threshold() == normal and gc.isenabled()
 
@@ -690,8 +691,8 @@ def test_sad_find_while_the_rest_of_a_page_is_parsed_waits_little_for_python_s_l
 
     assert MV.WORKER_SWITCH_SECONDS <= 0.0003
     measured = S.run_case("=\n" * 300000, True, tmp_path, ("open", "find"))["find"]
-    if max(measured["gap"], measured["hold"]) >= HB.gap_budget():
-        raise HB.Frozen("Find's gap", measured, f"at most {HB.gap_budget():.3f} s")
+    TB.budget(max(measured["gap"], measured["hold"]) < HB.gap_budget(),
+              ("Find's gap", measured, f"at most {HB.gap_budget():.3f} s"), error=HB.Frozen)
 
 
 def test_sad_a_paragraph_of_kaithi_number_signs_holds_no_turn():
@@ -807,7 +808,7 @@ def test_sad_one_page_is_made_at_a_time_and_the_gui_thread_never_waits_for_it():
     second.start()
     began = time.monotonic()
     MV.held_while(lambda: order.append(("gui", "made")))
-    assert time.monotonic() - began < 0.1  # (the GUI thread: not waited)
+    TB.budget(time.monotonic() - began < 0.1, 'time.monotonic() - began < 0.1')  # (the GUI thread: not waited)
     first.join()
     second.join()
     assert order.index(("second", "begun")) > order.index(("first", "ended")), order
@@ -946,9 +947,11 @@ def test_sad_a_link_to_the_same_file_written_otherwise_jumps_on_windows(tmp_path
     viewer.close()
 
 
-def test_happy_the_heartbeat_s_budget_is_tight_and_measured_again():
+def test_happy_the_heartbeat_s_budget_is_tight_and_measured_again(monkeypatch):
     """GAP was 0.5 s: review 24's 0.30 s heading line and 0.15 s paragraphs passed every stress test. A
-    test whose window froze is run once more (the conftest's hook, Frozen) before it fails."""
+    test whose window froze is run once more (the conftest's hook, Frozen) before it fails. (The heartbeat's
+    own rules: no duration measured - its budgets strict here, under -m "not timing" too.)"""
+    monkeypatch.setattr(TB, "SOFT", False)
     assert HB.GAP <= 0.15
     with pytest.raises(HB.Frozen):
         HB.assert_responsive(HB.gap_budget() + 0.01)

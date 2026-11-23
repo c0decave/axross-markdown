@@ -586,8 +586,13 @@ def update_main(args) -> int:
     except MU.UpdateError as exc:
         print(f"{PROG[0]}: {exc}", file=sys.stderr)
         return 1
+    except (OSError, Exception) as exc:  # noqa: BLE001 - (a reset connection, a full disk: said, no traceback)
+        print(f"{PROG[0]}: the update failed: {type(exc).__name__}: {exc}"[:400], file=sys.stderr)
+        return 1
     if result.newer:
-        how = f"{PROG[0]} --update" if install.can_update else install.why_not()
+        how = f"{PROG[0]} --update" if install.can_update else (
+            f"installed with pip - to update it: {MU.pip_hint(result.release.version)}" if install.kind == "pip"
+            else install.why_not())
         print(f"{result.text} - {how}")
     else:
         print(result.text)

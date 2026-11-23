@@ -136,6 +136,11 @@ class MarkdownApp:
 
 def build(app, args: list[str]):
     """The windows for *args* (files; none: a viewer without one)."""
+    from axross_markdown._ax.core.markdown_settings import window_state_path
+    from axross_markdown._ax.ui import viewer_window
+
+    # (the window's size in the program's own state: it was written into axross's ~/.config/axross/session.json)
+    viewer_window.STATE_FILE = window_state_path()
     program = MarkdownApp()
     program.open_paths(list(args))
     app._ax_markdown = program  # noqa: SLF001 - kept with the application

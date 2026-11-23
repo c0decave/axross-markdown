@@ -335,14 +335,15 @@ PAGE_PAIRS = (
     ("text", "page_bg", 4.5), ("link", "page_bg", 4.5), ("muted", "page_bg", 4.5), ("math", "page_bg", 4.5),
     *((f"h{n}", "page_bg", 4.5) for n in range(1, 7)),
     ("code_fg", "code_bg", 4.5), ("text", "pre_bg", 4.5), ("quote_fg", "quote_bg", 4.5),
-    ("text", "th_bg", 4.5), ("text", "zebra", 4.5), ("text", "highlight_bg", 4.5),
+    ("text", "th_bg", 4.5), ("text", "zebra", 4.5),
+    ("text", "highlight_bg", 4.5),  # (a <mark>, and Find's marks: ui.markdown_viewer.find_mark_format)
     ("mark", "page_bg", 3.0), ("selection_fg", "selection_bg", 4.5), ("text", "alert_bg", 4.5),
     *((kind, "alert_bg", 3.0) for kind in ("note", "tip", "important", "warning", "caution")),
     *((kind, "page_bg", 3.0) for kind in ("note", "tip", "important", "warning", "caution")),
 )
 #: The text and links of a High Contrast theme: AAA.
 AAA_PAIRS = (("text", "page_bg", 7.0), ("link", "page_bg", 7.0), ("text", "pre_bg", 7.0),
-             ("code_fg", "code_bg", 7.0))
+             ("code_fg", "code_bg", 7.0), ("text", "highlight_bg", 7.0))  # (the last: <mark> and Find's marks)
 
 
 def contrast_report(theme: Theme) -> list[tuple[str, str, float, float]]:

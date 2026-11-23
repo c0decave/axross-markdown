@@ -143,6 +143,21 @@ def _shown_at(browser, offset: int) -> QTextCursor:
     return QTextCursor(document.findBlockByNumber(low))
 
 
+def find_mark_format(theme) -> QTextCharFormat:
+    """Find's mark in the page's theme (*theme*: a core.markdown_themes.Theme, else dark or not): the theme's
+    highlight ground under its text colour - every marked character, a link's and code's too, at the theme's
+    text contrast (core.markdown_themes.PAGE_PAIRS' text on highlight_bg). It was one yellow for every light
+    theme and one brown for every dark one, under the text's own colour: 2.8:1 in Solar Dark, 1.84:1 for
+    Retro's code."""
+    from axross_markdown._ax.ui import markdown_html as H
+
+    palette = H.colours(theme)
+    fmt = QTextCharFormat()
+    fmt.setBackground(QColor(palette["highlight_bg"]))
+    fmt.setForeground(QColor(palette["text"]))
+    return fmt
+
+
 class MarkdownViewerDialog(QDialog):
     """The Markdown file *path* of *backend*, rendered. *source_pane*: the
     pane it was opened from (Edit opens the editor of its window).
@@ -285,6 +300,7 @@ class MarkdownViewerDialog(QDialog):
         self.view = MV.MarkdownView(MV.ImageSource(self.backend, self.path), parent=self)
         self.view.browser.verticalScrollBar().valueChanged.connect(self._show_marks)  # (the marks near the view)
         self.view.shown.connect(self._page_anew)  # (Find's marks and count: the new page's)
+        self.view.returned.connect(self._marks_again)  # (... and again once its place far on is laid out)
         self.view.navigator = self
         self.view.link.connect(self.follow)
         self.view.zoom_changed.connect(lambda percent: self.zoom_reset.setText(f"{percent}%"))
@@ -634,13 +650,12 @@ class MarkdownViewerDialog(QDialog):
         document = browser.document()
         marks, count, current = [], 0, 0
         selected = browser.textCursor()
-        fmt = QTextCharFormat()
-        fmt.setBackground(QColor("#f2cc60") if not self.view.dark else QColor("#7a5b00"))  # (the page's theme)
+        fmt = find_mark_format(self.view.theme if self.view.theme is not None else self.view.dark)
         deadline, capped = time.monotonic() + FIND_TURN, False
         places = self.view.laid_matches(needle)
         if places is not None:  # (the page's text looked in, not Qt's find: it read every block of the page
             # when the needle was not there - a code block of 1,000,000 lines, 0.3 s a search)
-            for at in places:
+            for at, end in places:
                 if count >= FIND_COUNT:
                     break
                 if count % 64 == 63 and time.monotonic() > deadline:
@@ -652,7 +667,7 @@ class MarkdownViewerDialog(QDialog):
                 if len(marks) < FIND_MARKS:
                     cursor = QTextCursor(document)
                     cursor.setPosition(at)
-                    cursor.setPosition(at + len(needle), QTextCursor.MoveMode.KeepAnchor)
+                    cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
                     mark = QTextEdit.ExtraSelection()
                     mark.cursor, mark.format = cursor, fmt
                     marks.append(mark)
@@ -700,6 +715,13 @@ class MarkdownViewerDialog(QDialog):
             self._mark_matches(needle)
         else:
             self.find_count.setText("")
+
+    def _marks_again(self) -> None:
+        """(a page shown again, back at the place read far on) Find's marks and count once more: they were
+        made when its first part was shown - "no match" stayed for a word the reload brought back there."""
+        needle = self.find_field.text()
+        if needle and (getattr(self, "_marks", None) or self.find_count.text()):
+            self._mark_matches(needle)
 
     def _show_marks(self, *_args) -> None:
         """The marks of _mark_matches the view shows (and a screen above and below it) set on the page: Qt

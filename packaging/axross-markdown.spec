@@ -12,7 +12,14 @@ late), with its data (the interface languages). The Qt plugins axross's own
 binaries leave out are left out here too (axross scripts/bundle_options.py):
 platforms nobody selects (VNC - CVE-2026-79680 - eglfs, linuxfb, minimal),
 the GTK theme and glib network plugins (they need the host's newer glib) and
-the CUPS print plugin (libcups.so.2 is not bundled; Qt prints to PDF).
+the CUPS print plugin (Qt prints to PDF). On Linux the build machine's own
+libraries those plugins pulled in go with them: a system library stays only
+when something left in the program loads it (packaging/system_libraries.py:
+the DT_NEEDED closure - 0.17.2's program carried 94, libcups.so.2, libgtk-3
+and gnutls among them, 48 loaded by nothing), and each one that stays goes
+in with its package's copyright file and an index of the source packages
+(licenses/system/INDEX.txt). The build stops when libcups.so.2 is still in
+or a kept library has no licence.
 
 The licences go in too: THIRD_PARTY_LICENSES.txt (package data of
 axross_markdown, written by axross's scripts/export_standalone.py: what the
@@ -70,6 +77,16 @@ a = Analysis(  # noqa: F821
 )
 a.binaries = [b for b in a.binaries if not dropped(b[0])]
 a.datas = [d for d in a.datas if not dropped(d[0])]
+if sys.platform.startswith("linux"):
+    sys.path.insert(0, HERE)
+    import system_libraries  # noqa: E402 - packaging/system_libraries.py
+
+    a.binaries, left_out = system_libraries.pruned(a.binaries)
+    print(f"axross-markdown.spec: {len(left_out)} system libraries no kept binary loads left out:",
+          " ".join(sorted(os.path.basename(name) for name, _source, _kind in left_out)))
+    if any(os.path.basename(name).startswith("libcups.so") for name, _source, _kind in a.binaries):
+        raise SystemExit("axross-markdown.spec: libcups.so.2 is still in the program")
+    a.datas += system_libraries.notices(a.binaries, os.path.join(os.path.dirname(HERE), "build", "system-licences"))
 pyz = PYZ(a.pure)  # noqa: F821
 # UTF-8 mode: --html and --term write UTF-8 into a pipe or file on every
 # system (Windows would take its ANSI code page otherwise)

@@ -600,7 +600,9 @@ def test_happy_check_update_and_update_on_the_command_line(tmp_path, monkeypatch
     pip = MU.Install("pip", "linux")
     monkeypatch.setattr(MU, "detect_install", lambda: pip)
     assert C.main(["--check-update"]) == 0
-    assert MU.PIP_HINT in capsys.readouterr().out
+    out = capsys.readouterr().out
+    # (the release's own wheel: its versions since 0.17.0 are on GitHub only - "pip install -U" upgraded nothing)
+    assert MU.pip_hint(NEW) in out and f"/releases/download/v{NEW}/axross_markdown-{NEW}-py3-none-any.whl" in out
 
 
 def test_sad_check_update_says_why_it_failed(monkeypatch, capsys):
@@ -876,3 +878,370 @@ def test_happy_the_release_is_a_draft_with_the_files_the_updater_fetches():
     assert MU.asset_name(MU.Install("appimage", "linux"), "1.2.3") == "axross-markdown-1.2.3-x86_64.AppImage"
     uses = [line.strip() for line in text.splitlines() if "uses:" in line and "uses: ./.github/" not in line]
     assert uses and all("@" in line and len(line.split("@")[1].split()[0]) == 40 for line in uses)
+
+
+# -- the twenty-seventh review: U1 (a network error outside UpdateError), U2 (TLS in the one-file programs) --
+
+class _Breaking(io.BytesIO):
+    """A body that gives *good* bytes, then raises *error* (a reset connection, a time-out, a cut answer)."""
+
+    def __init__(self, data: bytes, error: BaseException, good: int = 100):
+        super().__init__(data[:good])
+        self.error = error
+
+    def read(self, size=-1):
+        chunk = super().read(size)
+        if not chunk:
+            raise self.error
+        return chunk
+
+
+class _BreakingGitHub(FakeGitHub):
+    """The fake GitHub whose asset host breaks off in the body of the program's download (or every answer,
+    *everything*), or whose connection fails at once (*at_once*)."""
+
+    def __init__(self, error: BaseException, *, everything: bool = False, at_once: bool = False, **kwargs):
+        super().__init__(**kwargs)
+        self.error, self.everything, self.at_once = error, everything, at_once
+        self.broken = True
+
+    def get(self, url: str) -> MU.Reply:
+        if not self.broken:
+            return super().get(url)
+        if self.at_once:
+            self.requests.append((url, threading.current_thread().name))
+            raise self.error
+        reply = super().get(url)
+        program = url in self.data and self.data[url] not in (self.data.get(MU.LATEST_URL),) \
+            and len(self.data[url]) > 1000
+        if reply.status == 200 and (self.everything or program):
+            data = self.data[url]
+            return MU.Reply(200, "", len(data), _Breaking(data, self.error))
+        return reply
+
+
+def _breakers():
+    import http.client
+
+    return [ConnectionResetError(104, "Connection reset by peer"), TimeoutError("The read operation timed out"),
+            http.client.IncompleteRead(b"x", 10), OSError(113, "No route to host")]
+
+
+@pytest.mark.parametrize("error", _breakers(), ids=lambda error: type(error).__name__)
+def test_sad_a_reset_or_a_time_out_is_an_update_error(tmp_path, error):
+    """fetch wrapped only the request: a connection reset or a time-out in the body came out as itself - the
+    worker died with no word, --update printed a traceback. Now an UpdateError that says what happened; the
+    program untouched, nothing left beside it."""
+    inst, target, old = _binary(tmp_path)
+    new = _new_file(tmp_path) + b"#" * 5000
+    github = _BreakingGitHub(error, files={f"axross-markdown-{NEW}-linux-x86_64": new})
+    with pytest.raises(MU.UpdateError) as caught:
+        MU.update(inst, CURRENT, github, test=lambda path, version: None)
+    assert "try again" in str(caught.value)
+    assert target.read_bytes() == old and _leftovers(target.parent) == []
+    with pytest.raises(MU.UpdateError):
+        MU.check(CURRENT, _BreakingGitHub(error, everything=True, version=NEW))
+    with pytest.raises(MU.UpdateError):
+        MU.check(CURRENT, _BreakingGitHub(error, at_once=True, version=NEW))
+
+
+def test_sad_a_broken_connection_never_leaves_the_controller_stuck(tmp_path):
+    """Install during a connection reset: the worker died, busy stayed True, and Help > Check for Updates did
+    nothing for the rest of the session. Now "error" is said, and a second try works."""
+    _app()
+    from axross_markdown._ax.ui import markdown_update_ui as UI
+
+    inst, target, _old = _binary(tmp_path)
+    new = _new_file(tmp_path) + b"#" * 5000
+    github = _BreakingGitHub(ConnectionResetError(104, "Connection reset by peer"),
+                             files={f"axross-markdown-{NEW}-linux-x86_64": new})
+    controller = UI.UpdateController(None, fetcher=github, install=inst, current=CURRENT,
+                                     test=lambda path, version: None)
+    said = []
+    controller.said.connect(lambda kind, text: said.append((kind, text)))
+    controller.notice = lambda kind, text, parent=None: None
+    controller.check_now()
+    assert _wait(lambda: said, 60) and said[-1][0] == "available"
+    controller.install_now()
+    assert _wait(lambda: len(said) == 2, 60), "the install said nothing"
+    assert said[-1][0] == "error" and "broke off" in said[-1][1] and not controller.busy
+    github.broken = False
+    controller.install_now()
+    assert _wait(lambda: len(said) == 3, 60) and said[-1][0] == "installed", said
+    assert target.read_bytes() == new
+
+
+def test_sad_any_failure_of_a_worker_is_said_and_frees_the_controller(tmp_path):
+    """Not only an UpdateError: a bug, a full disk - said as "error", the controller free again."""
+    _app()
+    from axross_markdown._ax.ui import markdown_update_ui as UI
+
+    class Bug:
+        def get(self, url):
+            raise RuntimeError("a bug in the fetcher")
+
+    inst, _target, _old = _binary(tmp_path)
+    controller = UI.UpdateController(None, fetcher=Bug(), install=inst, current=CURRENT)
+    said = []
+    controller.said.connect(lambda kind, text: said.append((kind, text)))
+    controller.notice = lambda kind, text, parent=None: None
+    controller.check_now()
+    assert _wait(lambda: said, 30) and said[0][0] == "error" and "a bug" in said[0][1]
+    assert not controller.busy
+
+
+@pytest.mark.parametrize("option", ["--update", "--check-update"])
+def test_sad_update_on_the_command_line_says_a_reset_without_a_traceback(tmp_path, monkeypatch, capsys, option):
+    from axross_markdown._ax.core import markdown_cli as C
+
+    inst, target, old = _binary(tmp_path)
+    new = _new_file(tmp_path) + b"#" * 5000
+    github = _BreakingGitHub(ConnectionResetError(104, "Connection reset by peer"),
+                             everything=option == "--check-update",
+                             files={f"axross-markdown-{NEW}-linux-x86_64": new})
+    monkeypatch.setattr(MU, "Web", lambda *args, **kwargs: github)
+    monkeypatch.setattr(MU, "detect_install", lambda: inst)
+    monkeypatch.setattr(C, "program_version", lambda: CURRENT)
+    assert C.main([option]) == 1
+    err = capsys.readouterr().err
+    assert "broke off" in err and "Traceback" not in err
+    assert target.read_bytes() == old
+
+
+def test_sad_an_install_folder_windows_will_not_write_is_not_writable(tmp_path, monkeypatch):
+    """On Windows os.access says Program Files may be written: the PermissionError of the download's file came
+    out as itself. Now NotWritable, the program as it is."""
+    inst, target, old = _binary(tmp_path)
+    new = _new_file(tmp_path)
+    github = FakeGitHub(files={f"axross-markdown-{NEW}-linux-x86_64": new})
+    real_open = os.open
+
+    def refusing(path, *args, **kwargs):
+        if ".part" in os.fspath(path):
+            raise PermissionError(13, "Access is denied")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(MU.os, "open", refusing)
+    with pytest.raises(MU.NotWritable):
+        MU.update(inst, CURRENT, github, test=lambda path, version: None)
+    assert target.read_bytes() == old
+
+
+def test_sad_a_download_left_by_the_same_process_is_no_file_exists_error(tmp_path):
+    """Auto mode's background download and an Install click had the same pid and version - the same file name:
+    FileExistsError. The name has a random part now."""
+    inst, target, _old = _binary(tmp_path)
+    new = _new_file(tmp_path)
+    github = FakeGitHub(files={f"axross-markdown-{NEW}-linux-x86_64": new})
+    (target.parent / f"{MU._part_prefix(target)}{NEW}-{os.getpid()}.part").write_bytes(b"another download")
+    MU.update(inst, CURRENT, github, test=lambda path, version: None)
+    assert target.read_bytes() == new
+
+
+def test_sad_auto_mode_installs_a_release_once_a_session(tmp_path):
+    """After an install the controller still compared with the old version: 24 hours later it downloaded and
+    installed the same release again (and on Linux .previous then held the new program)."""
+    _app()
+    from axross_markdown._ax.ui import markdown_update_ui as UI
+
+    MU.set_mode("auto")
+    inst, target, _old = _binary(tmp_path)
+    new = _new_file(tmp_path)
+    github = FakeGitHub(files={f"axross-markdown-{NEW}-linux-x86_64": new})
+    controller = UI.UpdateController(None, fetcher=github, install=inst, current=CURRENT,
+                                     test=lambda path, version: None)
+    said = []
+    controller.said.connect(lambda kind, text: said.append(kind))
+    controller.notice = lambda kind, text, parent=None: None
+    controller._background_check()
+    assert _wait(lambda: said, 30) and said == ["installed"]
+    asked = len(github.requests)
+    controller._background_check()
+    _wait(lambda: False, 0.2)
+    assert said == ["installed"]
+    assert all(MU.LATEST_URL == url for url, _thread in github.requests[asked:])  # (the check only)
+    assert MU.previous_of(target).read_bytes() != new
+
+
+# -- TLS: a fake GitHub over https, with a CA of its own --------------------------------------------------
+
+def _ca_and_server(folder: Path) -> tuple[Path, Path, Path]:
+    """(the CA's certificate, the server's certificate, its key) - made with openssl, for "localhost"."""
+    import shutil
+    import subprocess
+
+    if shutil.which("openssl") is None:
+        pytest.skip("no openssl to make a CA")
+    folder.mkdir(parents=True, exist_ok=True)
+    ca_key, ca, key, request, cert = (folder / name for name in ("ca.key", "ca.pem", "srv.key", "srv.csr", "srv.pem"))
+    ext = folder / "ext.cnf"
+    ext.write_text("subjectAltName=DNS:localhost,IP:127.0.0.1\nbasicConstraints=CA:FALSE\n")
+
+    def run(*args):
+        subprocess.run(["openssl", *args], check=True, capture_output=True, timeout=60)
+
+    run("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(ca_key), "-out", str(ca), "-days", "2",
+        "-subj", "/CN=axross test CA", "-addext", "basicConstraints=critical,CA:TRUE",
+        "-addext", "keyUsage=critical,keyCertSign,cRLSign")
+    run("req", "-newkey", "rsa:2048", "-nodes", "-keyout", str(key), "-out", str(request), "-subj", "/CN=localhost")
+    run("x509", "-req", "-in", str(request), "-CA", str(ca), "-CAkey", str(ca_key), "-CAcreateserial",
+        "-out", str(cert), "-days", "2", "-extfile", str(ext))
+    return ca, cert, key
+
+
+@pytest.fixture
+def https_server(tmp_path):
+    """An https server on localhost with a certificate of a CA of the test's own: (its URL, the CA's file)."""
+    import http.server
+    import ssl
+
+    ca, cert, key = _ca_and_server(tmp_path / "tls")
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 - http.server's
+            body = b'{"tag_name": "v9.9.9"}'
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(str(cert), str(key))
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"https://localhost:{server.server_address[1]}/latest", ca
+    server.shutdown()
+    server.server_close()
+
+
+def test_sad_the_updater_trusts_the_host_s_ca_bundle_when_its_openssl_finds_none(https_server, monkeypatch):
+    """The one-file programs are built on Ubuntu; their OpenSSL looks for Ubuntu's bundle - on Fedora, Arch,
+    openSUSE and macOS a default context held no CA certificate, and every check failed with
+    CERTIFICATE_VERIFY_FAILED (said only in the log). Only a program that plays sound loaded the host's
+    bundle. The updater's context now loads the host's bundle (here: the test's CA in its place) whenever the
+    default store is empty - and a store without the CA is refused, as it must be."""
+    url, ca = https_server
+    empty = lambda context: 0  # noqa: E731 - (the default store as a frozen build finds it elsewhere)
+    trusting = MU.tls_context({}, candidates=[str(ca)], count=empty, certifi_path="")
+    reply = MU.Web(5, context=trusting).get(url)
+    assert reply.status == 200 and b"v9.9.9" in reply.body.read()
+    reply.close()
+    blind = MU.tls_context({}, candidates=[], count=empty, certifi_path="")
+    with pytest.raises(MU.UpdateError) as caught:
+        MU.Web(5, context=blind).get(url)
+    assert "certificate" in str(caught.value)
+    # (the user's own SSL_CERT_FILE is the user's: left as it is)
+    own = MU.tls_context({"SSL_CERT_FILE": "/x"}, candidates=[str(ca)], count=empty, certifi_path="")
+    with pytest.raises(MU.UpdateError):
+        MU.Web(5, context=own).get(url)
+    # (the check and the update ask through it - the command line's too)
+    made = []
+    monkeypatch.setattr(MU, "tls_context", lambda *args, **kwargs: made.append(1) or trusting)
+    assert MU.Web(5).context is trusting and made
+
+
+def test_sad_every_standalone_program_loads_the_host_s_ca_bundle(monkeypatch):
+    """ui.standalone_app.prepare_process called core.tls_env.apply_ca_bundle only for a program that plays
+    sound: axross-markdown's window never did."""
+    pytest.importorskip("PyQt6.QtWidgets")
+    from axross_markdown._ax.core import i18n, tls_env
+    from axross_markdown._ax.ui import standalone_app
+
+    called = []
+    monkeypatch.setattr(tls_env, "apply_ca_bundle", lambda *args, **kwargs: called.append(1))
+    monkeypatch.setattr(i18n, "install", lambda *args, **kwargs: None)
+    standalone_app.prepare_process()
+    assert called
+
+
+# -- U3: the updater's other edges -----------------------------------------------------------------------
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_sad_a_symlink_planted_as_previous_is_never_written_through(tmp_path):
+    """shutil.copy2 wrote the old program through a symlink planted at <target>.previous."""
+    inst, target, old = _binary(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.write_bytes(b"not to be overwritten")
+    MU.previous_of(target).symlink_to(elsewhere)
+    new = _new_file(tmp_path)
+    MU.update(inst, CURRENT, FakeGitHub(files={f"axross-markdown-{NEW}-linux-x86_64": new}),
+              test=lambda path, version: None)
+    assert elsewhere.read_bytes() == b"not to be overwritten"
+    previous = MU.previous_of(target)
+    assert not previous.is_symlink() and previous.read_bytes() == old and target.read_bytes() == new
+
+
+def test_sad_windows_says_where_the_old_program_is_when_neither_rename_goes(tmp_path, monkeypatch):
+    """Both renames failing (an antivirus' lock) left only .previous and .part.exe, and a raw PermissionError."""
+    inst, target, old = _binary(tmp_path)
+    inst = MU.Install("binary", "windows", "axross-markdown", target)
+    new = _new_file(tmp_path)
+    github = FakeGitHub(files={f"axross-markdown-{NEW}-windows-x64.exe": new})
+    real = os.replace
+    calls = []
+
+    def replace(source, destination):
+        if Path(destination) == target:  # (the new one in, and the old one back: both refused)
+            calls.append(Path(source).name)
+            raise PermissionError(13, "Access is denied")
+        return real(source, destination)
+
+    monkeypatch.setattr(MU.os, "replace", replace)
+    monkeypatch.setattr(MU.time, "sleep", lambda seconds: None)
+    with pytest.raises(MU.UpdateError) as caught:
+        MU.update(inst, CURRENT, github, test=lambda path, version: None)
+    assert str(MU.previous_of(target)) in str(caught.value) and "rename it" in str(caught.value)
+    assert MU.previous_of(target).read_bytes() == old and len(calls) == 4  # (the old one tried three times)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="a POSIX shell")
+def test_sad_a_self_test_that_hangs_ends_with_all_it_started(tmp_path):
+    """The self-test's time-out killed the direct child only: a one-file program is the bootloader's child
+    and stayed alive."""
+    pids = tmp_path / "pids"
+    program = tmp_path / "hangs"
+    program.write_text(f"#!/bin/sh\nsleep 600 &\necho $! > {pids}\nwait\n")
+    program.chmod(0o755)
+    with pytest.raises(MU.SelfTestFailed):
+        MU.self_test(program, NEW, timeout=2)
+    child = int(pids.read_text())
+    for _ in range(100):
+        try:
+            os.kill(child, 0)
+        except ProcessLookupError:
+            break
+        try:  # (a zombie reaped by nobody but init: its state says it is gone)
+            if Path(f"/proc/{child}/stat").read_text().split()[2] == "Z":
+                break
+        except OSError:
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail("the self-test's grandchild is still running")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="flock")
+def test_sad_two_updates_of_one_program_never_run_at_once(tmp_path):
+    """No lock between instances: two windows, or a window and --update, installed at once - one's cleanup
+    deleted the other's download."""
+    import fcntl
+
+    inst, target, old = _binary(tmp_path)
+    lock = target.with_name(f".{target.name}.update-lock")
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        with pytest.raises(MU.UpdateError) as caught:
+            MU.update(inst, CURRENT, FakeGitHub(files={f"axross-markdown-{NEW}-linux-x86_64": _new_file(tmp_path)}),
+                      test=lambda path, version: None)
+        assert "another axross-markdown" in str(caught.value) and target.read_bytes() == old
+    finally:
+        os.close(fd)
+    MU.update(inst, CURRENT, FakeGitHub(files={f"axross-markdown-{NEW}-linux-x86_64": _new_file(tmp_path)}),
+              test=lambda path, version: None)
+    assert target.read_bytes() != old

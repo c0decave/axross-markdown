@@ -26,6 +26,7 @@ sys.path.insert(0, str(ROOT))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from axross_markdown._ax.core import markdown_themes as MT  # noqa: E402
+from tests import markdown_timing as TB  # noqa: E402
 
 _HEX = re.compile(r"#[0-9a-f]{6}")
 
@@ -444,7 +445,7 @@ def test_sad_rapid_switching_is_rate_limited_to_one_change_a_moment(qt, tmp_path
         assert seen == ["dark"]  # (the first at once; the rest within MIN_INTERVAL_MS: held)
         assert hub._timer.isActive()  # noqa: SLF001
         now[0] += TU.MIN_INTERVAL_MS / 1000
-        assert _until(lambda: len(seen) == 2, 5)
+        assert TB.until_within(_until, lambda: len(seen) == 2, 5)
         assert seen[-1] == "night-violet"  # (the latest of them, once)
         _pump(0.2)
         assert seen == ["dark", "night-violet"] and hub.theme_id() == "night-violet"

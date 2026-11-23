@@ -35,6 +35,7 @@ from PyQt6.QtWidgets import QApplication  # noqa: E402
 
 from axross_markdown._ax.core.local_fs import LocalFS  # noqa: E402
 from axross_markdown._ax.ui import markdown_view as MV  # noqa: E402
+from tests import markdown_timing as TB  # noqa: E402
 
 APP = QApplication.instance() or QApplication([])
 
@@ -184,17 +185,17 @@ def test_happy_a_file_changed_on_disk_is_shown_anew_where_it_was(site):
         viewer.view.browser.verticalScrollBar().setValue(500)
         text = (site / "other.md").read_text().replace("line 3\n", "line three\n")
         (site / "other.md").write_text(text)
-        assert wait_until(lambda: "line three" in viewer.view.browser.toPlainText(), timeout=8)
+        assert TB.until_within(wait_until, lambda: "line three" in viewer.view.browser.toPlainText(), 8)
         assert _scroll(viewer) == 500
         # (said once the page is made: "Rendering…" stays meanwhile)
-        assert wait_until(lambda: "changed on disk" in viewer.view.status.text(), timeout=8)
+        assert TB.until_within(wait_until, lambda: "changed on disk" in viewer.view.status.text(), 8)
         # An editor that writes a new file and renames it over the old one.
         (site / "new.tmp").write_text(text.replace("line three", "line THREE"))
         os.replace(site / "new.tmp", site / "other.md")
-        assert wait_until(lambda: "line THREE" in viewer.view.browser.toPlainText(), timeout=8)
+        assert TB.until_within(wait_until, lambda: "line THREE" in viewer.view.browser.toPlainText(), 8)
         (site / "new.tmp").write_text(text.replace("line three", "line 3!"))
         os.replace(site / "new.tmp", site / "other.md")
-        assert wait_until(lambda: "line 3!" in viewer.view.browser.toPlainText(), timeout=8)
+        assert TB.until_within(wait_until, lambda: "line 3!" in viewer.view.browser.toPlainText(), 8)
     finally:
         _close(viewer)
 

@@ -1,4 +1,4 @@
-axross-markdown 0.17.2: licences and source code
+axross-markdown 0.17.3: licences and source code
 ==============================================================================
 
 axross-markdown - its own code and the code of axross
@@ -39,13 +39,21 @@ Source code
 
 The complete corresponding source code of each program:
 
-* axross-markdown 0.17.2: https://github.com/c0decave/axross-markdown (git tag
-  v0.17.2) and the sdist axross_markdown-0.17.2.tar.gz on PyPI and on the
-  release page. It holds the scripts that build the programs
-  (.github/workflows/release.yml, packaging/) and the exact versions and
-  SHA-256 of everything they contain (requirements.lock.txt,
-  packaging/requirements-pyinstaller.txt).
+* axross-markdown 0.17.3: https://github.com/c0decave/axross-markdown (git tag
+  v0.17.3) and the sdist axross_markdown-0.17.3.tar.gz on the release page
+  (https://github.com/c0decave/axross-markdown/releases/tag/v0.17.3). It holds
+  the scripts that build the programs (.github/workflows/release.yml,
+  packaging/), the tests and the exact versions and SHA-256 of everything they
+  contain (requirements.lock.txt, packaging/requirements-pyinstaller.txt); the
+  release checks that it does (packaging/reproducible_sdist.py --check). (PyPI
+  has some of the versions, not this one necessarily: the release page has
+  every one.)
 * axross, the code it is written out from: https://github.com/c0decave/axross
+* the Linux programs: the libraries of the system they are built on (Ubuntu's)
+  - each named in licenses/system/INDEX.txt inside the program and in
+  SYSTEM-LIBRARIES-linux-x86_64.txt on the release page, with its package's
+  copyright file (its licence) and its source package and version (apt-get
+  source SOURCE=VERSION; https://launchpad.net/ubuntu/+source/SOURCE/VERSION)
 * PyQt6 6.11.0 (Riverbank Computing): its sdist,
   https://pypi.org/project/PyQt6/6.11.0/#files -
   https://www.riverbankcomputing.com/software/pyqt/
@@ -100,6 +108,25 @@ PyQt6_sip 13.13.0      BSD-2-Clause
 * Pillow's wheels include libjpeg-turbo, libpng, libtiff, libwebp, FreeType,
   HarfBuzz, zlib and others: their licences are part of Pillow's licence text
   below.
+* The Linux programs: the build machine's libraries in them (glibc's excepted:
+  the system's own are used) - licenses/system/INDEX.txt inside the program
+  and SYSTEM-LIBRARIES-linux-x86_64.txt on the release page list each, with
+  its package's copyright file (its licence texts, LGPL-2.1 and LGPL-3.0 among
+  them) and its source package.
+* The AppImage: its runtime is AppImage's type2-runtime (MIT,
+  https://github.com/AppImage/type2-runtime), which contains libfuse3
+  (LGPL-2.1-or-later, https://github.com/libfuse/libfuse), squashfuse
+  (BSD-2-Clause, https://github.com/vasi/squashfuse) and zstd (BSD-3-Clause,
+  https://github.com/facebook/zstd): their licence texts and sources are at
+  those places; the runtime's exact build is named by
+  packaging/fetch_appimagetool.sh.
+* The Windows programs: Microsoft's Visual C++ runtime (vcruntime140.dll,
+  msvcp140.dll, ...), redistributable under the Visual Studio licence's
+  distributable code terms
+  (https://visualstudio.microsoft.com/license-terms/), and Qt's
+  opengl32sw.dll, a build of Mesa's llvmpipe (MIT,
+  https://docs.mesa3d.org/license.html), listed with Qt's third-party code
+  above.
 
 Licence texts
 -------------

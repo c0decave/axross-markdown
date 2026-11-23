@@ -1,0 +1,10 @@
+# What the sdist holds beside the package (scripts/export_standalone.py): the one-file programs' complete
+# corresponding source - the build's scripts, its hashed locks, the tests and the licences.
+include LICENSE NOTICE THIRD_PARTY_LICENSES.txt CHANGELOG.md README.md
+include requirements.lock.txt supply-chain-gate.toml
+graft .github
+graft packaging
+graft scripts
+graft tests
+graft docs
+global-exclude __pycache__ *.py[cod]

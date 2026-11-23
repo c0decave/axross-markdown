@@ -846,20 +846,23 @@ def _html_headings(token, doc: Document, counts: dict, taken: set) -> None:
         doc.headings.append(Heading(int(event[1][1]), title, anchor))
 
 
-def parse(text: str, parser=None, notes=None, anchors=None) -> Document:
+def parse(text: str, parser=None, notes=None, anchors=None, held=None) -> Document:
     """*text* parsed (see the module docstring). *notes*: (the labels of a
     long text's footnotes in the order they are numbered - note_labels -,
     whether this is its last part): a part of it parsed with them numbered
     across the text, their list in the last part only (moved there:
     notes_to_end). *anchors*: a dict a long text's parts are parsed with one
     after another - their headings' anchors numbered across the text, as one
-    parse of all of it numbers them ("intro", "intro-1")."""
+    parse of all of it numbers them ("intro", "intro-1"). *held*: (a dict the parts are parsed with one after
+    another, whether this is the last part) - the raw HTML's blocks a part leaves open (a <details> around many
+    parts) open at the next part's start, and closed in the last part only: each part closed them at its end, and
+    their own end tag in a later part was dropped (Export HTML closed a big fold after its first part)."""
     md = parser or make_parser()
     if text.startswith("\ufeff"):  # (a BOM: no character of the text)
         text = text[1:]
     text = flatter(text, LIST_DEPTH)[0]  # (deeper lists: at LIST_DEPTH, as every view shows them)
     text = quote_flatter(text)[0]  # (deeper quotes: at QUOTE_DEPTH)
-    env: dict = {}
+    env: dict = {} if held is None else {"held_html": held}
     if notes is not None:  # (labels: (label, how often it is referred to) - the last part's ↩ that many)
         labels, last, *more = notes
         places = labels.places if isinstance(labels, NoteLabels) else {}
@@ -1343,6 +1346,9 @@ def _safe_html(state) -> None:
 
     md = state.md
     blocks = _Sanitizer(md, HTML_BLOCK)
+    held = state.env.get("held_html")
+    if held is not None:  # (a part of a long text: what the parts before it left open - parse's *held*)
+        blocks.open = list(held[0].get("open", ()))
     tokens = state.tokens
     for token in tokens:
         if token.type == "html_block":
@@ -1370,7 +1376,10 @@ def _safe_html(state) -> None:
                 end = Token("safe_html_inline", "", 0)
                 end.meta = {"html": closing}
                 token.children.append(end)
-    closing = blocks.close()
+    if held is not None and not held[1]:
+        held[0]["open"], closing = list(blocks.open), []  # (closed in a later part)
+    else:
+        closing = blocks.close()
     if closing:
         end = Token("safe_html_block", "", 0)
         end.block, end.meta = True, {"html": closing}
@@ -1397,8 +1406,9 @@ def quote_flatter(text: str, depth: int = QUOTE_DEPTH) -> tuple[str, bool]:
     item's marker too ("- >>>>…") -, whether a line was). A fenced block's
     code is never changed: inside one only the marks of the quotes it is in
     are its line's (a quote's code of ">>>>" lines stayed as written)."""
-    if ">" * (depth + 1) not in text.replace(" ", "").replace("\t", ""):
-        return text, False
+    if text.count(">") <= depth or ">" * (depth + 1) not in "".join(
+            text[at:at + LINES_AT_ONCE].replace(" ", "").replace("\t", "") for at in range(0, len(text), LINES_AT_ONCE)):
+        return text, False  # (in pieces: the spaces of 8 MB taken out at once held Python's lock 0.06 s a pass)
     out, fence, changed = [], None, False
     for line in text.split("\n"):
         if fence is not None and fence[1] == 0:  # (a fenced block in no quote: its lines as they are)

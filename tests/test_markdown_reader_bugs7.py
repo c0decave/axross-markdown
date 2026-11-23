@@ -20,6 +20,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("PyQt6.QtWidgets", reason="PyQt6 not installed")
 
 from PyQt6.QtWidgets import QApplication  # noqa: E402
+from tests import markdown_timing as TB  # noqa: E402
 
 #: The longest a helper waits for a page to be ready (it goes on as soon as it is).
 READY_SECONDS = 120
@@ -190,7 +191,7 @@ def test_sad_the_scroll_bar_dropped_beyond_what_is_laid_out_stays_and_brings_it(
     assert view.more()
     target = int(bar.maximum() * 0.6)
     bar.setValue(target)  # (the thumb dropped at 60 %)
-    end = time.monotonic() + 30
+    end = time.monotonic() + TB.READY_SECONDS
     while time.monotonic() < end and view.status.text().startswith(MV.tr("Rendering…")):
         APP.processEvents()
         time.sleep(0.005)
@@ -461,5 +462,5 @@ def test_sad_a_long_run_of_spaces_takes_qts_own_parser_no_time():
 
     began = time.monotonic()
     shown = MV.fallback_text("para\n" + " " * 40_000 + "indented on\n\nx  \ny\n")  # (indentation: kept)
-    assert time.monotonic() - began < 1.0
+    TB.budget(time.monotonic() - began < 1.0, 'time.monotonic() - began < 1.0')
     assert MV.HARD in shown  # (still a hard break at a line's end)

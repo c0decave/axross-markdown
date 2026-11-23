@@ -52,6 +52,10 @@ class UpdateController(QObject):
         #: an update was begun in this session: the old program it keeps (.previous) is not removed
         #: by this one's cleanup - it goes once the new program has run a minute
         self.updating = False
+        #: the version this session installed (it starts next time): no check finds it newer again - auto mode
+        #: installed the same release every 24 hours
+        self.installed: str | None = None
+        self._installing = threading.Lock()
         self._from_worker.connect(self._arrived)
         self.scheduler = MU.Scheduler(self._background_check, start=self.start_thread)
         self.timer = QTimer(self)
@@ -78,23 +82,48 @@ class UpdateController(QObject):
         self.start_thread(lambda: None if self.updating else (MU.cleanup_previous(target),
                                                               MU.cleanup_partials(target)))
 
+    def _newer(self, result) -> bool:
+        """Whether *result* is newer than this program - and than what this session installed already."""
+        return result.newer and (self.installed is None or MU.is_newer(result.release.version, self.installed))
+
+    def _worker(self, work, result=None):
+        """*work()* as a worker's body: whatever it raises (not only an UpdateError: a reset connection, a full
+        disk, a bug) said as "error" - the controller never left busy, Check for Updates never dead for the
+        session."""
+        def run() -> None:
+            try:
+                work()
+            except MU.UpdateError as exc:
+                self._from_worker.emit("error", str(exc), result)
+            except Exception as exc:  # noqa: BLE001 - said, never a dead worker
+                log.warning("The update failed", exc_info=True)
+                self._from_worker.emit("error", f"{type(exc).__name__}: {exc}"[:300], result)
+        return run
+
     def _background_check(self) -> None:
         """(a worker thread) the check - and in "auto", the update."""
         result = MU.check(self.current, self.fetcher)
         MU.record_check(result)
-        if not result.newer:
+        if not self._newer(result):
             return
         if MU.mode() == "auto" and self.install_info.can_update:
             self.updating = True
-            try:
-                text = MU.update(self.install_info, self.current, self.fetcher, test=self.test,
-                                 check_result=result)
-            except MU.UpdateError as exc:
-                self._from_worker.emit("error", str(exc), result)
-                return
-            self._from_worker.emit("installed", text, result)
+            self._worker(lambda: self._install(result), result)()
             return
         self._from_worker.emit("available", result.text, result)
+
+    def _install(self, result) -> None:
+        """(a worker thread) the update to *result*'s release - "installed" said."""
+        if not self._installing.acquire(blocking=False):  # (auto mode's own and an Install click: one)
+            raise MU.UpdateError("an update is under way already")
+        try:
+            if self.installed is not None and not MU.is_newer(result.release.version, self.installed):
+                raise MU.UpdateError(f"{self.installed} is installed already - it starts the next time")
+            text = MU.update(self.install_info, self.current, self.fetcher, test=self.test, check_result=result)
+            self.installed = result.release.version
+        finally:
+            self._installing.release()
+        self._from_worker.emit("installed", text, result)
 
     # -- asked for -----------------------------------------------------------------------------------
 
@@ -105,36 +134,30 @@ class UpdateController(QObject):
         self.busy, self.asked = True, True
         self.parent_window = parent
 
-        def run() -> None:
-            try:
-                result = MU.check(self.current, self.fetcher)
-                MU.record_check(result)
-            except MU.UpdateError as exc:
-                self._from_worker.emit("error", str(exc), None)
-                return
-            self._from_worker.emit("available" if result.newer else "current", result.text, result)
+        def check() -> None:
+            result = MU.check(self.current, self.fetcher)
+            MU.record_check(result)
+            self._from_worker.emit("available" if self._newer(result) else "current", result.text, result)
 
-        self.start_thread(run)
+        self._start(self._worker(check))
+
+    def _start(self, run) -> None:
+        """*run* on a worker - a thread that cannot start said as "error" too."""
+        try:
+            self.start_thread(run)
+        except Exception as exc:  # noqa: BLE001 - (no thread: said, not busy for ever)
+            log.warning("The update's thread did not start", exc_info=True)
+            self._arrived("error", str(exc) or type(exc).__name__, None)
 
     def install_now(self, parent=None) -> None:
         """Install (the notice's button): download, check, self-test and swap on a worker."""
         result = self.last_result
-        if self.busy or result is None or not result.newer:
+        if self.busy or result is None or not self._newer(result):
             return
         self.busy, self.asked = True, True
         self.parent_window = parent
-
-        def run() -> None:
-            try:
-                text = MU.update(self.install_info, self.current, self.fetcher, test=self.test,
-                                 check_result=result)
-            except MU.UpdateError as exc:
-                self._from_worker.emit("error", str(exc), result)
-                return
-            self._from_worker.emit("installed", text, result)
-
         self.updating = True
-        self.start_thread(run)
+        self._start(self._worker(lambda: self._install(result), result))
 
     def _arrived(self, kind: str, text: str, result) -> None:
         """(the GUI thread) a worker's outcome."""
@@ -185,7 +208,7 @@ class UpdateController(QObject):
             said = tr("axross-markdown {new} is available (this is {current}).").format(
                 new=result.release.version, current=result.current)
             if not self.install_info.can_update:
-                said += "\n\n" + (tr("To update it: {command}").format(command=MU.PIP_HINT)
+                said += "\n\n" + (tr("To update it: {command}").format(command=MU.pip_hint(result.release.version))
                                   if self.install_info.kind == "pip" else self.install_info.why_not())
             return said
         if kind == "current":

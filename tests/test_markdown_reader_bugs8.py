@@ -20,6 +20,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("PyQt6.QtWidgets", reason="PyQt6 not installed")
 
 from PyQt6.QtWidgets import QApplication  # noqa: E402
+from tests import markdown_timing as TB  # noqa: E402
 
 #: The longest a helper waits for a page to be ready (it goes on as soon as it is).
 READY_SECONDS = 120
@@ -89,7 +90,7 @@ def test_sad_qts_own_parser_shows_every_section_of_a_text_in_parts():
 def test_sad_a_page_laid_out_in_parts_keeps_no_stand_in(full):
     view = view_of(sections(60), full, whole=False)
     view.load_rest()
-    end = time.monotonic() + 20
+    end = time.monotonic() + TB.READY_SECONDS
     while time.monotonic() < end and view.more():
         pump(0.02)
     tall = [(block.blockNumber(), block.blockFormat().lineHeight()) for block in _blocks(view.browser.document())
@@ -164,7 +165,7 @@ def test_sad_a_paragraph_of_many_dropped_tags_takes_no_time():
     began = time.monotonic()
     MD.parse(text)
     T.render(text)
-    assert time.monotonic() - began < 2.0
+    TB.budget(time.monotonic() - began < 2.0, 'time.monotonic() - began < 2.0')
     assert "bold" in ANSI.sub("", T.render("A <script> word, then <b>bold</b>.\n", T.Options(width=80)))
 
 

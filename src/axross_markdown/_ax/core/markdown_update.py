@@ -60,12 +60,16 @@ keeps those checks off whatever the setting says. ``--check-update`` and
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import http.client
 import json
 import logging
 import os
 import platform as _platform
 import re
+import secrets
+import ssl
 import stat
 import subprocess
 import sys
@@ -128,7 +132,17 @@ MODES = ("off", "notify", "auto")
 DEFAULT_MODE = "notify"
 #: The checks' interval: once a day.
 INTERVAL = 24 * 3600
-PIP_HINT = "pip install -U axross-markdown"
+#: How a pip install is updated: the release's own wheel - the releases since 0.17.0 are on GitHub only, so
+#: "pip install -U axross-markdown" upgraded nothing (PyPI's latest was 0.16.8). pip_hint names the file.
+PIP_HINT = f"pip install --upgrade the wheel of the latest release ({RELEASES_PAGE}/latest)"
+
+
+def pip_hint(version: str | None = None) -> str:
+    """The pip command that installs *version*'s wheel from its release (else PIP_HINT)."""
+    if not version or parse_version(version) is None:
+        return PIP_HINT
+    return f"pip install --upgrade {DOWNLOAD_PREFIX}v{version}/axross_markdown-{version}-py3-none-any.whl"
+
 
 _VERSION = re.compile(r"v?([0-9]{1,6})\.([0-9]{1,6})\.([0-9]{1,6})", re.ASCII)
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}", re.ASCII)
@@ -325,12 +339,69 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None  # (urllib raises the 3xx as an HTTPError: followed by fetch, checked first)
 
 
-class Web:
-    """The real network: urllib without its redirect handling, the environment's proxies."""
+def tls_context(environ=None, *, candidates=None, count=None, certifi_path: str | None = None) -> ssl.SSLContext:
+    """The TLS context the updater asks GitHub with: the default one - and, when that holds no CA certificate
+    (a one-file program's OpenSSL, built on Ubuntu, looks for Ubuntu's bundle: on Fedora, Arch, openSUSE or
+    macOS it found none, and every check failed with CERTIFICATE_VERIFY_FAILED, said only in the log), the
+    host's own bundle (core.tls_env.HOST_CA_FILES: a CA the administrator added is trusted), else certifi's
+    when it is there. The user's SSL_CERT_FILE / SSL_CERT_DIR are the user's choice: kept as they are."""
+    environ = os.environ if environ is None else environ
+    context = ssl.create_default_context()
+    if "SSL_CERT_FILE" in environ or "SSL_CERT_DIR" in environ:
+        return context
+    loaded = (count or (lambda found: int(found.cert_store_stats().get("x509_ca", 0))))
+    if loaded(context) > 0:
+        return context
+    try:
+        from axross_markdown._ax.core.tls_env import HOST_CA_FILES
+    except ImportError:  # (an export without it)
+        HOST_CA_FILES = ("/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt",
+                         "/etc/ssl/ca-bundle.pem", "/etc/ssl/cert.pem")
+    if certifi_path is None:
+        try:
+            import certifi
 
-    def __init__(self, timeout: float = READ_TIMEOUT) -> None:
+            certifi_path = certifi.where()
+        except ImportError:
+            certifi_path = ""
+    for path in [*(HOST_CA_FILES if candidates is None else candidates), certifi_path]:
+        if not path:
+            continue
+        try:
+            if os.path.isfile(path) and os.path.getsize(path) > 0:
+                context.load_verify_locations(cafile=path)
+                log.info("updates: the CA certificates of %s", path)
+                return context
+        except (OSError, ssl.SSLError, ValueError):
+            continue
+    log.warning("updates: no CA certificates found - GitHub's answer cannot be checked")
+    return context
+
+
+def _network_error(exc: BaseException) -> UpdateError:
+    """An error of the network (a connection reset, a time-out, a cut answer) as what the user is told."""
+    if isinstance(exc, UpdateError):
+        return exc
+    if isinstance(exc, TimeoutError) or "timed out" in str(exc):
+        what = "GitHub did not answer in time"
+    elif isinstance(exc, ssl.SSLError):
+        what = f"the secure connection to GitHub failed ({getattr(exc, 'reason', None) or exc})"
+    elif isinstance(exc, http.client.HTTPException):
+        what = f"GitHub's answer broke off ({type(exc).__name__})"
+    else:
+        what = f"the connection to GitHub broke off ({getattr(exc, 'strerror', None) or exc})"
+    return UpdateError(f"{what} - try again later")
+
+
+class Web:
+    """The real network: urllib without its redirect handling, the environment's proxies, TLS checked with
+    tls_context()."""
+
+    def __init__(self, timeout: float = READ_TIMEOUT, context: ssl.SSLContext | None = None) -> None:
         self.timeout = timeout
-        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler(), _NoRedirect())
+        self.context = tls_context() if context is None else context
+        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler(), _NoRedirect(),
+                                                  urllib.request.HTTPSHandler(context=self.context))
 
     def get(self, url: str) -> Reply:
         request = urllib.request.Request(url, headers={
@@ -341,8 +412,11 @@ class Web:
             location = exc.headers.get("Location", "") if exc.headers else ""
             exc.close()
             return Reply(exc.code, location or "")
-        except (urllib.error.URLError, OSError, ValueError) as exc:
+        except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
             reason = getattr(exc, "reason", exc)
+            if isinstance(reason, ssl.SSLCertVerificationError):
+                raise UpdateError(f"cannot reach GitHub: its certificate could not be checked ({reason.verify_message}"
+                                  f") - no CA certificates on this system?") from None
             raise UpdateError(f"cannot reach GitHub: {reason}") from None
         length = response.headers.get("Content-Length")
         try:
@@ -377,7 +451,10 @@ def fetch(url: str, fetcher, max_bytes: int, *, sink=None, progress=None, cancel
     checked (check_url); more than *max_bytes*: TooLarge."""
     for _hop in range(MAX_REDIRECTS + 1):
         check_url(url)
-        reply = fetcher.get(url)
+        try:
+            reply = fetcher.get(url)
+        except (OSError, http.client.HTTPException) as exc:  # (a fetcher's own: said as the network's)
+            raise _network_error(exc) from None
         if reply.status in (301, 302, 303, 307, 308):
             reply.close()
             if not reply.location:
@@ -392,7 +469,12 @@ def fetch(url: str, fetcher, max_bytes: int, *, sink=None, progress=None, cancel
             if reply.length is not None and reply.length > max_bytes:
                 raise TooLarge(f"{url.rsplit('/', 1)[-1][:80]} is {reply.length} bytes, more than "
                                f"{max_bytes} - refused")
-            return _read(reply, max_bytes, sink, progress, cancel, url)
+            try:
+                return _read(reply, max_bytes, sink, progress, cancel, url)
+            except (OSError, http.client.HTTPException) as exc:
+                # (a connection reset, a time-out in the body: the worker died with no word, the controller
+                # stuck "busy" for the session, --update a traceback - an UpdateError, as every other failure)
+                raise _network_error(exc) from None
         finally:
             reply.close()
     raise UpdateError(f"more than {MAX_REDIRECTS} redirects - refused")
@@ -655,18 +737,31 @@ def download(release: Release, install: Install, current: str, fetcher=None, *, 
     cleanup_partials(target)
     # (Windows runs a program by its contents, but its self-test is run as an .exe - the name says so)
     suffix = ".part.exe" if install.system == "windows" else ".part"
-    temp = folder / f"{_part_prefix(target)}{release.version}-{os.getpid()}{suffix}"
-    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o700)
+    # (a random part: an Install click while auto mode's own download ran had the same name - FileExistsError)
+    temp = folder / f"{_part_prefix(target)}{release.version}-{os.getpid()}-{secrets.token_hex(4)}{suffix}"
+    try:
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o700)
+    except PermissionError:  # (Windows: os.access says Program Files may be written)
+        raise NotWritable(f"{folder} cannot be written: the program stays as it is "
+                          f"(the release: {release.page})") from None
+    except OSError as exc:
+        raise UpdateError(f"the download cannot be kept in {folder}: {exc.strerror or exc}") from None
     digest = hashlib.sha256()
     try:
         with os.fdopen(fd, "wb") as handle:
             def sink(chunk: bytes) -> None:
                 digest.update(chunk)
-                handle.write(chunk)
+                try:
+                    handle.write(chunk)
+                except OSError as exc:  # (the disk full: no network's fault)
+                    raise UpdateError(f"the download cannot be kept in {folder}: {exc.strerror or exc}") from None
 
             got = fetch(asset.url, fetcher, asset.size, sink=sink, progress=progress, cancel=cancel)
-            handle.flush()
-            os.fsync(handle.fileno())
+            try:
+                handle.flush()
+                os.fsync(handle.fileno())
+            except OSError as exc:
+                raise UpdateError(f"the download cannot be kept in {folder}: {exc.strerror or exc}") from None
         if got != asset.size:
             raise ChecksumError(f"{name}: {got} bytes came, the release says {asset.size} - refused")
         if digest.hexdigest() != expected:
@@ -687,8 +782,49 @@ def self_test_answer(version: str, program: str = PROGRAM) -> str:
     return f"{program} {version} ok"
 
 
+def _run_alone(args, *, timeout: float, **kwargs):
+    """subprocess.run of *args* in a process group of its own, all of it ended at the time-out: a one-file
+    program is its bootloader's child - killing the bootloader alone left the program running."""
+    if os.name == "nt":
+        kwargs["creationflags"] = kwargs.get("creationflags", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        kwargs["start_new_session"] = True
+    capture = kwargs.pop("capture_output", False)
+    if capture:
+        kwargs["stdout"] = kwargs["stderr"] = subprocess.PIPE
+    check = kwargs.pop("check", False)
+    with subprocess.Popen(args, **kwargs) as process:
+        try:
+            out, err = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _end_group(process)
+            process.communicate()
+            raise
+        if check and process.returncode:
+            raise subprocess.CalledProcessError(process.returncode, args, out, err)
+        return subprocess.CompletedProcess(args, process.returncode, out, err)
+
+
+def _end_group(process) -> None:
+    """*process* and every process it started (its group; on Windows its tree) ended."""
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(process.pid)], capture_output=True, timeout=30,
+                           check=False)
+        else:
+            import signal
+
+            os.killpg(process.pid, signal.SIGKILL)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        process.kill()
+    except OSError:
+        pass
+
+
 def self_test(path: Path, version: str, program: str = PROGRAM, *, timeout: float = SELF_TEST_SECONDS,
-              run=subprocess.run) -> None:
+              run=None) -> None:
     """*path* run once with ``--self-test``: it must answer :func:`self_test_answer` - else SelfTestFailed."""
     try:
         from axross_markdown._ax.core.subprocess_env import clean_child_env
@@ -698,6 +834,7 @@ def self_test(path: Path, version: str, program: str = PROGRAM, *, timeout: floa
         env = dict(os.environ)
     env[NO_CHECK_ENV] = "1"
     env.setdefault("QT_QPA_PLATFORM", "offscreen")
+    run = _run_alone if run is None else run
     try:
         done = run([str(path), "--self-test"], stdin=subprocess.DEVNULL, capture_output=True,
                    timeout=timeout, env=env, check=False)
@@ -732,10 +869,19 @@ def install(downloaded: Downloaded, inst: Install, *, test=None, after=None) -> 
         raise
     previous = previous_of(target)
     try:
-        if stat.S_ISREG(previous.lstat().st_mode):
-            os.unlink(previous)
+        mode = previous.lstat().st_mode
     except OSError:
-        pass
+        mode = None
+    if mode is not None:
+        # (a symlink planted there: the copy below wrote through it - removed, the link itself; a folder: refused)
+        if stat.S_ISREG(mode) or stat.S_ISLNK(mode):
+            try:
+                os.unlink(previous)
+            except OSError:
+                pass
+        else:
+            _unlink(path)
+            raise UpdateError(f"{previous} is in the way (no file) - the program stays as it is")
     if inst.system == "windows" or os.name == "nt":
         # (a running program may be renamed, not overwritten)
         try:
@@ -746,8 +892,16 @@ def install(downloaded: Downloaded, inst: Install, *, test=None, after=None) -> 
         try:
             os.replace(path, target)
         except OSError as exc:
-            os.replace(previous, target)
             _unlink(path)
+            for attempt in range(3):  # (an antivirus holding the file a moment: tried again)
+                try:
+                    os.replace(previous, target)
+                    break
+                except OSError:
+                    if attempt == 2:
+                        raise UpdateError(f"{target}: {exc.strerror or exc}; the program could not be put back "
+                                          f"either: it is {previous} - rename it to {target.name}") from None
+                    time.sleep(0.5)
             raise UpdateError(f"{target}: {exc.strerror or exc}; this one is kept") from None
     else:
         try:
@@ -827,9 +981,38 @@ def update(install_: Install | None = None, current: str | None = None, fetcher=
         return result.text
     if not install_.can_update:
         return f"{result.text} - {install_.why_not()}"
-    downloaded = download(result.release, install_, current, fetcher, progress=progress, cancel=cancel)
-    installed = install(downloaded, install_, test=test, after=after)
+    with _updating(install_.target):
+        downloaded = download(result.release, install_, current, fetcher, progress=progress, cancel=cancel)
+        installed = install(downloaded, install_, test=test, after=after)
     return f"{PROGRAM} {installed.version} is installed - it starts the next time"
+
+
+@contextlib.contextmanager
+def _updating(target: Path):
+    """One update of *target* at a time across processes (two windows, a window and --update): a lock file
+    beside it held while one downloads and installs - another's cleanup deleted the download, one rolled back
+    over the other's install. Held already: UpdateError."""
+    lock = Path(target).with_name(f".{Path(target).name}.update-lock")
+    try:
+        fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:  # (an unwritable folder: download() says so)
+        yield
+        return
+    try:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise UpdateError("another axross-markdown is updating it now - try again later") from None
+        yield
+    finally:
+        os.close(fd)  # (the lock goes with the descriptor; the file stays, empty)
 
 
 # -- the settings ---------------------------------------------------------------------------------
@@ -949,7 +1132,7 @@ class Scheduler:
 
 __all__ = ["ALLOWED_HOSTS", "Asset", "Cancelled", "CheckResult", "ChecksumError", "DEFAULT_MODE",
            "DowngradeRefused", "Downloaded", "HostRefused", "Install", "Installed", "MODES", "NO_CHECK_ENV",
-           "NotWritable", "PIP_HINT", "Release", "Reply", "Scheduler", "SelfTestFailed", "SignatureError",
+           "NotWritable", "PIP_HINT", "pip_hint", "Release", "Reply", "Scheduler", "SelfTestFailed", "SignatureError",
            "TRUSTED_KEYS", "TooLarge", "UpdateError", "Web", "asset_name", "check", "check_url", "checks_allowed",
            "cleanup_partials", "cleanup_previous", "detect_install", "download", "due", "fetch", "install",
            "is_newer", "last_check", "mode", "parse_release", "parse_sums", "parse_version", "record_check",

@@ -11,7 +11,15 @@ from pathlib import Path
 import pytest
 
 SRC = Path(__file__).resolve().parents[1] / "src"
-if SRC.is_dir() and str(SRC) not in sys.path:
+if os.environ.get("AXROSS_MARKDOWN_TEST_INSTALLED"):  # (the release's tests: of the wheel built, installed - not
+    import importlib.util  # this checkout's src/)
+
+    sys.path[:] = [p for p in sys.path if Path(p or ".").resolve() != SRC]
+    for _package in (init.parent.name for init in SRC.glob("*/__init__.py")):
+        _found = importlib.util.find_spec(_package)
+        if _found is None or SRC in Path(_found.origin).resolve().parents:
+            raise SystemExit(f"tests/conftest.py: {_package} is not installed - pip install the wheel first")
+elif SRC.is_dir() and str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
     os.environ["PYTHONPATH"] = os.pathsep.join(p for p in (str(SRC), os.environ.get("PYTHONPATH", "")) if p)
 _home = tempfile.mkdtemp(prefix="axross-test-home-")
@@ -54,16 +62,19 @@ def _reset_theme():
 
 
 def pytest_configure(config):
-    """The marker ``timing`` (tests/markdown_timing.py)."""
-    from tests.markdown_timing import MARKER_HELP
+    """The markers ``timing`` and ``budgets`` (tests/markdown_timing.py); under ``-m "not timing"`` (the
+    blocking job) a duration over its budget is a warning, its test's content still asserted."""
+    from tests.markdown_timing import configure
 
-    config.addinivalue_line("markers", MARKER_HELP)
+    configure(config)
 
 
 def pytest_collection_modifyitems(config, items):
     """axross's tests of its own export of the tool (test_packaging_*) need axross; the tests that pass or
-    fail by elapsed time get the marker ``timing`` (tests/markdown_timing.py): the CI runs them in a job
-    of their own that does not block (``-m timing``), the rest with ``-m "not timing"``. Locally: all."""
+    fail by elapsed time only get the marker ``timing``, those that assert their content and a duration
+    ``budgets`` (tests/markdown_timing.py): the CI runs ``-m "not timing"`` as the blocking job (a budget
+    missed a warning there) and ``-m "timing or budgets"`` strictly in a job that does not block. Locally:
+    all, strictly."""
     import pytest
 
     for item in items:

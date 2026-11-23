@@ -169,13 +169,18 @@ DEFERRED = [0]
 
 
 def assert_responsive(gap: float, label=None) -> None:
-    """*gap* (a heartbeat's longest) within gap_budget() - else the window froze, what held it aside. Not
-    while a caller measures again before it judges (DEFERRED: bugs22's within_turn)."""
+    """*gap* (a heartbeat's longest) within gap_budget() - else the window froze, what held it aside (under
+    markdown_timing.SOFT a warning: a budget). Not while a caller measures again before it judges (DEFERRED:
+    bugs22's within_turn)."""
     if DEFERRED[0]:
         return
     budget = gap_budget()
     if gap >= budget:
-        raise Frozen((label, f"the window did not answer for {gap:.3f} s (at most {budget:.3f} s)"))
+        from tests import markdown_timing as TB
+
+        # (the blocking job: a duration is a warning there - tests/markdown_timing.py's budget())
+        TB.budget(False, (label, f"the window did not answer for {gap:.3f} s (at most {budget:.3f} s)"),
+                  error=Frozen)
 
 
 def gaps_since(mark: int) -> float:

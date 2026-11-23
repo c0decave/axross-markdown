@@ -4,6 +4,90 @@ What changed in each release of axross-markdown. The code is axross's
 Markdown viewer (https://github.com/c0decave/axross), written out by axross's
 `scripts/export_standalone.py markdown`.
 
+## 0.17.3 - 2026-11-22
+
+The twenty-seventh review's findings (0.17.2 at 7/10).
+
+- **Find after an emoji.** Find looked in the page's text by Python's
+  indices (a character a place) and selected by the document's (UTF-16: an
+  emoji, a math letter or a CJK Extension-B character two places): every
+  such character before a match moved the selection and every mark one
+  place, half a surrogate pair after 200 emoji. A README titled `# 🚀 Project`
+  was enough. The two are mapped now, in both parsers, the text read in
+  parts too.
+- **Find backward** never left a match at the page's first character.
+- **Qt's own parser** (axross's built-in viewer; the window without
+  markdown-it): a heading kept its size and weight on its first piece only
+  (`# foo *bar*`: "bar" body text); `_em_` and `__strong__` were underlined,
+  not italic and bold; a link's title in `'…'` or `(…)` broke the link (its
+  address made a relative file name); `www.…&hl;` linked to
+  `[http://…](http://…)`. Each now as GFM's spec examples show them.
+- **Export HTML** closed a `<details>` larger than a piece of the text after
+  the first piece (at character 106,868 of 531,952), its later sections
+  outside the fold. The pieces carry what their raw HTML leaves open.
+- **Freezes on hostile pages:** opening an 8 MB HTML block in Qt's own
+  parser held Python's lock 0.27 s, Find in such a block 0.25 to 0.45 s
+  (both: single calls over all of the block, now a piece at a time); a link
+  to a missing anchor among 100,000 headings was a turn of 0.19 s (0.35 s in
+  Qt's own parser: every heading's anchor worked out on the GUI thread, now
+  on a worker and kept); a theme switch on a page read to its end was a turn
+  of 0.16 to 0.175 s (now 0.01 s: the new page in a fresh document). Qt's own
+  parser's code colouring is kept on that fresh document (after a zoom of a
+  big page it was lost with the old one).
+- **Find's marks** are in the page's theme: its highlight ground under its
+  text colour - 2.8:1 in Solar Dark before, now at least AA everywhere and
+  AAA in the High Contrast themes. After a reload that brings the word back
+  at a place far on, Find marks and counts it again ("no match" stayed).
+- **Settings:** a typo in `settings.json` (a trailing comma) made the next
+  choice write a file with only that choice - every other setting gone,
+  `"update_mode": "off"` with them, and the program asked GitHub again. A
+  file that is no JSON is now read for what can still be read, kept as
+  `settings.json.broken` (never over one kept before) at the next choice,
+  and written back with the new choice; the update mode "off" survives any
+  typo. A symlinked settings file (a dotfiles manager's) is written through
+  its link, the writes locked across processes. The window's size goes into
+  `~/.local/state/axross-markdown/window.json`, not into axross's own
+  `~/.config/axross/session.json`.
+- **Updates:** a connection reset, a time-out or a cut answer ended the
+  update's worker with no word - Help > Check for Updates did nothing for
+  the rest of the session, `--update` printed a traceback. Each is said now
+  and can be tried again; any failure of a worker is said. The one-file
+  programs check GitHub's certificate with the system's CA bundle when their
+  OpenSSL finds none (built on Ubuntu, they found none on Fedora, Arch,
+  openSUSE or macOS - only a program that plays sound loaded it). Auto mode
+  installs a release once (it installed it again every 24 hours); two
+  updates of one program never run at once; a planted `.previous` symlink is
+  never written through; a hung self-test ends with all it started; on
+  Windows a failed swap says where the old program is. A pip install is told
+  to install the release's wheel (`pip install -U axross-markdown` upgraded
+  nothing: the 0.17 releases are on GitHub only).
+- **Tests and the release gate:** 0.17.1's split took 175 tests out of the
+  release gate because they measured a time somewhere - security tests
+  among them (an export's safe links, a symlinked README showing `.env`'s
+  secret, an image bomb, hostile formulas) and logic on a held clock. Each
+  was looked at again: 36 tests stay in the set `timing`, whose pass or fail
+  depends on elapsed time only; 114 are split - their content asserted and
+  blocking, their durations budgets (marker `budgets`) that are a warning in
+  the blocking job (`-m "not timing"`) and strict in the non-blocking one
+  (`-m "timing or budgets"`); the rest block again as plain tests, their
+  readiness waits as long as a slow runner needs. A check fails when a test
+  of the timing set asserts anything but a duration, when its name says
+  security, safety, hostile or a secret, or when a test asserts a duration
+  outside a budget.
+- **Packaging:** the Linux program carried 94 of the build machine's
+  libraries, libcups.so.2 and libgtk-3 among them, 48 loaded by nothing it
+  keeps, none with a licence. Only those something in it loads stay now,
+  each with its package's copyright file and its source package
+  (`licenses/system/INDEX.txt` inside it, `SYSTEM-LIBRARIES-linux-x86_64.txt`
+  on the release page); the build stops when one has no licence or libcups is
+  in. The sdist holds what THIRD_PARTY_LICENSES.txt says (the workflows,
+  `packaging/`, the locks, the tests: a MANIFEST.in, checked at the release)
+  and is the same bytes for the same commit. The release tests the wheel it
+  built, not the source tree; publishes its own files only (tests.yml's
+  supply-chain report was among the assets); runs `axross-mdcat.exe
+  --self-test`. THIRD_PARTY_LICENSES.txt names the AppImage runtime's
+  libraries and the Windows runtime DLLs.
+
 ## 0.17.2 - 2026-11-22
 
 0.17.1 was not released: 9 tests of its CI's blocking set failed. Seven of

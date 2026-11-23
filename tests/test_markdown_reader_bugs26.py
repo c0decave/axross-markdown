@@ -37,6 +37,7 @@ from tests.test_markdown_reader_bugs20 import _Turns  # noqa: E402
 from tests.test_markdown_reader_bugs22 import PARSERS, _closed_after, within_turn  # noqa: E402,F401
 from tests.test_markdown_reader_bugs24 import _opened, _shown_md4c, _viewer  # noqa: E402
 from tests.test_markdown_reader_bugs25 import _rss, _sections  # noqa: E402
+from tests import markdown_timing as TB  # noqa: E402
 
 APP = QApplication.instance() or QApplication([])
 
@@ -45,7 +46,7 @@ def _quick(call, seconds: float) -> None:
     began = time.process_time()
     call()
     took = time.process_time() - began
-    assert took < seconds * HB.machine_factor(), took
+    TB.budget(took < seconds * HB.machine_factor(), took)
 
 
 def _exported(viewer, action: str, target: str, seconds: float = 3.0) -> float:
@@ -384,8 +385,8 @@ def test_sad_a_missing_anchor_is_said_at_once(full):
     assert view.more()
     began = time.monotonic()
     view.go_to_anchor("nope")  # (the texts not parsed yet read on a worker: said when it is done)
-    assert until(lambda: "#nope" in view.status.text(), 10), view.status.text()
-    assert time.monotonic() - began < 5 * HB.machine_factor()
+    assert TB.until_within(until, lambda: "#nope" in view.status.text(), 10), view.status.text()
+    TB.budget(time.monotonic() - began < 5 * HB.machine_factor(), 'time.monotonic() - began < 5 * HB.machine_factor()')
     assert view.more() and not view._whole  # (nothing laid out for it)
     for name in ("h29000", "under"):  # (a heading far on, an underlined one: found)
         view.go_to_anchor(name)
@@ -469,7 +470,7 @@ def test_sad_find_in_the_page_s_text_finds_what_qt_s_find_finds():
                 if qt.isNull():
                     break
                 cursor = qt
-    places = list(view.laid_matches("ab"))
+    places = [start for start, _end in view.laid_matches("ab")]
     found, cursor = [], document.find("ab", 0)
     while not cursor.isNull():
         found.append(cursor.selectionStart())
@@ -623,4 +624,5 @@ def test_sad_qt_s_own_parser_keeps_a_www_link_s_character_reference_as_text():
     text = "www.google.com/search?q=commonmark&hl;\n"
     assert " ".join(_shown_md4c(text).split()) == "www.google.com/search?q=commonmark&hl;"
     shown = MV.fallback_text(text)
-    assert "(<http://www.google.com/search?q=commonmark>)&hl;" in shown, shown
+    # (its address without "<…>": an autolink to a later pass, the href "[http://…](http://…)" - review 27's N4)
+    assert "(http://www.google.com/search?q=commonmark)&hl;" in shown, shown

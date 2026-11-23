@@ -54,6 +54,7 @@ from PyQt6.QtWidgets import QApplication, QProgressDialog  # noqa: E402
 
 from tests import markdown_heartbeat as HB  # noqa: E402
 from tests.test_markdown_reader_bugs11 import pump, until  # noqa: E402
+from tests import markdown_timing as TB  # noqa: E402
 
 APP = QApplication.instance() or QApplication([])
 
@@ -412,7 +413,7 @@ def test_sad_the_heartbeat_sees_a_worker_holding_the_lock_not_the_gui_s_own_work
     while worker.is_alive():
         pump(0.01)
     beat.stop()
-    assert beat.blocked > 0.1, beat.blocked
+    TB.budget(beat.blocked > 0.1, beat.blocked)
     beat = HB.Heartbeat()
     pump(0.02)
     began = time.thread_time()
@@ -420,7 +421,7 @@ def test_sad_the_heartbeat_sees_a_worker_holding_the_lock_not_the_gui_s_own_work
         sum(range(1000))
     pump(0.02)
     beat.stop()
-    assert beat.blocked < 0.1 and beat.turn > 0.25, (beat.blocked, beat.turn)
+    TB.budget(beat.blocked < 0.1 and beat.turn > 0.25, (beat.blocked, beat.turn))
 
 
 def _cases(full_sweep: bool) -> list:
@@ -450,4 +451,4 @@ def test_sad_no_text_of_the_sweep_freezes_the_window(case, tmp_path):
             fh.write(json.dumps({"case": _case_name(case), "measured": measured}) + "\n")
     longest, where = worst(measured)
     budget = HB.gap_budget()
-    assert longest < budget, (_case_name(case), where, measured[where], f"at most {budget:.3f} s")
+    TB.budget(longest < budget, (_case_name(case), where, measured[where], f"at most {budget:.3f} s"))

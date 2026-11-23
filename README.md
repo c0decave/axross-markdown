@@ -64,11 +64,11 @@ Every dependency is pinned and reviewed in `requirements.lock.txt`
 python -m pytest tests
 ```
 
-The tool's own tests from axross - 45 files, their imports renamed as the code's - and a test that the program starts and ends cleanly; Qt's offscreen platform, no display needed.
+The tool's own tests from axross - 47 files, their imports renamed as the code's - and a test that the program starts and ends cleanly; Qt's offscreen platform, no display needed.
 
-Tests that pass or fail by elapsed time - the window's heartbeat and turn budgets, waits that are the assertion, the freeze sweep, the stress grids - carry the marker `timing` (`tests/markdown_timing.py`; `tests/test_markdown_timing_marks.py` fails when a test that asserts a duration lacks it). The CI runs them in a job of their own that blocks nothing (`-m timing`, its failures as warnings: a shared runner about twice as slow fails them without a bug) and the rest with `-m "not timing"`; a release waits for the rest only.
+Tests that pass or fail by elapsed time only - the window's heartbeat and turn budgets, the freeze sweep, the stress grids - carry the marker `timing`; tests that assert what the page shows or refuses *and* a duration carry `budgets`: their content is asserted as any test's, each duration through `budget()` (`tests/markdown_timing.py`; `tests/test_markdown_timing_marks.py` fails when a test asserts a duration otherwise, or a `timing` test asserts anything but a duration - a security test never does). The CI's blocking job runs `-m "not timing"`: every content assertion blocks, a duration over its budget is a warning there. A job of its own that blocks nothing runs `-m "timing or budgets"` strictly (a shared runner about twice as slow fails a duration without a bug); a release waits for the blocking job only.
 
-**Locally nothing changes:** `python -m pytest tests` runs the whole suite, the timing tests included, at full strictness - that is the bar for every change.
+**Locally nothing changes:** `python -m pytest tests` runs the whole suite at full strictness, durations included - that is the bar for every change.
 
 ## Licence
 

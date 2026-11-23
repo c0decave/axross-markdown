@@ -76,17 +76,24 @@ jobs:
           # any test tool is in the environment)
           python -m pip install --require-hashes -r requirements.lock.txt
           python -m pip install --require-hashes -r packaging/requirements-build.txt
-          python -m build --no-isolation --outdir release/
+          # (the sdist the same bytes for the same commit: its files' times the commit's, in a fixed order -
+          # packaging/reproducible_sdist.py; the wheel is reproducible already)
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) python -m build --no-isolation --outdir release/
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) python packaging/reproducible_sdist.py release/*.tar.gz
           python -m twine check --strict release/*
+          # (the sdist holds what THIRD_PARTY_LICENSES.txt says it holds: the build's scripts and locks)
+          python packaging/reproducible_sdist.py --check release/*.tar.gz
         } 2>&1 | tee -a "$RUNNER_TEMP/job.log"
-    - name: Tests against the locked dependencies
+    - name: Tests of the built wheel against the locked dependencies
       env:
         QT_QPA_PLATFORM: offscreen
+        # (the tests import the installed wheel, not this checkout's src/: tests/conftest.py)
+        AXROSS_MARKDOWN_TEST_INSTALLED: "1"
       run: |
         set -o pipefail
         {
           # (pytest and its dependencies hashed as well: packaging/requirements-test.txt)
-          python -m pip install --no-build-isolation --no-deps .
+          python -m pip install --no-deps release/*.whl
           python -m pip install --require-hashes -r packaging/requirements-test.txt
           python -m pytest -q -rfE -m "not timing" tests  # (the timing ones: tests.yml's job timing)
         } 2>&1 | tee -a "$RUNNER_TEMP/job.log"
@@ -152,6 +159,14 @@ jobs:
             *) cp build/dist/axross-markdown "release/axross-markdown-${{ matrix.suffix }}"
                cp build/dist/axross-markdown "release/axross-markdown-${version}-${{ matrix.suffix }}" ;;
           esac
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            # (the build machine's libraries in the program: each, its package's licence, its source package -
+            # packaging/system_libraries.py - beside the binaries too)
+            { cat build/system-licences/INDEX.txt
+              for text in build/system-licences/*.copyright; do
+                printf '\n%s\n%s\n\n' "==== licenses/system/$(basename "$text")" "===="; cat "$text"
+              done; } > "release/SYSTEM-LIBRARIES-${{ matrix.suffix }}.txt"
+          fi
         } 2>&1 | tee -a "$RUNNER_TEMP/job.log"
     - name: Smoke tests (--version, --html, an SVG drawn by --svg-worker; on Linux --term and the window)
       env:
@@ -186,6 +201,9 @@ jobs:
           printf '```yaml\nname: build\nretries: 3\n```\n' > yaml.md
           if [ "${{ runner.os }}" = "Windows" ]; then
             # (the window program opens no console there: the terminal view is axross-mdcat.exe)
+            # (the updater runs a downloaded axross-mdcat.exe so before it replaces the one running)
+            got=$("release/axross-mdcat-${version}-${{ matrix.suffix }}" --self-test | tail -n 1 | tr -d '\r')
+            [ "$got" = "axross-mdcat $version ok" ] || { echo "::error::axross-mdcat.exe --self-test says '$got'"; exit 1; }
             "release/axross-mdcat-${{ matrix.suffix }}" --no-pager --color never smoke.md > mdcat.txt
             grep -q 'Smoke' mdcat.txt || { echo "::error::axross-mdcat.exe wrote no heading"; exit 1; }
             "release/axross-mdcat-${{ matrix.suffix }}" --no-pager --color truecolor yaml.md > yaml.txt
@@ -242,6 +260,9 @@ jobs:
     - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
       with:
         path: artifacts
+        # (this workflow's own: tests.yml's supply-chain report is no asset of the release)
+        pattern: "{python,binaries-*}"
+        merge-multiple: true
     - name: SHA256SUMS and the notes
       run: |
         set -o pipefail
