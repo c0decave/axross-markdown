@@ -42,10 +42,11 @@ permissions:
 jobs:
   # The supply-chain gate on requirements.lock.txt and
   # packaging/requirements-pyinstaller.txt (supply-chain-gate.toml), then the tests (tests.yml):
-  # no job below starts before both pass. The blocking tests only: those that pass
-  # or fail by elapsed time (the marker timing, tests/markdown_timing.py) run in
-  # tests.yml's job timing on every push, and block nothing - a release never
-  # waits for them.
+  # no job below starts before both pass. Not the tests' wall-clock budgets: those that pass
+  # or fail by elapsed time (the marker timing, tests/markdown_timing.py) run strictly in
+  # tests.yml's job timing on every push, and block nothing. What blocks is tests.yml's
+  # job test and its job turns: the timing tests once more, failing on a turn of the GUI
+  # thread over the gate (CPU time - the runner's load cannot lengthen it).
   ci:
     uses: ./.github/workflows/tests.yml
     with:
@@ -67,6 +68,9 @@ jobs:
       run: |
         version=$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')
         [ "v$version" = "$GITHUB_REF_NAME" ] || { echo "::error::tag $GITHUB_REF_NAME, pyproject.toml $version"; exit 1; }
+        # (... and the package's own: what --version and the updater say)
+        own=$(python3 -c 'import re, pathlib; print(re.search(r"__version__ = \"([^\"]+)\"", pathlib.Path("src/axross_markdown/__init__.py").read_text()).group(1))')
+        [ "$own" = "$version" ] || { echo "::error::pyproject.toml $version, the package $own"; exit 1; }
         grep -q "^## $version " CHANGELOG.md || { echo "::error::CHANGELOG.md has no section for $version"; exit 1; }
     - name: Qt's system libraries
       run: |
@@ -82,13 +86,18 @@ jobs:
           # any test tool is in the environment)
           python -m pip install --require-hashes --only-binary=:all: -r requirements.lock.txt
           python -m pip install --require-hashes --only-binary=:all: -r packaging/requirements-build.txt
-          # (the sdist the same bytes for the same commit: its files' times the commit's, in a fixed order -
-          # packaging/reproducible_sdist.py; the wheel is reproducible already)
+          # (the sdist and the wheel the same bytes for the same commit: their files' times the commit's, in a
+          # fixed order, modes 0644 / 0755 whatever the builder's umask - packaging/reproducible_sdist.py,
+          # packaging/reproducible_wheel.py; a fixed umask too, for what setuptools copies before that)
+          umask 022
           SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) python -m build --no-isolation --outdir release/
           SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) python packaging/reproducible_sdist.py release/*.tar.gz
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) python packaging/reproducible_wheel.py release/*.whl
           python -m twine check --strict release/*
-          # (the sdist holds what THIRD_PARTY_LICENSES.txt says it holds: the build's scripts and locks)
+          # (the sdist holds what THIRD_PARTY_LICENSES.txt says it holds: the build's scripts and locks; the
+          # wheel's files are the ones its RECORD names, written as reproducible_wheel.py writes them)
           python packaging/reproducible_sdist.py --check release/*.tar.gz
+          python packaging/reproducible_wheel.py --check release/*.whl
         } 2>&1 | tee -a "$RUNNER_TEMP/job.log"
     - name: Tests of the built wheel against the locked dependencies
       env:
@@ -286,7 +295,9 @@ jobs:
         } 2>&1 | tee -a "$RUNNER_TEMP/job.log"
     # (each asset's SHA-256 bound to this repository, this workflow and this tag: scripts/sign_release.py
     # checks it with gh attestation verify before it signs SHA256SUMS)
+    # (a tag's push only: the workflow started by hand on a tag would leave a second set of attestations)
     - name: Build provenance of every asset
+      if: github.event_name == 'push'
       uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
       with:
         subject-path: assets/*

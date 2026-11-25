@@ -268,6 +268,34 @@ def _visible_controls(text: str) -> str:
                    else c for c in text)
 
 
+def plain_mailto(url: QUrl) -> QUrl:
+    """A ``mailto:`` link as it is handed to the mail program: the address and, when it has one, the
+    subject - nothing else of it. A link's ``attach=`` put a file of the reader's in the mail, ``bcc=`` and
+    ``cc=`` added receivers, ``body=`` wrote its text: all behind a question that showed them at the end of
+    a long address at best. Any other address is left as it is."""
+    from PyQt6.QtCore import QUrlQuery
+
+    if url.scheme().lower() != "mailto":
+        return url
+    plain = QUrl()
+    plain.setScheme("mailto")
+    import unicodedata
+
+    address = url.path(QUrl.ComponentFormattingOption.FullyDecoded).split("?", 1)[0]
+    # (no line break in it: "%0D%0ABcc:" in the address is a header line to some mail programs)
+    plain.setPath("".join(c for c in address if unicodedata.category(c) not in ("Cc", "Cf", "Zl", "Zp")))
+    subject = next((value for name, value in QUrlQuery(url).queryItems(QUrl.ComponentFormattingOption.FullyDecoded)
+                    if name.lower() == "subject"), "")
+    subject = " ".join(_visible_controls(subject).split())[:SUBJECT_SHOWN]
+    if subject:
+        query = QUrlQuery()
+        query.addQueryItem("subject", bytes(QUrl.toPercentEncoding(subject)).decode("ascii"))
+        plain.setQuery(query)
+    return plain
+
+
+#: Characters of a mailto: link's subject that are passed on.
+SUBJECT_SHOWN = 200
 #: Characters of an address the question shows (a longer one is cut, its
 #: length said), and of each of its lines (a long one made the box as wide
 #: as the screen and more).

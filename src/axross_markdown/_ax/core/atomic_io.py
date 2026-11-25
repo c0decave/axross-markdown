@@ -42,6 +42,7 @@ against a crash; that is the price of keeping the file's identity.
 from __future__ import annotations
 
 import errno
+import io
 import logging
 import os
 import secrets
@@ -140,16 +141,107 @@ def _temp_sibling(backend, path: str) -> str:
 MAX_LINK_HOPS = 40
 
 
-def _link_destination(backend, link: str, target: str) -> str:
-    """The path a symlink at *link* with content *target* names. Not
-    normalised: ``..`` must be resolved after the links, by the backend."""
+def _link_destination(backend, link: str, target: str, hops: list[int] | None = None) -> str:
+    """The path a symlink at *link* with content *target* names: *target*
+    itself, or below the link's folder - its ``..`` steps taken one at a
+    time (:func:`_without_parent_steps`)."""
     sep = backend.separator() if hasattr(backend, "separator") else "/"
     if target.startswith(sep) or (sep == os.sep and os.path.isabs(target)):
-        return target
+        return _without_parent_steps(backend, target, hops)
     parent = backend.parent(link) if hasattr(backend, "parent") else os.path.dirname(link)
     if hasattr(backend, "join"):
-        return backend.join(parent, target)
-    return os.path.join(parent, target)
+        return _without_parent_steps(backend, backend.join(parent, target), hops)
+    return _without_parent_steps(backend, os.path.join(parent, target), hops)
+
+
+def _has_parent_step(path: str, sep: str) -> bool:
+    if ".." not in path:
+        return False
+    names = path.replace("\\", "/").split("/") if sep == "\\" else path.split(sep)
+    return ".." in names
+
+
+def _without_parent_steps(backend, path: str, hops: list[int] | None = None) -> str:
+    """*path* without its ``..`` components, each taken where it really
+    leads: the folder before a ``..`` is asked about first, and when it is
+    a link, the link is followed (one hop at a time, :data:`MAX_LINK_HOPS`
+    in all) before the step up - ``link/..`` is the folder above the
+    link's target, not the one the link lies in. A path without ``..`` comes
+    back as it is.
+
+    A save to ``sub/l2.md -> ../target.md`` went to ``sub/../target.md``:
+    the write of the temp file there worked, its rename and its removal
+    were refused (a rename or remove never takes a ``..``, core.backend_guard),
+    so the file could never be saved through that link and every try left
+    a temp file beside it."""
+    sep = backend.separator() if hasattr(backend, "separator") else "/"
+    if not _has_parent_step(path, sep):
+        return path
+    hops = [0] if hops is None else hops
+    if sep == "\\":
+        path = path.replace("/", sep)
+    names = path.split(sep)
+    kept, floor = _rooted(names[:1])
+    for name in names[floor:]:
+        if name in ("", "."):
+            continue
+        if name != "..":
+            kept.append(name)
+        elif len(kept) > floor and kept[-1] != "..":
+            kept, floor = _folder_itself(backend, kept, sep, hops, path)
+            if len(kept) > floor:
+                kept.pop()
+        elif not floor:
+            kept.append(name)  # (above a relative path's start: left as written, for the backend to refuse)
+        # (above the root is the root)
+    if kept == [""]:
+        return sep
+    return sep.join(kept) or "."
+
+
+def _rooted(names: list[str]) -> tuple[list[str], int]:
+    """(*names* to go on from, how many of them are the root - "" before the
+    first separator, or a drive - which no ``..`` goes above)."""
+    if names and (names[0] == "" or names[0].endswith(":")):
+        return list(names), 1
+    return [], 0
+
+
+def _folder_itself(backend, kept: list[str], sep: str, hops: list[int], path: str) -> tuple[list[str], int]:
+    """(the names of the folder *kept* names, its root's length) - the folder
+    a link there leads to, followed to its end."""
+    floor = _rooted(kept[:1])[1]
+    while len(kept) > floor:
+        folder = sep.join(kept)
+        target = _link_target(backend, folder)
+        if target is None:
+            break
+        hops[0] += 1
+        if hops[0] > MAX_LINK_HOPS:
+            raise OSError(errno.ELOOP, os.strerror(errno.ELOOP), path)
+        # (the link's own target may hold ``..`` again: taken the same way)
+        kept = _link_destination(backend, folder, target, hops).split(sep)
+        if len(kept) > 1 and kept[-1] == "":
+            kept.pop()
+        floor = _rooted(kept[:1])[1]
+        if not floor and kept[:1] == [".."]:
+            break  # (a relative link above its start: nothing more to ask about)
+    return kept, floor
+
+
+def _link_target(backend, path: str) -> str | None:
+    """What the link at *path* holds; None when *path* is no link, is not
+    there, or cannot be asked about (the step up is then taken by name)."""
+    try:
+        info = backend.stat(path)
+    except OSError:
+        return None
+    if getattr(info, "is_link", False) is not True:
+        return None
+    try:
+        return backend.readlink(path) or None
+    except (OSError, AttributeError, NotImplementedError):
+        return None
 
 
 def _is_absent(backend, path: str, exc: OSError) -> bool:
@@ -179,9 +271,11 @@ def _resolve_destination(backend, path: str) -> tuple[str, int | None] | None:
 
     Returns ``None`` for a link the backend reports but cannot read; the
     caller writes through it then instead of replacing it. A chain longer
-    than :data:`MAX_LINK_HOPS` (a loop) raises ``ELOOP``.
+    than :data:`MAX_LINK_HOPS` (a loop) raises ``ELOOP``. No ``..`` is left
+    in the path returned (:func:`_without_parent_steps`).
     """
-    current = path
+    hops = [0]
+    current = _without_parent_steps(backend, path, hops)
     for _hop in range(MAX_LINK_HOPS + 1):
         try:
             info = backend.stat(current)
@@ -206,7 +300,7 @@ def _resolve_destination(backend, path: str) -> tuple[str, int | None] | None:
             return None
         if not target:
             return None
-        current = _link_destination(backend, current, target)
+        current = _link_destination(backend, current, target, hops)
     raise OSError(errno.ELOOP, os.strerror(errno.ELOOP), path)
 
 
@@ -551,6 +645,108 @@ def _in_place_journaled(op_id: str, path: str, data: bytes, reason: str) -> None
     )
 
 
+def _refuse_parent_steps(backend, path: str) -> None:
+    """PermissionError before anything is written when *path* still holds a
+    ``..`` (one above a relative path's start, or written the Windows way
+    on a backend that splits on a backslash): the temp file could be
+    written there, but neither renamed nor removed (core.backend_guard
+    refuses both), so every try left one behind."""
+    try:
+        from axross_markdown._ax.core.backend_guard import has_parent_component
+    except ImportError:  # pragma: no cover - the guard is part of every build
+        return
+    try:
+        refused = has_parent_component(backend, path)
+    except Exception:  # noqa: BLE001 - a stand-in backend the guard cannot ask
+        refused = False
+    if refused:
+        raise PermissionError(errno.EPERM, "refusing to save to a path with '..' in it", path)
+
+
+def _sync_written(backend, f) -> None:
+    """The local temp file's bytes on the disk before it is renamed into
+    place: without it a power loss right after the rename could leave the
+    name with an empty file - the old text gone, the new one never written.
+    Only a local file has a descriptor to sync."""
+    if not _is_local(backend):
+        return
+    try:
+        f.flush()
+        os.fsync(f.fileno())
+    except (AttributeError, ValueError, io.UnsupportedOperation):
+        return  # (a writer without a descriptor: a LocalFS subclass with its own)
+    except OSError as exc:
+        if exc.errno not in (errno.EINVAL, errno.ENOTSUP, errno.EROFS):
+            raise
+        log.debug("atomic_write: this file system does not sync %s: %s", getattr(f, "name", ""), exc)
+
+
+def _sync_folder(backend, path: str) -> None:
+    """The rename itself on the disk: the folder of the local file *path*
+    synced (best effort - Windows and some file systems cannot). Only for
+    the plain local file system: a LocalFS that confines its paths (the MCP
+    server's) opens nothing by name here."""
+    if not _private_local(backend) or os.name != "posix":
+        return
+    folder = os.path.dirname(os.path.abspath(path)) or os.sep
+    try:
+        fd = os.open(folder, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0))
+    except OSError as exc:
+        log.debug("atomic_write: cannot open %s to sync it: %s", folder, exc)
+        return
+    try:
+        os.fsync(fd)
+    except OSError as exc:
+        log.debug("atomic_write: cannot sync %s: %s", folder, exc)
+    finally:
+        os.close(fd)
+
+
+def _drop_temp(backend, tmp: str, what: str = "atomic_write") -> None:
+    """The temp file *tmp* gone after a save that failed (best effort, the
+    save's own error is the one raised). A local one this module made itself
+    is unlinked by name when the backend will not remove it (a name the
+    guard refuses): it held the text and stayed beside the file."""
+    try:
+        if backend.exists(tmp):
+            backend.remove(tmp)
+        return
+    except Exception as cleanup_exc:  # noqa: BLE001
+        log.debug("%s: cleanup of %s failed: %s", what, tmp, cleanup_exc)
+    if _private_local(backend):
+        try:
+            os.unlink(tmp)
+        except OSError as cleanup_exc:
+            log.debug("%s: cleanup of %s failed: %s", what, tmp, cleanup_exc)
+
+
+def read_only_target(backend, path: str) -> bool:
+    """Whether a save to the local file *path* would replace a file marked
+    read-only (through its links: the file itself): no write bit for the
+    one who saves, in a folder that lets the file be replaced all the same -
+    the rename route gives the new file the old one's mode, so a 0444 file
+    was replaced without a word. The editor asks first. False for a file
+    that is not there, for another backend's, and when nothing can be said."""
+    if not _is_local(backend):
+        return False
+    try:
+        resolved = _resolve_destination(backend, path)
+    except OSError:
+        return False
+    if resolved is None:
+        return False
+    try:
+        st = os.stat(resolved[0])
+    except OSError:
+        return False
+    if not stat_module.S_ISREG(st.st_mode):
+        return False
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        # (root may write any file: read-only is what the mode says to everyone)
+        return not st.st_mode & 0o222
+    return not os.access(resolved[0], os.W_OK)
+
+
 def atomic_write(backend, path: str, data: bytes, *, new_mode: int | None = None) -> None:
     """Write *data* to *path* atomically.
 
@@ -591,6 +787,12 @@ def atomic_write(backend, path: str, data: bytes, *, new_mode: int | None = None
             direct = True
         else:
             path, previous_mode = resolved
+            try:
+                _refuse_parent_steps(backend, path)
+            except PermissionError as exc:
+                _finish_journal(op_id, "atomic_write", status="error", dest=path, bytes_total=len(data),
+                                error=str(exc))
+                raise
             if previous_mode is None and new_mode is not None and not backend.exists(path):
                 previous_mode = new_mode & 0o7777
             reason = _keep_identity_reason(backend, path)
@@ -645,6 +847,7 @@ def atomic_write(backend, path: str, data: bytes, *, new_mode: int | None = None
         with f:
             if owned:
                 f.write(data)
+                _sync_written(backend, f)
         if owned and _mode_left_to_set(f, written, previous_mode):
             _restore_mode(backend, tmp, previous_mode)
         _refuse_swapped_temp(tmp, written)
@@ -652,6 +855,7 @@ def atomic_write(backend, path: str, data: bytes, *, new_mode: int | None = None
         if carried:
             _finalize_temp_destination = _temp_commit()
             _finalize_temp_destination(backend, tmp, path)
+            _sync_folder(backend, path)
             log.debug("atomic_write: rename-based commit for %s", path)
             _finish_journal(
                 op_id,
@@ -666,15 +870,7 @@ def atomic_write(backend, path: str, data: bytes, *, new_mode: int | None = None
         # Best-effort cleanup — if the write didn't complete, remove the
         # temp so we don't leak. Swallow errors from the cleanup
         # itself; the original exception is re-raised below.
-        try:
-            if backend.exists(tmp):
-                backend.remove(tmp)
-        except Exception as cleanup_exc:
-            log.debug(
-                "atomic_write: cleanup of %s failed: %s",
-                tmp,
-                cleanup_exc,
-            )
+        _drop_temp(backend, tmp)
         _finish_journal(
             op_id,
             "atomic_write",
@@ -687,10 +883,7 @@ def atomic_write(backend, path: str, data: bytes, *, new_mode: int | None = None
         raise
     if not carried:
         # The rename would drop the file's group or an extended attribute.
-        try:
-            backend.remove(tmp)
-        except Exception as cleanup_exc:  # noqa: BLE001
-            log.debug("atomic_write: cleanup of %s failed: %s", tmp, cleanup_exc)
+        _drop_temp(backend, tmp)
         if not _is_local(backend):
             _write_through(backend, op_id, path, data, "its owner would not survive a rename")
             return
@@ -705,13 +898,18 @@ def atomic_write_stream(
     chunk_size: int = 1024 * 1024,
     on_chunk=None,
     new_mode: int | None = None,
+    before_commit=None,
 ) -> int:
     """Atomically stream bytes from ``reader`` into ``path``.
 
     ``reader`` must expose ``read(size)``. Returns bytes written. The
     optional ``on_chunk(bytes_done)`` callback is invoked after each
     successful chunk write. *new_mode* as in :func:`atomic_write`: the
-    mode a NEW file gets from its first byte on.
+    mode a NEW file gets from its first byte on. *before_commit(temp)*, on
+    the temp-file route only, runs once the temp file is complete and
+    before it takes the file's place: it may check the temp file and
+    prepare the place; an exception from it removes the temp file and
+    leaves the file as it was.
     """
     bytes_done = 0
     direct = _is_native_atomic(backend) or _cannot_rename(backend)
@@ -722,6 +920,7 @@ def atomic_write_stream(
             direct = True  # a link we cannot read: write through it
         else:
             path, previous_mode = resolved
+            _refuse_parent_steps(backend, path)
             if previous_mode is None and new_mode is not None and not backend.exists(path):
                 previous_mode = new_mode & 0o7777
     if direct:
@@ -763,19 +962,13 @@ def atomic_write_stream(
         _refuse_swapped_temp(tmp, written)
         if not _carry_local_attributes(backend, path, tmp):  # best effort: xattrs
             log.info("atomic_write_stream: %s loses a group or extended attribute", path)
+        if before_commit is not None:
+            before_commit(tmp)
         _finalize_temp_destination = _temp_commit()
         _finalize_temp_destination(backend, tmp, path)
         return bytes_done
     except BaseException:
-        try:
-            if backend.exists(tmp):
-                backend.remove(tmp)
-        except Exception as cleanup_exc:
-            log.debug(
-                "atomic_write_stream: cleanup of %s failed: %s",
-                tmp,
-                cleanup_exc,
-            )
+        _drop_temp(backend, tmp, "atomic_write_stream")
         raise
 
 

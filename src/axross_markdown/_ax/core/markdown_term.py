@@ -32,6 +32,7 @@ import posixpath
 import re
 import stat as _stat
 import sys
+import time
 from dataclasses import dataclass, field
 from urllib.parse import quote, unquote, urlsplit
 
@@ -54,6 +55,15 @@ IMAGES_PIXELS = 100_000_000
 #: The widest and tallest an image is drawn (columns; rows of text).
 IMAGE_COLUMNS = 80
 IMAGE_ROWS = 40
+#: Code blocks of one text that are always coloured, and the seconds the colouring of the ones after them
+#: may take in all (each block is lexed in a child process, a question and an answer a block: 60,000 small
+#: blocks took 108 s) - the blocks after that are shown plain, said once.
+CODE_BLOCKS = 500
+CODE_SECONDS = 3.0
+#: Coloured code blocks kept (the same block again - a text of one snippet 10,000 times - is not lexed again):
+#: those of at most CODE_KEPT_CHARS characters, CODE_KEPT of them.
+CODE_KEPT = 256
+CODE_KEPT_CHARS = 2000
 
 #: The colours on a dark and on a light ground (the terminal's own: "--theme auto", "dark", "light"); every
 #: theme has its own (core.markdown_themes, Options.theme).
@@ -85,6 +95,8 @@ def colour_depth(stream=None, environ=None) -> str:
     if environ.get("NO_COLOR"):
         return "none"
     forced = environ.get("FORCE_COLOR")
+    if forced is not None and forced.strip().lower() in ("", "0", "false", "no"):
+        forced = None  # (FORCE_COLOR=0 asks for none: it forced colour)
     if not forced and (not hasattr(stream, "isatty") or not stream.isatty()):
         return "none"
     term = environ.get("TERM", "")
@@ -148,7 +160,7 @@ class Style:
     italic: bool = False
     underline: bool = False
     strike: bool = False
-    dim: bool = False
+    # (no "dim": SGR 2 halves a theme's colour - muted text fell to 2:1; the muted colour mutes)
 
     def but(self, **changes) -> Style:
         values = {**self.__dict__, **changes}
@@ -169,16 +181,20 @@ class Painter:
     #: its contrast on it (core.markdown_themes.readable256)
     ground: str = ""
 
-    def _colour(self, value: str, background: bool) -> str:
+    def _colour(self, value: str, background: bool, on: str = "") -> str:
+        """The SGR codes of the colour *value* (a role's name or "#rrggbb") - *on*: the ground the text
+        stands on when it is not the page's (inline code's own: in 256 colours its text was matched
+        against the page, 3.7:1 on its own ground in Solar Light, 4.17 in Slate)."""
         if not value:
             return ""
         hex_colour = value if value.startswith("#") else self.palette.get(value, "")
+        on = on if on.startswith("#") else self.palette.get(on, "") if on else ""
         if self.depth == "truecolor" and hex_colour:
             r, g, b = _rgb(hex_colour)
             return f"{48 if background else 38};2;{r};{g};{b}"
         if self.depth == "256" and hex_colour:
-            if self.ground and not background:
-                return f"38;5;{MT.readable256(hex_colour, self.ground)}"
+            if (on or self.ground) and not background:
+                return f"38;5;{MT.readable256(hex_colour, on or self.ground)}"
             return f"{48 if background else 38};5;{_xterm256(*_rgb(hex_colour))}"
         if self.depth == "16" and not background and value in BASIC:
             return str(BASIC[value])
@@ -188,9 +204,9 @@ class Painter:
         if self.depth == "none":
             return ""
         codes = [c for c in (
-            "1" if style.bold else "", "2" if style.dim else "", "3" if style.italic else "",
+            "1" if style.bold else "", "3" if style.italic else "",
             "4" if style.underline else "", "9" if style.strike else "",
-            self._colour(style.fg, False), self._colour(style.bg, True)) if c]
+            self._colour(style.fg, False, style.bg or ""), self._colour(style.bg, True)) if c]
         return f"{ESC}[{';'.join(codes)}m" if codes else ""
 
     def reset(self) -> str:
@@ -395,11 +411,24 @@ def _math_spans(tex: str, style: Style, url: str = "") -> list:
     return spans
 
 
+#: (unseen) Unicode's tag characters (U+E0000 to U+E007F: ASCII no terminal draws - a text hidden in the page
+#: for whoever, or whatever, reads the terminal's output) and the interlinear annotation marks (U+FFF9 to
+#: U+FFFB) - but a flag's own tags (the black flag, "gbsct", the cancel tag: Scotland's).
+_UNSEEN = re.compile("(\U0001f3f4[\U000e0030-\U000e0039\U000e0061-\U000e007a]{1,6}\U000e007f)"
+                     "|[\U000e0000-\U000e007f\ufff9-\ufffb]")
+
+
+def unseen(text: str) -> str:
+    """*text* without the characters no one sees and core.markdown_doc.clean leaves (_UNSEEN): taken out, as
+    the other invisible characters are."""
+    return _UNSEEN.sub(r"\1", text) if _UNSEEN.search(text) else text
+
+
 def _plain_text(text: str) -> str:
     """Text of the file for a line of the terminal: no control character
-    (core.markdown_doc.clean), a tab as a space (a tab moves the cursor to the
-    next stop of the terminal, as wide as no one counted)."""
-    return MD.clean(text).replace("\t", " ")
+    (core.markdown_doc.clean), none no one sees (unseen: an entity's too), a tab as a space (a tab moves the
+    cursor to the next stop of the terminal, as wide as no one counted)."""
+    return unseen(MD.clean(text)).replace("\t", " ")
 
 
 def _tokens(spans: list[Span]):
@@ -674,7 +703,7 @@ _HTML_STYLES = {
     "b": {"bold": True}, "strong": {"bold": True}, "i": {"italic": True}, "em": {"italic": True},
     "u": {"underline": True}, "ins": {"underline": True}, "s": {"strike": True, "fg": "muted"},
     "strike": {"strike": True, "fg": "muted"}, "del": {"strike": True, "fg": "muted"},
-    "mark": {"fg": "h4", "bold": True}, "small": {"dim": True},
+    "mark": {"fg": "h4", "bold": True}, "small": {"fg": "muted"},
     "kbd": {"fg": "code_fg", "bg": "code_bg", "bold": True}, "code": {"fg": "code_fg", "bg": "code_bg"},
     "summary": {"bold": True}, **{f"h{n}": {"fg": f"h{n}", "bold": True} for n in range(1, 7)},
 }
@@ -822,6 +851,11 @@ class Renderer:
         #: (IMAGES_PIXELS) and what each one drew ({(path, columns): lines or why}) - of the whole text,
         #: its parts' Renderers sharing them (render_parts: each part drew 200, 6,000 images 193 MB)
         self._images = self.tables.setdefault("images", {"drawn": 0, "left": IMAGES_PIXELS, "cache": {}})
+        #: the colouring of the text's code blocks, shared likewise: how many were lexed, the seconds that
+        #: took, whether the rest is plain (said once), Pygments' formatter (made once, not a block) and
+        #: the blocks already coloured
+        self._code = self.tables.setdefault("code", {"lexed": 0, "seconds": 0.0, "said": False,
+                                                     "formatters": {}, "kept": {}})
         self.picture_cache: dict[tuple[str, int], list[str] | str] = self._images["cache"]
 
     @property
@@ -885,7 +919,7 @@ class Renderer:
                               ("text", "code_inline", "softbreak", "hardbreak")) if child.children else child.content
                 if (child.meta or {}).get("refused"):  # (file:, a data: of no image: named, never read)
                     at.spans.append(Span(f"🖼 {MD.clean(alt or '') or 'image'}", at.style.but(fg="image", bold=True)))
-                    at.spans.append(Span(" ‹address not allowed›", at.style.but(fg="muted", dim=True)))
+                    at.spans.append(Span(" ‹address not allowed›", at.style.but(fg="muted")))
                     continue
                 self._image(at, MD.clean(str(child.attrGet("src") or "")), MD.clean(alt or ""))
             elif kind == "footnote_ref":
@@ -920,15 +954,16 @@ class Renderer:
                 # it made the column as wide as it and was broken mid-word; a hyperlink needs none)
                 if not (url and self.p.hyperlinks and self.p.depth != "none"):
                     notes.append(href)
-                    at.spans.append(Span(f"[{len(notes)}]", at.style.but(fg="muted", dim=True)))
+                    # ("L": a link's - a footnote's number is "[1]" too, and both stood on one page)
+                    at.spans.append(Span(f"[L{len(notes)}]", at.style.but(fg="muted")))
                 return
-            at.spans.append(Span(f" ‹{href}›", at.style.but(fg="muted", dim=True)))
+            at.spans.append(Span(f" ‹{href}›", at.style.but(fg="muted")))
 
     def _table_notes(self, prefix: str) -> None:
         """The addresses of a table's links (_close_link), under it."""
         notes, self._cell_notes = getattr(self, "_cell_notes", None) or [], None
         for number, href in enumerate(notes, 1):
-            self.emit(prefix + self.p.paint(f"[{number}] {href}", Style(fg="muted", dim=True)))
+            self.emit(prefix + self.p.paint(f"[L{number}] {href}", Style(fg="muted")))
 
     def _image(self, at: _Inline, src: str, alt: str) -> None:
         if src[:5].lower() == "data:":  # (held in the document: drawn, its payload never printed)
@@ -936,7 +971,7 @@ class Renderer:
             at.pictures.append(Picture("data:", alt, "", why, data))
             at.spans.append(Span(f"🖼 {alt or 'image'}", at.style.but(fg="image", bold=True)))
             if why:
-                at.spans.append(Span(f" ‹data: image – {why}›", at.style.but(fg="muted", dim=True)))
+                at.spans.append(Span(f" ‹data: image – {why}›", at.style.but(fg="muted")))
             return
         path, why = locate(src, self.o.folder)
         at.pictures.append(Picture(src, alt, path, why))
@@ -948,7 +983,7 @@ class Renderer:
         target = self._link_target(src) if path else src if remote and safe_url(src) else ""
         at.spans.append(Span(label, at.style.but(fg="image", bold=True), at.url or target))
         if why and not remote:
-            at.spans.append(Span(f" ‹{src} – {why}›", at.style.but(fg="muted", dim=True)))
+            at.spans.append(Span(f" ‹{src} – {why}›", at.style.but(fg="muted")))
 
     def _html_event(self, at: _Inline, event: tuple) -> None:
         """An event of raw HTML's allowed subset (core.markdown_doc) in a
@@ -1050,7 +1085,7 @@ class Renderer:
             if self.drawn >= IMAGES:  # (each drawing counts: one image named 10,000 times wrote 30 MB)
                 if self.drawn == IMAGES:
                     self.emit(prefix + self.p.paint(f"  (more than {IMAGES} images: the rest are not drawn)",
-                                                    Style(fg="muted", dim=True)))
+                                                    Style(fg="muted")))
                     self.drawn += 1
                 continue
             self.drawn += 1
@@ -1060,7 +1095,7 @@ class Renderer:
                 drawn = self._draw(picture.path, columns, picture.data)
                 self.picture_cache[key] = drawn
             if isinstance(drawn, str):  # (wrapped: a long name went past the width)
-                self.para([Span(f"({picture.src}: {drawn})", Style(fg="muted", dim=True))],
+                self.para([Span(f"({picture.src}: {drawn})", Style(fg="muted"))],
                           prefix + "  ", prefix + "  ", width)
                 continue
             for line in drawn:
@@ -1093,7 +1128,7 @@ class Renderer:
         return "\n".join(self.lines) + "\n"
 
     def front_matter(self, text: str) -> None:
-        style = Style(fg="muted", dim=True)
+        style = Style(fg="muted")
         self.emit(self.p.paint("┄┄┄ front matter ┄┄┄", style))
         for line in MD.clean(text).expandtabs(TAB).splitlines():
             for piece in _chop(line, self.o.width):  # (a long YAML value went past the width)
@@ -1321,7 +1356,9 @@ class Renderer:
 
     @staticmethod
     def heading_style(level: int) -> Style:
-        return Style(fg=f"h{level}", bold=True, underline=level >= 4)
+        """A heading's look: bold in its level's colour, the small ones (5, 6) in italics too. No underline:
+        that is a link's (h4 to h6 were underlined, and read as links)."""
+        return Style(fg=f"h{level}", bold=True, italic=level >= 5)
 
     def heading_lines(self, level: int, spans, pictures, prefix: str, width: int) -> None:
         """A heading of *level* (Markdown's or raw HTML's): its mark, its
@@ -1347,6 +1384,13 @@ class Renderer:
         text = MD.clean(token.content).expandtabs(TAB).rstrip("\n")
         gutter = self.p.paint("▏", Style(fg="border"))
         room = max(8, width - MD.cell_width(_strip_ansi(rest)) - 2)
+        if not self._code["said"] and self._colours_code(text, lang) and self._code_budget_spent():
+            self._code["said"] = True  # (said where the colours end, once)
+            self.emit(first + self.p.paint(f"(colouring {self._code['lexed']} code blocks took more than "
+                                           f"{CODE_SECONDS:g} s: the rest are shown plain)",
+                                           Style(fg="muted", italic=True)))
+            self.emit(rest.rstrip())
+            first = rest
         if lang:
             if lang.lower() in DIAGRAMS:  # (drawn by GitHub; here its source, said so)
                 lang = f"{lang} – diagram, shown as its source"
@@ -1390,34 +1434,70 @@ class Renderer:
                 first = rest
         self.blank()
 
+    def _colours_code(self, text: str, lang: str) -> bool:
+        """Whether a code block of *text* in *lang* is coloured at all (colours on, a language named, not
+        too long)."""
+        return self.p.depth != "none" and bool(lang) and len(text) < 200_000
+
+    def _code_budget_spent(self) -> bool:
+        """Whether the text's code blocks are plain from here on: more than CODE_BLOCKS were lexed and
+        that took CODE_SECONDS."""
+        return self._code["lexed"] >= CODE_BLOCKS and self._code["seconds"] >= CODE_SECONDS
+
+    def _formatter(self):
+        """(Pygments' formatter for the colours of this terminal and theme, the style's name for the
+        lexing child) - made once a text: making one a block was half of a text of small blocks' time."""
+        key = (self.p.depth, self.o.theme, self.o.dark)
+        made = self._code["formatters"].get(key)
+        if made is None:
+            from pygments.formatters import (
+                Terminal256Formatter,
+                TerminalFormatter,
+                TerminalTrueColorFormatter,
+            )
+
+            theme = MT.get(self.o.theme) if self.o.theme else None
+            style = MT.pygments_style(theme) if theme is not None else \
+                "github-dark" if self.o.dark else "default"
+            if self.p.depth == "truecolor":
+                formatter = TerminalTrueColorFormatter(style=style)
+            elif self.p.depth == "256":
+                formatter = Terminal256Formatter(style=style)
+            else:
+                formatter = TerminalFormatter(bg="dark" if (theme or self.o.dark) else "light")
+            made = self._code["formatters"][key] = (
+                formatter, style if isinstance(style, str) and self.p.depth in ("truecolor", "256") else "default")
+        return made
+
     def _highlight(self, text: str, lang: str) -> list[str]:
         """The lines of *text*, coloured by Pygments for *lang* (when it knows
-        it and colours are on)."""
-        if self.p.depth != "none" and lang and len(text) < 200_000:
+        it and colours are on, and the text's code blocks have not taken their time: _code_budget_spent)."""
+        if self._colours_code(text, lang):
+            key = (lang, text, self.p.depth, self.o.theme, self.o.dark) if len(text) <= CODE_KEPT_CHARS else None
+            kept = self._code["kept"].get(key) if key is not None else None
+            if kept is not None:
+                return list(kept)
+            if self._code_budget_spent():
+                return [self.p.paint(line, Style(fg="text")) for line in text.split("\n")]
             try:
                 from pygments import format as formatted
-                from pygments.formatters import (
-                    Terminal256Formatter,
-                    TerminalFormatter,
-                    TerminalTrueColorFormatter,
-                )
 
-                theme = MT.get(self.o.theme) if self.o.theme else None
-                style = MT.pygments_style(theme) if theme is not None else \
-                    "github-dark" if self.o.dark else "default"
+                formatter, style = self._formatter()
                 # (lexed in a child: a lexer's pattern stuck in backtracking held the terminal for ever -
                 # too slow, the block plain: core.markdown_doc.code_tokens)
-                tokens = MD.code_tokens(text if text.endswith("\n") else text + "\n", lang,
-                                        style if isinstance(style, str) and self.p.depth in ("truecolor", "256")
-                                        else "default")
+                began = time.monotonic()
+                try:
+                    tokens = MD.code_tokens(text if text.endswith("\n") else text + "\n", lang, style)
+                finally:
+                    self._code["lexed"] += 1
+                    self._code["seconds"] += time.monotonic() - began
                 if tokens is not None:
-                    if self.p.depth == "truecolor":
-                        formatter = TerminalTrueColorFormatter(style=style)
-                    elif self.p.depth == "256":
-                        formatter = Terminal256Formatter(style=style)
-                    else:
-                        formatter = TerminalFormatter(bg="dark" if (theme or self.o.dark) else "light")
-                    return formatted(tokens, formatter).rstrip("\n").split("\n")
+                    lines = formatted(tokens, formatter).rstrip("\n").split("\n")
+                    if key is not None:
+                        if len(self._code["kept"]) >= CODE_KEPT:
+                            self._code["kept"].clear()
+                        self._code["kept"][key] = lines
+                    return list(lines)
             except ImportError:
                 pass
             except Exception:  # noqa: BLE001 - a style missing in an old Pygments: plain
@@ -1720,18 +1800,35 @@ STREAM_ROWS = 4 * STREAM_LINES
 LONG_PARAGRAPH = 2000
 _PLAIN_ROW = re.compile(r"(?![#>=`$<\[]|[-+*_](?:[ \t]|[-+*_ \t]*\Z)|\d{1,9}[.)](?:[ \t]|\Z)|[:~][ \t])"
                         r"[^\s|$`<][^|$`<]*\Z")
+#: ... and one that begins with "[" when its brackets and parentheses close on it and it is no definition
+#: (_closed_links_row): 500,000 lines of a link each were one paragraph, one part - 40 s before the page
+#: showed anything.
+_PLAIN_LINK_ROW = re.compile(r"\[[^|$`<]*\Z")
 #: A paragraph's line longer than this is broken at its spaces into lines of about half of it.
 LONG_LINE = STREAM_PART_CHARS
+#: Marks of emphasis ("*", "_", "~") a piece of a broken line holds at most: markdown-it pairs them in time
+#: growing faster than their number - a line of 4.1 MB with one in two characters a mark was 36 s before
+#: its first part showed, each part of 100,000 characters 50,000 marks. A piece that dense is a part of
+#: its own (_long_lines_broken's second set).
+LINE_MARKS = 4000
 
 
 def _long_lines_broken(rows: list[str]) -> tuple[list[str], frozenset]:
+    """(see _long_lines_parted) the rows and the numbers of the lines a part may begin with."""
+    out, broken, _dense = _long_lines_parted(rows)
+    return out, broken
+
+
+def _long_lines_parted(rows: list[str]) -> tuple[list[str], frozenset, frozenset]:
     """*rows* with each paragraph's line longer than LONG_LINE - one of markup (links, emphasis, code:
     more than one character in a hundred), slow to parse - broken into lines at spaces (a line end in
     a paragraph reads as the space it was), and the numbers of the lines a part may begin with: a line of
-    700 KB was one part, parsed whole before anything showed (12 s). Never in code, a table, a heading."""
+    700 KB was one part, parsed whole before anything showed (12 s). Never in code, a table, a heading.
+    Third: the lines of those that begin a piece dense with emphasis (LINE_MARKS) - a part begins at each."""
     if not any(len(row) > LONG_LINE for row in rows):
-        return rows, frozenset()
+        return rows, frozenset(), frozenset()
     out, broken, fence = [], set(), None
+    dense: set = set()
     for row in rows:
         opened = _FENCE.match(row)
         if fence is not None:
@@ -1743,30 +1840,48 @@ def _long_lines_broken(rows: list[str]) -> tuple[list[str], frozenset]:
             fence = opened.group(1)
             out.append(row)
             continue
+        # ("&": a character reference - 400,000 of them on one line were one part, 18 s)
         if len(row) <= LONG_LINE or row[:1] in " \t>|#" or "|" in row[:200] or _REFERENCE.match(row) \
-                or sum(row.count(mark) for mark in "[*_`<$") * 100 < len(row):
+                or sum(row.count(mark) for mark in "[*_`<$&") * 100 < len(row):
             # (a line of words is parsed fast and laid out a line at a time: as it is - its wrapping too)
             out.append(row)
             continue
         at, step = 0, LONG_LINE // 2
+        marks = sum(row.count(mark) for mark in "*_~")
+        if marks * step > LINE_MARKS * len(row):  # (dense with emphasis: pieces of LINE_MARKS marks each)
+            step = max(2000, LINE_MARKS * len(row) // marks)
+            dense.add(len(out))
+        heavy = len(out) in dense
         while at < len(row):
             cut = row.find(" ", at + step) if at + step < len(row) else -1
             piece = row[at:] if cut < 0 else row[at:cut]
             if at:
                 piece = piece.lstrip(" ")
-                if piece[:1] in "#>-+*=|0123456789:~`" or not piece:  # (no block may begin there)
+                # (no block may begin there - "**bold" begins none: a line of such words was put together
+                # again, one part of 4 MB)
+                if not piece or piece[:1] in "#>-+*=|0123456789:~`" and not (
+                        piece[:1] == "*" and piece[1:2] not in ("", " ", "\t") and piece.strip("*-_ \t")):
                     out[-1] += " " + piece
                     at = len(row) if cut < 0 else cut + 1
                     continue
                 broken.add(len(out))
+                if heavy:
+                    dense.add(len(out))
             out.append(piece)
             at = len(row) if cut < 0 else cut + 1
-    return out, frozenset(broken)
+    return out, frozenset(broken), frozenset(dense)
 
 
 _PLAIN_TICKS_ROW = re.compile(r"(?![#>=$<\[]|`{3}|[-+*_](?:[ \t]|[-+*_ \t]*\Z)|\d{1,9}[.)](?:[ \t]|\Z)|[:~][ \t])"
                               r"[^\s|$<][^|$<]*\Z")
 _TICKS = re.compile(r"`+")
+
+
+def _closed_links_row(row: str) -> bool:
+    """A paragraph's line that begins with "[" and is text all the same: no definition, its brackets and
+    parentheses closed on it (a link's text or address going on in the next line is not)."""
+    return row[:1] == "[" and row[:2] != "[^" and _PLAIN_LINK_ROW.match(row) is not None \
+        and not _REFERENCE.match(row) and row.count("[") == row.count("]") and row.count("(") == row.count(")")
 
 
 def _closed_spans_row(row: str) -> bool:
@@ -1887,6 +2002,16 @@ def text_parts_at(text: str, lines: int | None = None) -> list[tuple[str, int | 
     return [(part, first) for part, _apart, first in _text_parts(text, lines)]
 
 
+_FENCE_END = re.compile(r"(?:\A|\n) {0,3}(`{3,}|~{3,})[ \t]*\n*\Z")
+
+
+def begins_after_code(before: str, part: str) -> bool:
+    """Whether *part* (of text_parts_at) begins with a fenced code block and the part *before* it ends with
+    one: the line between two code blocks (the page's "code gap") is no part's own - whoever makes the
+    page from the parts puts it there."""
+    return bool(_FENCE.match(part)) and _FENCE_END.search(before[-400:]) is not None
+
+
 def notes_of(text: str) -> list[str] | None:
     """The labels of *text*'s footnotes in the order they are numbered - a
     part of it is parsed with them (MD.parse's *notes*) - or None: none."""
@@ -1922,7 +2047,7 @@ def _column_widths(rows: list[str], columns: int) -> list[int]:
                                   else row.strip().lstrip("|"))
         for column, cell in enumerate(cells[:columns]):
             cell = cell.strip()
-            size = MD.cell_width(_CELL_LINK.sub(lambda m: m.group(1) + "[000]", cell)) if cell else 0
+            size = MD.cell_width(_CELL_LINK.sub(lambda m: m.group(1) + "[L000]", cell)) if cell else 0
             if size > widths[column]:
                 widths[column] = size
     return widths
@@ -2004,8 +2129,9 @@ def _text_parts(text: str, lines: int | None = None) -> list[tuple[str, bool, in
     if plan is not None:  # (the notes' definitions: a part of their own, the last - never cut)
         text, notes, _labels, noted = plan
     rows = text.split("\n")
-    rows, broken = (rows, frozenset()) if plan is not None else _long_lines_broken(rows)
+    rows, broken, dense = (rows, frozenset(), frozenset()) if plan is not None else _long_lines_parted(rows)
     cuts, fence, since, ordinal, plain, size = [0], None, 0, None, 0, 0
+    code = code_size = 0  # (the lines and characters of code since the last cut)
     # (a footnote's definition no link's: all again in the last part - note_plan)
     definitions = [row for row in rows if _REFERENCE.match(row) and not row.lstrip().startswith("[^")]
     for number, row in enumerate(rows):
@@ -2013,20 +2139,33 @@ def _text_parts(text: str, lines: int | None = None) -> list[tuple[str, bool, in
         if fence is not None:
             if opened and opened.group(1)[0] == fence[0] and len(opened.group(1)) >= len(fence):
                 fence = None
+            code += 1  # (code is counted apart, for a part that may begin with a code block only: the cuts
+            code_size += len(row) + 1  # between other blocks fall where they fell)
             continue
         if opened:
+            # (a part may begin with a code block of the top level, after an empty line, once the lines
+            # since the last cut - code's too - are a part's: 60,000 small code blocks, an empty line between
+            # them, were never cut - one part of 1.9 MB, 90 s before the page showed anything)
+            if (since + code >= lines or size + code_size >= STREAM_PART_CHARS) and number \
+                    and row[:1] == opened.group(1)[0] and not rows[number - 1].strip() and number not in noted \
+                    and code:
+                cuts.append(number)
+                since = size = code = code_size = 0
+                ordinal = None
             fence = opened.group(1)
             plain = 0
+            code += 1
+            code_size += len(row) + 1
             continue
         since += 1
         size += len(row) + 1
-        plain = plain + 1 if _PLAIN_ROW.match(row) or _closed_spans_row(row) else 0
+        plain = plain + 1 if _PLAIN_ROW.match(row) or _closed_spans_row(row) or _closed_links_row(row) else 0
         numbered = _NUMBERED_ITEM.match(row)
         if numbered:  # (a top-level ordered list's item: the number it is shown with)
             ordinal = int(numbered.group(1)) if ordinal is None else ordinal + 1
         elif row.strip() and row[:1] not in " \t":
             ordinal = None  # (the list has ended)
-        if (since >= lines or size >= STREAM_PART_CHARS) and number and row.strip() \
+        if (since >= lines or size >= STREAM_PART_CHARS or number in dense) and number and row.strip() \
                 and (row[:1] not in " \t>|" or GOES_ON in row[:2]
                      or (row[:1] == "|" and not rows[number - 1].strip() and number + 1 < len(rows)
                          and _TABLE_DELIMITER.match(rows[number + 1]))) \
@@ -2037,7 +2176,7 @@ def _text_parts(text: str, lines: int | None = None) -> list[tuple[str, bool, in
                      or number in broken) \
                 and number not in noted:  # (... and between definitions)
             cuts.append(number)
-            since = size = 0
+            since = size = code = code_size = 0
             if numbered and ordinal is not None:  # (a part beginning in a list: numbered on - "1997." then "1.")
                 rows[number] = f"{ordinal}{row[numbered.end(1):]}"
     cuts.append(len(rows))
@@ -2077,6 +2216,7 @@ def render_parts(text: str, options: Options | None = None):
     """*text* for the terminal in parts, as they are rendered (see
     text_parts): the first is there at once."""
     options = options or Options()
+    text = unseen(text)  # (tag characters, annotation marks: in no line, code or link of the page)
     text, flattened = MD.flatter(text, LIST_DEPTH)
     text, shallower = MD.quote_flatter(text)
     tables: dict = {"natural": []}  # (a table drawn in parts: its columns - Renderer.draw_table)

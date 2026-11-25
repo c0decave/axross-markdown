@@ -316,6 +316,50 @@ def _linear_inline_rules(md) -> None:
         md.inline.ruler.at("linkify", linkify)
 
 
+#: Marks of emphasis and strike-through ("*", "_", "~") one line (a paragraph, a cell) is read with at most: the
+#: marks after them are text, as written. markdown-it makes a token of every one before it pairs them - a
+#: paragraph of 4 MB of them held 1.5 GB and took 36 s; LINE_SPANS shows 300 spans of a line anyway.
+LINE_MARKS = 20_000
+_MARK_RUNS = {"emphasis": re.compile(r"\*+|_+"), "strikethrough": re.compile("~+"), "tilde_run": re.compile("~+"),
+              "single_tilde": re.compile("~+")}
+
+
+def _fewer_marks(md) -> None:
+    """The inline rules of emphasis and strike-through, each line's first LINE_MARKS marks only: a run that
+    goes past them is text (one piece of the pending text, no token a mark)."""
+    rules = {rule.name: rule.fn for rule in md.inline.ruler.__rules__}
+
+    def bounded(original, run: re.Pattern):
+        def rule(state, silent: bool) -> bool:
+            if silent:
+                return original(state, silent)
+            found = run.match(state.src, state.pos, state.posMax)
+            if found is None:
+                return False
+            made = state.__dict__.get("_ax_marks", 0)
+            if made + len(found.group()) <= LINE_MARKS:
+                before = len(state.tokens)
+                ok = original(state, silent)
+                if ok:  # (a rule that reads on inside its marks - "~x~" - counted them itself: read again)
+                    state.__dict__["_ax_marks"] = state.__dict__.get("_ax_marks", 0) + max(1, len(state.tokens) - before)
+                return ok
+            state.__dict__["_ax_marks"] = LINE_MARKS
+            if hasattr(state, "append_pending"):  # (markdown-it-py 4.3: no copy of the pending text a piece)
+                state.append_pending(found.group())
+            else:
+                state.pending += found.group()
+            state.pos = found.end()
+            return True
+
+        rule._ax_bounded = True
+        return rule
+
+    for name, run in _MARK_RUNS.items():
+        original = rules.get(name)
+        if original is not None and not getattr(original, "_ax_bounded", False):
+            md.inline.ruler.at(name, bounded(original, run))
+
+
 def _linkify_in_pieces(md) -> None:
     """linkify-it-py's searches a piece of a long text at a time: its rule
     pretested all of an inline's text and matched all of a text token in one
@@ -506,6 +550,7 @@ def make_parser():
     # closes only after one, not before a digit - "tickets are $5 and $10" stays text.
     md.use(dollarmath_plugin, allow_space=False, allow_digits=False, double_inline=True,
            allow_blank_lines=False)
+    _code_before_math(md)
     md.inline.ruler.before("strikethrough", "tilde_run", _tilde_run)
     md.inline.ruler.before("strikethrough", "single_tilde", _single_tilde)
     shown_as = md.normalizeLinkText
@@ -536,6 +581,7 @@ def make_parser():
     md.block.ruler.before("front_matter", "toml_front_matter", _toml_front_matter,
                           {"alt": ["paragraph", "reference", "blockquote", "list"]})
     _linear_inline_rules(md)
+    _fewer_marks(md)
     _keep_deep_blocks(md)
     _guard(md)
     return md
@@ -875,9 +921,18 @@ def parse(text: str, parser=None, notes=None, anchors=None, held=None) -> Docume
                 return 0
             return sum(1 for line, _inside, _sub in places.get(label, ()) if line < first)  # (numbered on)
 
-        env["footnotes"] = {"refs": _NumberedNotes((":" + label, number) for number, (label, _n) in enumerate(labels)),
+        # (the notes' numbers made once a text, and of a part that is not the last only the notes it refers
+        # to: every part was given every note - 100,000 notes in 50 parts, five million entries made and
+        # walked, did not finish in two minutes in the terminal)
+        refs = getattr(labels, "numbered", None) if isinstance(labels, NoteLabels) else None
+        if refs is None:
+            refs = _NumberedNotes((":" + label, number) for number, (label, _n) in enumerate(labels))
+            if isinstance(labels, NoteLabels):
+                labels.numbered = refs
+        env["footnotes"] = {"refs": refs,
                             "list": {number: {"label": label, "count": seed(label, count)}
-                                     for number, (label, count) in enumerate(labels)}}
+                                     for number, (label, count) in enumerate(labels)}
+                            if last else _NotesAsAsked(labels, seed)}
     _PARSING.deadline = time.monotonic() + PARSE_SECONDS + len(text) * PARSE_SECONDS_PER_CHAR
     _PARSING.ticks = 0
     try:
@@ -970,6 +1025,21 @@ class _NumberedNotes(_NoteRefs):
         super().__setitem__(key, value)
 
 
+class _NotesAsAsked(dict):
+    """A part's notes by their numbers ({"label", "count"} each, as the footnote plugin keeps them), made
+    as the part refers to them: the part's own list of notes - which is dropped, the last part shows them
+    all - holds those only."""
+
+    def __init__(self, labels, seed) -> None:
+        super().__init__()
+        self._labels, self._seed = labels, seed
+
+    def __missing__(self, number):
+        label, count = self._labels[number]
+        made = self[number] = {"label": label, "count": self._seed(label, count)}
+        return made
+
+
 def _folded_note_refs(md) -> None:
     """The footnote plugin's reference rule matching labels as GitHub does,
     case aside: each reference's label the note's own (_NoteRefs)."""
@@ -1005,6 +1075,8 @@ class NoteLabels(list):
     its place's number)]} (a part numbers its places on from the ones before)."""
 
     places: dict = {}
+    #: their numbers by label (the footnote plugin's "refs"), made once: parse
+    numbered = None
 
 
 @functools.lru_cache(maxsize=2)  # (asked for twice of one text: its parts, its notes' numbers)
@@ -1164,6 +1236,9 @@ def _html_attrs(tag: str, attrs, md) -> dict[str, str]:
         elif tag in ("td", "th") and name in ("colspan", "rowspan"):
             if value.strip().isdigit() and 1 <= int(value) <= 100:  # (a cell of 999 columns: no)
                 found[name] = value.strip()
+        elif tag == "ol" and name == "start":  # (the number its list begins with: it began at 1)
+            if value.strip().isascii() and value.strip().isdigit() and len(value.strip()) <= 9:
+                found[name] = str(int(value))
         elif tag == "img":
             if name == "src":
                 src = _html_src(value, md)
@@ -1242,7 +1317,13 @@ class _Sanitizer:
         self._seen = {}
         self.parser.feed(html_text)
         self.parser.close()  # (what is left in its buffer: text, not a tag still to come)
-        return self.events
+        # (the caller's now, and nothing of this text kept: the sanitizer is in a cycle with its parser - only
+        # Python's collector frees it, and what it still held with it: the 1.6 million events of a raw table
+        # of 150,000 rows and its text, walked by the next full collection in whatever thread began it -
+        # the GUI thread's, one turn of 0.55 s as the page was opened)
+        events, self.events = self.events, []
+        self._source, self._seen = "", {}
+        return events
 
     def start(self, tag: str, attrs, void: bool = False) -> None:
         tag = tag.lower()
@@ -1540,9 +1621,9 @@ def html_events(token) -> list[tuple]:
 
 # -- bare addresses as links (GFM's extended autolinks) ----------------------------------------
 
-#: An address written bare: http(s)://… or www.… at a line's start or after
+#: An address written bare: http(s)://…, ftp://… or www.… at a line's start or after
 #: a space, "*", "_", "~" or "(" - or an e-mail address (GFM).
-_BARE_LINK = re.compile(r"(?<![^\s*_~(])(?:https?://|www\.)[\w-]+(?:\.[\w-]+)+[^\s<]*"
+_BARE_LINK = re.compile(r"(?<![^\s*_~(])(?:https?://|ftp://|www\.)[\w-]+(?:\.[\w-]+)+[^\s<]*"
                         r"|(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+", re.UNICODE)
 #: What ends an address but is no part of it ("see www.x.org.").
 _TRAILING = "?!.,:*_~'\""
@@ -1787,6 +1868,77 @@ def _fewer_formulas(state) -> None:
                     marks = "$$" if child.type == "math_inline_double" else "$"
                     child.type, child.tag, child.nesting = "text", "", 0
                     child.content = f"{marks}{child.content}{marks}"
+
+
+def _backtick_runs(state) -> tuple[list[int], list[int], dict[int, list[int]]]:
+    """The runs of backticks in *state*'s text, found once a text: where each starts, how long each is, and
+    the starts of the runs of each length."""
+    runs = state.__dict__.get("_ax_backticks")
+    if runs is None:
+        src, starts, lengths, by_length = state.src, [], [], {}
+        at = src.find("`")
+        while at >= 0:
+            stop = at + 1
+            while stop < len(src) and src[stop] == "`":
+                stop += 1
+            starts.append(at)
+            lengths.append(stop - at)
+            by_length.setdefault(stop - at, []).append(at)
+            at = src.find("`", stop)
+        runs = state.__dict__["_ax_backticks"] = (starts, lengths, by_length)
+    return runs
+
+
+def _code_crosses(state, start: int, end: int) -> bool:
+    """Whether a code span that opens in *state*'s text between *start* and *end* closes after *end*: a
+    formula between the two would end inside that code span. A span that closes before *end* is the
+    formula's own ("$`x^2`$"); backticks that close nowhere are text."""
+    starts, lengths, by_length = _backtick_runs(state)
+    src, limit = state.src, state.posMax
+    index = bisect.bisect_left(starts, start)
+    while index < len(starts) and starts[index] < end:
+        at, length = starts[index], lengths[index]
+        slashes = at
+        while slashes > start and src[slashes - 1] == "\\":
+            slashes -= 1
+        if (at - slashes) % 2:  # (its first backtick escaped: the rest opens)
+            at, length = at + 1, length - 1
+        if length:
+            same = by_length.get(length, ())
+            closer = bisect.bisect_right(same, at)
+            if closer < len(same) and same[closer] < limit:
+                if same[closer] >= end:
+                    return True
+                index = bisect.bisect_right(starts, same[closer], index)
+                continue
+        index += 1
+    return False
+
+
+def _code_before_math(md) -> None:
+    """A code span wins over a formula, as GitHub reads it: a "$" whose closing "$" would lie inside a code
+    span that opens after it is text ("pay $5 or `$HOME` and $PATH" was "pay 5 or `HOME` and $PATH" - the
+    formula "5 or `", the code span gone), and so is one whose closing "$" lies past the link's text it is
+    in ("[cost $5](x) and `$z`" was no link)."""
+    rules = {rule.name: rule.fn for rule in md.inline.ruler.__rules__}
+    original = rules.get("math_inline")
+    if original is None or getattr(original, "_ax_code_first", False):
+        return
+
+    def math_inline(state, silent: bool) -> bool:
+        start = state.pos
+        if state.src[start] != "$" or not _backtick_runs(state)[0]:
+            return original(state, silent)
+        if not original(state, True):
+            return False
+        end, state.pos = state.pos, start
+        # (the plugin looks for the closing "$" in all the text: one past a link's text is not this one's)
+        if end > state.posMax or _code_crosses(state, start, end):
+            return False
+        return original(state, silent)
+
+    math_inline._ax_code_first = True
+    md.inline.ruler.at("math_inline", math_inline)
 
 
 def _backtick_math(state) -> None:

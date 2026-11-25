@@ -35,11 +35,40 @@ _LINE_BREAK = re.compile("(\r\n|\r|\n|\u2029|\ufdd0|\ufdd1)")
 NEWLINE_NAMES = {"\n": "LF", "\r\n": "CRLF", "\r": "CR"}
 
 
+#: Characters split in one call: one call of ``re`` holds Python's lock
+#: for all of it - 5 MB split at once on the thread that reads a file kept
+#: the window from answering 0.1 s.
+SPLIT_CHARS = 1 << 18
+
+
 def _split_lines(text: str) -> tuple[list[str], list[str]]:
     """*text* as the editor's blocks and the break that ended each one
     (``""`` after the last block)."""
-    parts = _LINE_BREAK.split(text)
-    return parts[0::2], parts[1::2] + [""]
+    size = len(text)
+    if size <= SPLIT_CHARS:
+        parts = _LINE_BREAK.split(text)
+        return parts[0::2], parts[1::2] + [""]
+    lines: list[str] = []
+    endings: list[str] = []
+    open_line: list[str] = []  # (the pieces of a line that goes on in the next part)
+    at = 0
+    while at < size:
+        cut = min(size, at + SPLIT_CHARS)
+        if cut < size and text[cut - 1] == "\r" and text[cut] == "\n":
+            cut += 1  # (CR LF is one break)
+        parts = _LINE_BREAK.split(text[at:cut])
+        if len(parts) == 1:
+            open_line.append(parts[0])
+        else:
+            open_line.append(parts[0])
+            lines.append("".join(open_line))
+            lines.extend(parts[2:-1:2])
+            endings.extend(parts[1::2])
+            open_line = [parts[-1]]
+        at = cut
+    lines.append("".join(open_line))
+    endings.append("")
+    return lines, endings
 
 
 def _common_newline(endings: list[str]) -> str:
@@ -165,6 +194,9 @@ class TextDocument:
         self._endings: list[str] = [""]
         self._force_newline = False
         self.loaded = False
+        #: The file read was neither valid UTF-8 nor UTF-16: shown as Latin-1,
+        #: which reads any byte (and writes each back as it was).
+        self.not_unicode = False
 
     @classmethod
     def untitled(cls) -> "TextDocument":
@@ -191,6 +223,7 @@ class TextDocument:
         if self.encoding == "utf-16":
             self.utf16_codec = "utf-16-be" if raw.startswith(b"\xfe\xff") else "utf-16-le"
         self.original = raw
+        self.not_unicode = self.encoding == "latin-1"  # (decode()'s last resort only)
         self._remember(text)
         self._force_newline = False
         self.loaded = True
@@ -261,9 +294,16 @@ class TextDocument:
         Raises OSError when it cannot be read back."""
         return self.read_bytes() != self.original
 
-    def save(self, blocks: list[str], *, force: bool = False) -> str:
+    def save(self, blocks: list[str], *, force: bool = False, ask_gone: bool = False,
+             ask_read_only: bool = False) -> str:
         """Write *blocks*: ``"saved"``, or ``"conflict"`` when the file
         changed since it was read (nothing written; *force* writes anyway).
+        With *ask_gone*: ``"gone"`` when the file is no longer there (it
+        was deleted or moved meanwhile; nothing written - without it the
+        file is made again). With *ask_read_only*: ``"read-only"`` when the
+        file is marked read-only but could be replaced (nothing written;
+        core.atomic_io.read_only_target). The editor window asks, then
+        saves without the flag.
         Raises PermissionError for a document that was never read,
         UnicodeEncodeError (nothing written), OSError."""
         if self.backend is None:
@@ -273,6 +313,8 @@ class TextDocument:
                 "The file was never read, so saving would replace content nobody has seen."
             )
         content = self.encode(blocks)
+        if ask_gone and self._gone():
+            return "gone"
         if not force:
             try:
                 if self.changed_on_disk():
@@ -281,12 +323,23 @@ class TextDocument:
                 raise  # cannot check: refuse rather than overwrite blind
             except OSError as exc:
                 log.warning("Could not check %s for changes, saving: %s", self.path, exc)
-        from axross_markdown._ax.core.atomic_io import atomic_write
+        from axross_markdown._ax.core.atomic_io import atomic_write, read_only_target
+
+        if ask_read_only and read_only_target(self.backend, self.path):
+            return "read-only"
 
         atomic_write(self.backend, self.path, content)
         self._after_write(content)
         log.info("Saved file: %s (%d bytes)", self.path, len(content))
         return "saved"
+
+    def _gone(self) -> bool:
+        """Whether the file is certainly no longer there (a dangling link
+        counts as there: its target is made by the save, as before)."""
+        try:
+            return not self.backend.exists(self.path)
+        except Exception:  # noqa: BLE001 - cannot be asked: not "gone"
+            return False
 
     def save_as(self, backend, path: str, blocks: list[str]) -> None:
         """Write *blocks* to *path* on *backend* (any file there is

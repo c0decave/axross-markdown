@@ -206,7 +206,7 @@ def test_sad_the_terminal_puts_a_cells_link_address_under_the_table():
     out = T.render(TABLE, T.Options(width=60, depth="none"))
     cells = [line for line in out.splitlines() if line.startswith("│")]
     assert not any("http" in line for line in cells), out  # (printed in the cell, broken mid-word)
-    assert "[1] https://github.com/JeffLIrion/adb_shell" in out and "[2] https://opensource.org/licenses/MIT" in out
+    assert "[L1] https://github.com/JeffLIrion/adb_shell" in out and "[L2] https://opensource.org/licenses/MIT" in out
     license_column = cells[0].split("│")[2]
     assert len(license_column) <= len(" MIT[2] ") + 4, out  # (as wide as the address made it: 19 for "MIT")
 

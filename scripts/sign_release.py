@@ -168,9 +168,32 @@ def sign(sums: bytes, key, trusted: list[bytes]) -> bytes:
     return signature
 
 
+def child_env(environ=None) -> dict:
+    """The environment a child (gh) is started with: this one's without the key's passphrase - no program
+    but this one needs it (every gh child inherited AXROSS_MARKDOWN_KEY_PASSPHRASE)."""
+    environ = os.environ if environ is None else environ
+    return {name: value for name, value in environ.items() if name != PASSPHRASE_ENV}
+
+
 def gh(*args: str, capture: bool = False) -> str:
-    out = subprocess.run(["gh", *args], check=True, text=True, stdout=subprocess.PIPE if capture else None)
+    try:
+        out = subprocess.run(["gh", *args], check=True, text=True, stdout=subprocess.PIPE if capture else None,
+                             env=child_env())
+    except FileNotFoundError:
+        raise SystemExit("gh (GitHub's command line) is not installed: nothing is checked, nothing signed") from None
     return out.stdout if capture else ""
+
+
+def release_repo(repo: str, other: bool) -> str:
+    """*repo* when it is the pinned one. Another - a fork - would be checked against its own workflow's
+    attestations and then signed with the pinned key: refused, unless *other* says it is meant (the option
+    --sign-for-a-repo-that-is-not-the-pinned-one: a test of this script against a release of one's own)."""
+    if repo != REPO and not other:
+        raise SystemExit(f"{repo} is not {REPO}: its release is not signed with this key "
+                         "(--sign-for-a-repo-that-is-not-the-pinned-one, for a test, says otherwise)")
+    if repo != REPO:
+        print(f"WARNING: signing a release of {repo}, not of {REPO} - a test, never a release", file=sys.stderr)
+    return repo
 
 
 def attested(path: Path, tag: str, repo: str) -> None:
@@ -240,10 +263,17 @@ def main(argv=None) -> int:
     p.add_argument("tag")
     p.add_argument("--key", type=Path, required=True)
     p.add_argument("--repo", default=REPO)
+    p.add_argument("--sign-for-a-repo-that-is-not-the-pinned-one", dest="other_repo", action="store_true",
+                   help=f"sign a release of a --repo that is not {REPO} (a test of this script only)")
     p.add_argument("--publish", action="store_true")
     p.add_argument("--pinned-from", type=Path, default=UPDATER)
     args = parser.parse_args(argv)
-    key = load_key(args.key)
+    if args.cmd == "release":  # (before the key is opened, or its passphrase asked for)
+        args.repo = release_repo(args.repo, args.other_repo)
+    try:
+        key = load_key(args.key)
+    except (EOFError, KeyboardInterrupt):  # (no terminal to ask the passphrase on, or Ctrl+C: said)
+        raise SystemExit(f"no passphrase for {args.key}: set {PASSPHRASE_ENV} or run it on a terminal") from None
     if args.cmd == "pubkey":
         print("base64:", base64.b64encode(public_raw(key)).decode())
         return 0

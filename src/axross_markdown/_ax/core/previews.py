@@ -198,26 +198,22 @@ class PreviewDecodeFailed(PreviewError):
 
 
 def _is_local_backend(backend) -> bool:
-    """True iff the backend is flagged ``is_local`` by the registry
-    or is the well-known ``LocalFS`` class. Anything we can't
-    positively identify is treated as remote — safe default."""
-    # Registered backend?
+    """True iff the backend's class is flagged ``is_local`` by the registry
+    (its own or a base class's capabilities) or, unregistered, is a
+    ``LocalFS``. Anything we can't positively identify is treated as
+    remote — safe default. (core.remote_open.is_local_backend: one answer
+    for the decoders and for whether a viewer gets a copy.) A standalone
+    tool exported without the backends (axross-markdown) knows the local
+    disk only."""
     try:
-        from axross_markdown._ax.core import backend_registry
-
-        cls = type(backend).__name__
-        for info in backend_registry.all_backends():
-            if info.class_name == cls:
-                return bool(getattr(info.capabilities, "is_local", False))
-    except Exception as exc:  # registry shouldn't fail, but be defensive
-        log.debug("previews: registry lookup failed: %s", exc)
-    # Fall back to class identity — LocalFS and its subclasses.
-    try:
-        from axross_markdown._ax.core.local_fs import LocalFS
-
+        from axross_markdown._ax.core.remote_open import is_local_backend
+    except ImportError:
+        try:
+            from axross_markdown._ax.core.local_fs import LocalFS
+        except ImportError:
+            return False
         return isinstance(backend, LocalFS)
-    except Exception:
-        return False
+    return is_local_backend(backend)
 
 
 def _require_local(backend) -> None:

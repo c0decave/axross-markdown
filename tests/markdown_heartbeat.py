@@ -183,6 +183,103 @@ def assert_responsive(gap: float, label=None) -> None:
                   error=Frozen)
 
 
+#: The longest turn (the GUI thread's CPU time in one event-loop turn) the window may take, in seconds, on the
+#: machine the budgets were measured on: over it a duration's budget is missed (a warning in the blocking job).
+TURN = 0.1
+#: The turn no release goes out with: a turn is CPU time, so what else the machine does cannot lengthen it -
+#: only a slower machine can (machine_factor). Over it assert_turn fails in every job, the blocking one too.
+TURN_GATE = 0.25
+
+
+class Held(AssertionError):
+    """A turn over TURN_GATE (assert_turn): the GUI thread itself worked that long in one go - the window was
+    frozen whatever the machine's load. Never a warning."""
+
+
+def turn_gate() -> float:
+    """TURN_GATE on this machine (as much longer as it lays out a page more slowly: machine_factor)."""
+    return TURN_GATE * machine_factor()
+
+
+def assert_turn(turn: float, label=None) -> None:
+    """*turn* (a heartbeat's longest, CPU time) judged twice: over turn_gate() it fails in every job (Held:
+    the release gate - a turn does not depend on the machine's load); over TURN it misses a budget
+    (tests/markdown_timing.py's budget(): a warning in the blocking job, a failure in the timing job and
+    locally)."""
+    gate = turn_gate()
+    if turn >= gate:
+        raise Held((label, f"one turn of the GUI thread took {turn:.3f} s of CPU time (the gate: {gate:.3f} s)"))
+    from tests import markdown_timing as TB
+
+    bound = TURN * machine_factor()
+    TB.budget(turn < bound, (label, f"one turn of the GUI thread took {turn:.3f} s (at most {bound:.3f} s)"))
+
+
+#: The marker of a test that keeps the GUI thread busy on purpose (it tests the meters themselves): its turns
+#: are not gated (gate_turns).
+LONG_TURN_MARKER = "long_turn"
+LONG_TURN_HELP = "long_turn: holds the GUI thread on purpose (a test of the meters) - its turns are not gated"
+
+
+def turns_since(mark: int) -> float:
+    """The longest turn of the heartbeats stopped since STOPPED had *mark* entries."""
+    return max((turn for _gap, turn in STOPPED[mark:]), default=0.0)
+
+
+def gate_turns(item, mark: int) -> None:
+    """(the conftests, after a test's call) no heartbeat the test stopped saw a turn over turn_gate() - else
+    Held, in every job: the release gate. Whatever the test itself asserted, and however it judged its
+    durations - a turn that long is the window frozen by its own work."""
+    if item.get_closest_marker(LONG_TURN_MARKER) is not None or len(STOPPED) <= mark:
+        return  # (meant to be long - or no heartbeat at all: nothing to time the machine for)
+    longest = turns_since(mark)
+    if longest < TURN_GATE:
+        return
+    gate = turn_gate()
+    if longest >= gate:
+        raise Held(f"{item.nodeid}: one turn of the GUI thread took {longest:.3f} s of CPU time "
+                   f"(the gate: {gate:.3f} s)")
+
+
+def after_failure(item, error: AssertionError) -> int:
+    """(the conftests) what a failed test's *error* comes to. Frozen: the test is measured once more
+    (measure_again) and fails only if it freezes again. A test that passes or fails by elapsed time only
+    (the marker timing) in the gating run (tests/markdown_timing.py's GATE): its assertion is a duration's -
+    a warning there, never Held. Anything else is raised again. Returns the mark its turns are gated from
+    (those of the last run)."""
+    from tests import markdown_timing as TB
+
+    mark = len(STOPPED)
+    if isinstance(error, Frozen):
+        measure_again(item.runtest, error)
+        return mark
+    if TB.GATE and item.get_closest_marker(TB.MARKER) is not None and not isinstance(error, Held):
+        text = f"{item.nodeid}: {str(error).splitlines()[0][:300] if str(error) else type(error).__name__}"
+        TB.MISSED.append(text)
+        import warnings
+
+        warnings.warn(TB.TimingBudgetWarning(text), stacklevel=2)
+        return 0  # (every turn of the run counts: the gate is all this job asks of it)
+    raise error
+
+
+def settle_collector() -> None:
+    """(the conftests, before a test that may measure the window) what earlier tests of this process left
+    is gone first: their windows and pages - closed, not yet deleted - are collected and deleted now. One
+    process runs every test, and a window's deferred deletion is done by whatever event loop runs next: an
+    export's own, in the test after it. Export PDF after three other test files had "a turn" of 0.6 to
+    0.7 s so, after the whole suite 2.3 to 5 s, and passed alone: the suite's own leavings, not the
+    window's work."""
+    import gc
+    import sys
+
+    gc.collect()
+    core = sys.modules.get("PyQt6.QtCore")
+    if core is not None and core.QCoreApplication.instance() is not None:
+        core.QCoreApplication.sendPostedEvents(None, core.QEvent.Type.DeferredDelete.value)
+        gc.collect()  # (what those deletions let go of)
+
+
 def gaps_since(mark: int) -> float:
     """The longest gap of the heartbeats stopped since STOPPED had *mark* entries."""
     return max((gap for gap, _turn in STOPPED[mark:]), default=0.0)

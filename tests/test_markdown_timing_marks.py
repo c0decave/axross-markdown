@@ -37,11 +37,12 @@ from tests import markdown_timing as MT  # noqa: E402
 
 #: What measures elapsed time, by name (a call of it, or of an attribute of that name).
 SEEDS = {"Heartbeat", "assert_responsive", "gap_budget", "within_turn", "turn_for", "_Turns", "Turns",
-         "_longest_turn", "_quick", "measure_again", "gaps_since", "thread_time", "process_time",
+         "_longest_turn", "_quick", "assert_turn", "measure_again", "gaps_since", "thread_time", "process_time",
          "perf_counter", "Frozen"}
 #: What judges a duration as a budget (tests/markdown_timing.py's budget(): a warning under -m "not timing")
 #: - a test calling one of them (or a helper that does) has a timing part: the marker budgets.
-BUDGETED = {"budget", "until_within", "assert_responsive", "within_turn", "_quick", "_ops_turns"}
+BUDGETED = {"budget", "until_within", "assert_responsive", "assert_turn", "within_turn", "_quick",
+            "_ops_turns"}
 #: The clocks an elapsed time is read from (a moment subtracted from one of them is a measured time).
 CLOCKS = ("monotonic", "time", "perf_counter", "process_time", "thread_time")
 #: The waits whose timeout, asserted, is a budget.

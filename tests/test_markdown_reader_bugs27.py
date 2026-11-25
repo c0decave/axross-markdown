@@ -438,6 +438,8 @@ def test_sad_a_missing_anchor_reads_no_heading_on_the_gui_thread(full):
     view.show()
     view.render(text)
     assert until(lambda: view._readable and not view._scheduled, 240)
+    # (Qt's own parser shows a long text's first part first: the whole page, then)
+    assert until(lambda: view._readable and not (view._page or {}).get("head") and not view._scheduled, 600)
     real, on_gui = MV.slug, []
 
     def counted(*args, **kwargs):

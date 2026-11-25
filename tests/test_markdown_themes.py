@@ -83,6 +83,13 @@ def _drawn_pairs(theme):
     pairs += [(f"muted on {ground}", page["muted"], page[ground], 4.5)
               for ground in ("th_bg", "zebra", "pre_bg", "code_bg")]
     pairs += [(f"{kind} title on alert_bg", page[kind], page["alert_bg"], 4.5) for kind in _ALERTS]
+    # (in a <mark>: a link and struck text - text: AAA in a High Contrast theme - and a formula; a formula in
+    # a table, a quote, an alert)
+    pairs += [("a link in a mark", page["mark_link"], page["highlight_bg"], least),
+              ("struck text in a mark", page["mark_muted"], page["highlight_bg"], least),
+              ("a formula in a mark", page["mark_math"], page["highlight_bg"], 4.5)]
+    pairs += [(f"math on {ground}", page["math"], page[ground], 4.5)
+              for ground in ("th_bg", "zebra", "quote_bg", "alert_bg")]
     pairs += [(f"term.{role}", term[role], term["page_bg"], 4.5)
               for role in ("text", "muted", "link", "quote", "image", "math", "mark", "open",
                            *(f"h{n}" for n in range(1, 7)), *_ALERTS)]
@@ -118,7 +125,120 @@ def test_happy_the_contrast_report_measures_every_ground_a_colour_is_drawn_on():
         for kind in _ALERTS:
             assert report[(kind, "alert_bg")] == 4.5, (theme.id, kind)
             assert report[(f"term.{kind}", "term.page_bg")] == 4.5
+        assert report[("mark_link", "highlight_bg")] == least and report[("mark_muted", "highlight_bg")] == least
+        assert report[("mark_math", "highlight_bg")] == 4.5
+        for ground in ("th_bg", "zebra", "quote_bg", "alert_bg"):
+            assert report[("math", ground)] == 4.5
         assert report[("term.code_fg", "term.code_bg")] == 4.5 and report[("term.muted", "term.pre_bg")] == 4.5
+
+
+#: A page with every kind of text a theme colours, each on the grounds it can stand on.
+_EVERYTHING = """# Heading one with a [link](http://x.y/h)
+
+## Two
+
+### Three
+
+#### Four
+
+##### Five
+
+###### Six
+
+Text with a [link](http://x.y/), `inline code`, a [`linked code`](http://x.y/c), ~~struck~~, $x^2$ and a note[^1].
+
+<mark>marked [inmark](http://x.y/m) and ~~struck in mark~~ and $m^2$ and ~~[both](http://x.y/b)~~</mark>
+
+| head $h$ | [th link](http://x.y/t) | ~~th struck~~ |
+|---|---|---|
+| cell $a$ | [one](http://x.y/1) | ~~s1~~ `c1` |
+| cell $b$ | [two](http://x.y/2) | ~~s2~~ `c2` |
+| cell $c$ | [three](http://x.y/3) | ~~s3~~ |
+
+> a quote with a [quoted link](http://x.y/q), ~~quoted struck~~ and $q$
+
+> [!NOTE]
+> note text [alert link](http://x.y/a) $n$ ~~alert struck~~
+
+> [!TIP]
+> tip
+
+> [!IMPORTANT]
+> important
+
+> [!WARNING]
+> warning
+
+> [!CAUTION]
+> caution
+> ```python
+> def f(x): return "s" + str(1)  # comment
+> ```
+
+```python
+import os
+class A:
+    def f(self, x=1):  # comment
+        return f"s{x}" + None
+```
+
+- [ ] open task
+- [x] done task
+
+Term
+: definition
+
+<details><summary>Summary with <a href="http://x.y/s">a link</a></summary>
+
+inside
+
+</details>
+
+[^1]: The note's text.
+"""
+
+
+@pytest.mark.parametrize("theme_id", list(MT.THEMES))
+def test_happy_every_fragment_of_a_rendered_page_reaches_aa_on_its_own_ground(theme_id):
+    """The colours as the page draws them - each fragment's own colour against the ground it stands on
+    (ui.markdown_theme_ui.rendered_contrasts), not the roles a list pairs: a link and struck text in a <mark>
+    were below AA in six themes (Dark 3.60 and 3.83, Retro 3.81, Slate 4.07), a formula in a table's header
+    in two (Arctic 4.41, Retro 4.23) - pairs MT.PAGE_PAIRS did not list. AA's 4.5 for every fragment of text
+    (a task's box, a sign: 3); a High Contrast theme's text and links 7, in a <mark> too."""
+    pytest.importorskip("PyQt6.QtWidgets")
+    pytest.importorskip("markdown_it")
+    pytest.importorskip("pygments")
+    from PyQt6.QtGui import QTextDocument
+    from PyQt6.QtWidgets import QApplication
+
+    from axross_markdown._ax.core import markdown_doc as MD
+    from axross_markdown._ax.ui import markdown_html as H
+    from axross_markdown._ax.ui.markdown_theme_ui import rendered_contrasts
+
+    app = QApplication.instance() or QApplication([])
+    theme = MT.THEMES[theme_id]
+    page = theme.page
+    document = QTextDocument()
+    document.setDefaultStyleSheet(H.style_sheet(theme))
+    document.setHtml(H.to_html(MD.parse(_EVERYTHING), theme))
+    rows = rendered_contrasts(document, theme)
+    assert app is not None and len(rows) > 80
+    grounds = {ground for _text, _colour, ground, _ratio in rows}
+    assert {page["page_bg"], page["highlight_bg"], page["th_bg"], page["zebra"], page["code_bg"],
+            page["alert_bg"]} <= grounds, grounds
+    signs = ("\u2610", "\u2611")  # (a task's box: a sign, 3:1 - MT.PAGE_PAIRS' "mark")
+    low = [(text, colour, ground, round(ratio, 2)) for text, colour, ground, ratio in rows
+           if ratio < (3.0 if text.startswith(signs) else 4.5)]
+    assert not low, (theme_id, low)
+    marked = {text: (colour, ratio) for text, colour, ground, ratio in rows if ground == page["highlight_bg"]}
+    assert marked["inmark"][0] == page["mark_link"] and marked["struck in mark"][0] == page["mark_muted"]
+    assert marked["m"][0] == page["mark_math"] and marked["both"][0] in (page["mark_link"], page["mark_muted"])
+    if theme.aaa:
+        for text in ("inmark", "struck in mark", "both"):
+            assert marked[text][1] >= 7.0, (theme_id, text, marked[text])
+        links = [(text, round(ratio, 2)) for text, colour, _ground, ratio in rows
+                 if colour in (page["link"], page["text"]) and ratio < 7.0]
+        assert not links, (theme_id, links)
 
 
 def test_happy_code_in_an_alert_is_on_the_code_ground_in_its_syntax_colours():
@@ -661,7 +781,7 @@ def test_happy_the_program_s_view_menu_has_the_page_theme_then_the_window_theme(
 
     viewer = MarkdownApp().open_paths([""])[0]
     menus = [action.menu() for action in viewer.view_button.menu().actions() if action.menu() is not None]
-    assert [menu.objectName() for menu in menus] == ["markdown_page_theme", "window_theme"]
+    assert [menu.objectName() for menu in menus] == ["markdown_page_theme", "window_theme", "language"]
     assert menus[0].actions()[0].text() in ("Automatic (as the window)", "Automatic (as axross)")
 
 

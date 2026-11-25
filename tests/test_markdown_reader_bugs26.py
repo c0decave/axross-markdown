@@ -381,6 +381,8 @@ def test_sad_a_missing_anchor_is_said_at_once(full):
     view.show()
     view.render(text)
     assert until(lambda: view._readable and view.markdown, 120)
+    # (Qt's own parser shows a long text's first part first: the whole page, then)
+    assert until(lambda: not (view._page or {}).get("head"), 600)
     until(lambda: not view._scheduled, 60)
     assert view.more()
     began = time.monotonic()

@@ -92,7 +92,7 @@ def browser_page(text: str) -> str:
 
 def test_happy_a_readmes_html_is_shown_in_qt():
     page = qt_page(README)
-    assert '<p align="center"><img src="logo.png" width="200" alt="Logo" /><br /><b>tagline</b></p>' in page
+    assert '<p align="center"><img src="logo.png" width="200" alt="Logo" title="Logo" /><br /><b>tagline</b></p>' in page
     assert "comment" not in page
     # (folded as GitHub folds it: its summary the link that opens it)
     assert ('<p class="summary"><a class="fold" href="#axross-details-1"><b>▸ More <span class="kbd">Ctrl</span>'

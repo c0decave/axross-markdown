@@ -140,6 +140,9 @@ RENDER_DELAY = 300  # ms: the live preview follows the typing after this pause
 #: parses at every pause in the typing (20,000 characters were parsed on the
 #: GUI thread: 19 KB of "<!--" or "http:// " 0.8 to 0.9 s).
 BACKGROUND_CHARS = 2_000
+#: Characters of a text past which Qt's own parser's page shows its first part before the rest is made
+#: (MarkdownView._head_first).
+MD4C_HEAD_CHARS = 250_000
 #: ... and a text with formulas longer than this.
 MATH_BACKGROUND_CHARS = 2_000
 #: ... and a text of more brackets than this, however short: markdown-it
@@ -814,6 +817,28 @@ _SPACES = "\t\x0b\x0c\x1c-\x1f \x85\xa0\u1680\u180e\u2000-\u200d\u2028\u2029\u20
 #: (from a run's start only, possessive: from each space of a run of 999 it was tried again - 2 MB of words
 #: 999 spaces apart held Python's lock 1.1 s)
 _SPACE_RUN = re.compile("(?<![%s])[%s]{%d,}+" % (_SPACES, _SPACES, SPACE_RUN + 1))
+#: "*" or "_" in a row at most (a longer run is cut - renderable): each of them opens or closes an emphasis,
+#: one inside the other. 30,000 of them, a letter, 30,000 more (60 KB) were 34 s before markdown-it's page
+#: showed its letter, and in Qt's own parser - which showed them as written, a line laid out again with
+#: every change to its block - turns of 0.75 to 0.9 s as it was opened, zoomed, resized, its theme switched.
+EMPHASIS_RUN = 498
+_LONG_EMPHASIS = re.compile(r"(?<!\*)\*{%d,}+|(?<!_)_{%d,}+" % (EMPHASIS_RUN + 6, EMPHASIS_RUN + 6))
+
+
+def _shorter_emphasis(piece: str, found: list | None = None) -> str:
+    """*piece* with each run of more than EMPHASIS_RUN + 5 "*" or "_" cut to EMPHASIS_RUN and what its length
+    leaves of 6 (so that what it opens and closes pairs as before: by twos, and by CommonMark's rule of
+    three); *found* told that one was."""
+    if "*" * (EMPHASIS_RUN + 6) not in piece and "_" * (EMPHASIS_RUN + 6) not in piece:
+        return piece
+
+    def cut(match: re.Match) -> str:
+        if found is not None and not found:
+            found.append(True)
+        run = match.group(0)
+        return run[:EMPHASIS_RUN + len(run) % 6]
+
+    return _LONG_EMPHASIS.sub(cut, piece)
 
 
 #: A heading's text, a table cell's, laid out at most (characters): Qt lays out a heading or a cell as one
@@ -970,6 +995,10 @@ def renderable(text: str, table_cells: int | None = None, keep_marks: bool = Fal
     if "\t" in text:
         text = by_lines(_fewer_tabs, text)
     early = {}
+    runs: list = []
+    text = by_lines(lambda piece: _shorter_emphasis(piece, runs), text)
+    if runs:
+        early["emphasis"] = _t("runs of more than {count} * or _, cut", count=EMPHASIS_RUN)
     text, flattened = quote_flatter(text)
     if flattened:
         early["quotes"] = _t("quotes nested more than {count} deep, shown flatter", count=QUOTE_DEPTH)
@@ -1170,12 +1199,30 @@ _REMOTE = r"(?:https?:|ftps?:|//)[^)\s]+"
 #: at every "![" of a run - "![" 49,500 times took the passes 90 s)
 _LINKED_REMOTE_IMAGE = re.compile(r"\[!\[([^\[\]\n]*)\]\((" + _REMOTE + r")(?:\s+\"[^\"\n]*\")?\)\]\(([^)\s]+)\)")
 _REMOTE_IMAGE = re.compile(r"!\[([^\[\]\n]*)\]\((" + _REMOTE + r")(?:\s+\"[^\"\n]*\")?\)")
-_DESTINATION = re.compile(r"\]\([ \t]*+[^()\s]*(?:\([^()\s]*\)[^()\s]*)*"
-                          r"(?:\s++(?:\"(?:[^\"\\\n]|\\.)*+\"|'(?:[^'\\\n]|\\.)*+'|\((?:[^()\\\n]|\\.)*+\)))?[ \t]*+\)")
+_DESTINATION = re.compile(r"\]\([ \t]*+(?:\n[ \t]*+)?+[^()\s]*(?:\([^()\s]*\)[^()\s]*)*"
+                          r"(?:\s++(?:\"(?:[^\"\\\n]|\\.)*+\"|'(?:[^'\\\n]|\\.)*+'|\((?:[^()\\\n]|\\.)*+\)"
+                          r"|\"(?:[^\"\\\n]|\\.|\n(?![ \t]*\n)){0,1000}+\"|'(?:[^'\\\n]|\\.|\n(?![ \t]*\n)){0,1000}+'"
+                          r"|\((?:[^()\\\n]|\\.|\n(?![ \t]*\n)){0,1000}+\)))?[ \t]*+(?:\n[ \t]*+)?+\)")
+# (its destination or its title on a line of its own, a title over lines - up to 1,000 characters, no empty
+# line in it: CommonMark's. On one line only, the address of "[m](http://a.b/ "multi" over "line")" was made a
+# link of its own, the link's address "[http://a.b/](http://a.b/)".)
 # (possessive: a run of spaces after "](" tried by each of them again was quadratic. Its title in "…", '…' or
 # (…), as CommonMark's: one in '…' or (…) was no title, and the address was made a link of its own)
 #: A link's or an image's address in <…> (spaces, parentheses may be in it).
 _ANGLE_DESTINATION = re.compile(r'\]\([ \t]*<([^<>\n]*)>((?:[ \t]+(?:"[^"\n]*"|\'[^\'\n]*\'|\([^()\n]*\)))?)[ \t]*\)')
+
+
+#: An image in a link, both written out: "[![alt](image)](address)" (the image's address without "<…>").
+_LINKED_IMAGE = re.compile(r"\[(!\[[^\[\]\n]*\]\([ \t]*+[^()\s<]*+(?:\([^()\s]*+\)[^()\s]*+)*+"
+                           r"(?:[ \t]++\"[^\"\n]*+\")?+[ \t]*+\))\]"
+                           r"\(([ \t]*+[^()\s]++(?:[ \t]++(?:\"[^\"\n]*+\"|'[^'\n]*+'))?+[ \t]*+)\)")
+
+
+def _linked_image(match: re.Match) -> str:
+    """"[![alt](image)](address)" as "[mark](address)![alt](image)": Qt's Markdown reader gives an image no
+    link - a click on a badge or a thumbnail did nothing. apply_marks gives the image the address of the
+    mark before it."""
+    return f"[{LINKED}]({match.group(2)}){match.group(1)}"
 
 
 def _unangled(match: re.Match) -> str:
@@ -1231,6 +1278,20 @@ HARD = "\ue099"
 #: (Qt's own parser) a raw-HTML table's first cell: its first row is no header (<td>, not <th>) -
 #: _style_tables draws it as the others (Markdown's first row is always one).
 NO_HEAD = "\ue09a"
+#: (Qt's own parser) the first line of a list item that begins with a code block or a quote: empty, the
+#: block under it (_blocks_apart; the mark goes in apply_marks).
+ITEM_FIRST = "\ue08f"
+#: (Qt's own parser) a heading or a table's first cell in a quote, once for each level of it: Qt's Markdown
+#: reader gives those blocks no quote level, and they were drawn outside the quote's box (_blocks_apart;
+#: apply_marks sets the level).
+QUOTED = "\ue08e"
+#: (Qt's own parser) the text of a link around an image, put before the image: Qt's Markdown reader gives
+#: an image no link (_linked_image; apply_marks gives the image the link's address, the mark goes).
+LINKED = "\ue08d"
+#: (Qt's own parser) a table of right-to-left text, in its header's first cell: its columns are written
+#: in reverse (_blocks_apart, _html_table - Qt lays a table's first column out on the left whatever its
+#: direction), apply_marks puts the table on the right and makes its cells read right to left.
+MIRRORED = "\ue08c"
 #: a hard line break: a backslash or two spaces and more at a line's end (the
 #: spaces from the first of their run - tried from each, a long run took time growing as its square)
 _HARD_BREAK = re.compile(r"(?:\\|(?<! ) {2,})\n(?! {0,3}(?:=+|-+)[ \t]*(?:\n|\Z))(?=[ \t>]*[^\s>])")
@@ -1378,7 +1439,10 @@ def container_pieces(text: str) -> str:
             continue
         before = stack
         stack, pos = _containers_of(line, stack, lazy)
-        if stack and since > CONTAINED_LINES and line.strip() and not lazy:
+        # (... also after a paragraph's line, when this one begins an item of its own: it goes on with no
+        # paragraph - a list flattened to LIST_DEPTH, 2,900 items in its innermost, was one part: 0.2 s)
+        if stack and since > CONTAINED_LINES and line.strip() \
+                and (not lazy or not any(stack[-1] is old for old in before)):
             # (many small blocks in a container - 5,000 items of a list in a quote: cut between two of them
             # too, the containers going on begun again; a quote's line begins it again with its own marks)
             going = [container for container in stack if any(container is old for old in before)]
@@ -1958,6 +2022,12 @@ _DETAILS_TAGS = re.compile(r"<(/?)(details|summary)\b([^<>]*)>", re.IGNORECASE)
 _OPEN_ATTRIBUTE = re.compile(r"(?:^|\s)open(?:\s|=|/|$)", re.IGNORECASE)
 
 
+#: (_fold_details' *toggled*) every <details> shown open, its summary no link: a page to print or to export
+#: (Qt's own parser's) - a closed one's contents were not in the exported file at all, its summary a link
+#: to an anchor that file did not hold.
+ALL_OPEN = frozenset({-1})
+
+
 def _fold_details(text: str, toggled=frozenset(), hidden: dict | None = None) -> str:
     """*text* (Qt's own parser's) with what each closed ``<details>`` holds after its summary left out, as
     GitHub shows it and markdown-it's page does (ui.markdown_html.fold_details): closed unless it says
@@ -1991,8 +2061,9 @@ def _fold_details(text: str, toggled=frozenset(), hidden: dict | None = None) ->
         closing, name = match.group(1), match.group(2).lower()
         if name == "details" and not closing:
             number += 1
-            shown = bool(_OPEN_ATTRIBUTE.search(match.group(3))) != (number in toggled)
-            stack.append({"number": number, "open": shown, "tag": match, "summary": None, "from": None})
+            shown = bool(_OPEN_ATTRIBUTE.search(match.group(3))) != (number in toggled) or toggled is ALL_OPEN
+            stack.append({"number": number, "open": shown, "tag": match, "summary": None, "from": None,
+                          "plain": toggled is ALL_OPEN})
             continue
         if not stack:
             continue
@@ -2040,6 +2111,8 @@ def _summary_line(entry: dict, inner: str) -> str:
     """A <details>' summary as a line of its own: a link that opens or folds it, "▾" open, "▸" closed."""
     sign = "▾" if entry["open"] else "▸"
     inner = inner.replace("[", "\\[").replace("]", "\\]")
+    if entry.get("plain"):  # (on paper, in an exported page: nothing a click turns)
+        return f"\n\n{sign} {_open('bold')}{inner}{_close('bold')}\n\n"
     return f"\n\n[{sign} {_open('bold')}{inner}{_close('bold')}](#{FOLD}{entry['number']})\n\n"
 
 
@@ -2064,8 +2137,10 @@ def fallback_text(text: str, toggled=frozenset(), hidden: dict | None = None) ->
     if "|" in text or "#" in text or "-" in text or "=" in text:  # (blocks GFM reads otherwise than Qt's parser)
         text = "".join(segment if code else _tables_of_their_header(_headings_apart(segment))
                        for code, segment in _segments(text))
+    if "|" in text or ">" in text or "`" in text or "~" in text or "     " in text:
+        text = _blocks_apart(text)
     # (each looked for a piece at a time, or as a string: a search over all of a big text keeps Python's lock)
-    if not any(mark in text for mark in ("<", "[!", ":", "$", "](", "^[", "math", "&")) \
+    if not any(mark in text for mark in ("<", "[!", ":", "$", "](", "^[", "math", "&", "~", "www.")) \
             and not found_by_lines(_SPACES_BETWEEN, text) \
             and not ("  \n" in text or "\\\n" in text) and not (">" in text and _QUOTE_AFTER_A_GAP.search(text)):
         return text
@@ -2239,22 +2314,26 @@ _LONG_ADDRESS = re.compile(r"\]\((?=[ \t]*+<?[^\s()<>]{%d})" % (ADDRESS_CHARS + 
 _LABEL_LINE = re.compile(r" {0,3}\[[^\]\n]+\]:[ \t]*\Z")
 _ANGLED_LINE = re.compile(r"[ \t]*<[^<>\n]*>[ \t]*\Z")
 _TITLE_LINE = re.compile(r"""[ \t]*(?:"[^"\n]*"|'[^'\n]*'|\([^()\n]*\))[ \t]*\Z""")
+#: ... a destination without "<…>" alone on one, or with its title.
+_BARE_LINE = re.compile(r"""[ \t]*+[^\s<]\S*+(?:[ \t]++(?:"[^"\n]*"|'[^'\n]*'|\([^()\n]*\)))?+[ \t]*+\Z""")
 
 
 def _joined_definitions(text: str) -> str:
-    """*text* with a reference definition written over lines whose destination is in "<…>" on one line:
-    raw HTML's pass took "<my url>" on a line of its own for a tag (the definition text: the spec's 164)."""
+    """*text* with a reference definition written over lines on one line: raw HTML's pass took "<my url>" on
+    a line of its own for a tag (the definition text: the spec's 164), and two spaces after a destination on
+    its own line were a hard break whose mark stayed in the link's address (the spec's 162)."""
     rows, out, index, fence = text.split("\n"), [], 0, None
     while index < len(rows):
         row = rows[index]
         opened = FENCE.match(row)
         if opened and (fence is None or _closes(opened, fence)):
             fence = opened.group(1) if fence is None else None  # (never in code)
-        elif fence is None and index + 1 < len(rows) and _LABEL_LINE.match(row) \
-                and _ANGLED_LINE.match(rows[index + 1]):
+        elif fence is None and index + 1 < len(rows) and "]:" in row and _LABEL_LINE.match(row) \
+                and (_ANGLED_LINE.match(rows[index + 1]) or _BARE_LINE.match(rows[index + 1])):
+            titled = rows[index + 1].rstrip()[-1:] in "\"')" and len(rows[index + 1].split()) > 1
             joined = row.rstrip() + " " + rows[index + 1].strip()
             index += 2
-            if index < len(rows) and _TITLE_LINE.match(rows[index]):
+            if not titled and index < len(rows) and _TITLE_LINE.match(rows[index]):
                 joined += " " + rows[index].strip()
                 index += 1
             out.append(joined)
@@ -2438,6 +2517,190 @@ def _headings_apart(text: str) -> str:
     return "\n".join(out)
 
 
+#: (_blocks_apart) a setext heading's underline after its line's quote marks.
+_QUOTED_UNDERLINE = re.compile(r"(?:=+|-+)[ \t]*\Z")
+#: (_blocks_apart) an ATX heading's marks and the room after them, text following.
+_ATX_MARKS = re.compile(r"#{1,6}[ \t]+(?=[^\s#]|#+[^\s#])")
+
+
+def _blocks_apart(text: str) -> str:
+    """*text* with the blocks Qt's Markdown reader lays out otherwise than GFM written so that it does not
+    (one pass over the lines, linear; nothing in a code block changes):
+
+    - a table right under a paragraph's line gets an empty line before it (Qt's parser lets no table
+      interrupt a paragraph: "para" over "| a | b |" over "|---|---|" was one line of text);
+    - a list item that begins with a code block or a quote gets a first line of its own (ITEM_FIRST), the
+      block under it, and a fence or a quote right under an item's line an empty line before it (the
+      reader made a list item of each block after such a one: "1. ```" over "foo" drew "1. foo", "2. bar",
+      each line of the code its own number);
+    - a heading and a table in a quote are marked as the quote's (QUOTED: they stood outside its box);
+    - a table whose header begins with right-to-left text has its columns in reverse (MIRRORED: its first
+      column stood on the left)."""
+    out = []
+    state = {"last": False, "depth": 0, "listed": False, "table": False, "plain": False, "lead": 0, "mirror": 0}
+    for code, segment in _segments(text):
+        if code:
+            first, newline, rest = segment.partition("\n")
+            out += [_fence_apart(first, state), newline, rest]
+            state["last"] = state["table"] = False
+            continue
+        rows = segment.split("\n")
+        for number, row in enumerate(rows):
+            if number:
+                out.append("\n")
+            if number + 1 == len(rows) and not row:
+                break  # (the segment ends with its last line's end)
+            state["rows"], state["row"] = rows, number
+            out.append(_row_apart(row, rows[number + 1] if number + 1 < len(rows) else "", state, out))
+    return "".join(out)
+
+
+def _mirrored_row(row: str, columns: int, mark: str = "") -> str:
+    """(_blocks_apart) a table's *row* (its header, its delimiter row too) with its *columns* cells in
+    reverse - a missing one empty; *mark*: put before the text of the cell that was its first."""
+    row = row.strip()
+    bars = [found.start() for found in _CELL_BAR.finditer(row) if found.group(0) == "|"]
+    cells, at = [], 0
+    for bar in bars:
+        cells.append(row[at:bar].strip())
+        at = bar + 1
+    cells.append(row[at:].strip())
+    if bars and bars[0] == 0:
+        cells = cells[1:]
+    if len(cells) > 1 and bars and bars[-1] == len(row) - 1:
+        cells = cells[:-1]
+    cells = cells[:columns] + [""] * (columns - len(cells))
+    chunk = CHUNK if cells[0].startswith(CHUNK) else ""  # (a later part's header: its mark stays the first)
+    cells[0] = mark + cells[0][len(chunk):]
+    return "|" + chunk + " " + " | ".join(reversed(cells)) + " |"
+
+
+def _lead_of(row: str) -> tuple[str, list]:
+    """(a line's lead - its indentation, its quotes' and list items' marks -, the marks: (start, end, whether
+    a quote's) each)."""
+    if row[:1] not in " \t>-+*0123456789":
+        return "", []
+    lead = _CONTAINER_LEAD.match(row, 0, LEAD_REACH).group(0)
+    return lead, [(found.start(), found.end(), found.group(0) == ">") for found in _LEAD_MARK.finditer(lead)]
+
+
+def _item_first(row: str, marks: list) -> str | None:
+    """(_blocks_apart) *row* - a list item's first line that begins with a block - as an empty first line
+    (ITEM_FIRST), an empty line and the block under them; None where its lead holds two items' marks."""
+    items = [mark for mark in marks if not mark[2]]
+    if len(items) != 1:
+        return None
+    start, end, _quote = items[0]
+    return (row[:end] + " " + ITEM_FIRST + "\n" + row[:start].rstrip() + "\n"
+            + row[:start] + " " * (end - start) + row[end:])
+
+
+def _fence_apart(row: str, state: dict) -> str:
+    """(_blocks_apart) a code block's first line: in a list item."""
+    lead, marks = _lead_of(row)
+    if not marks and not state["listed"]:
+        return row
+    if marks and not marks[-1][2] and FENCE.match(row[len(lead):]):  # ("1. ```": the item begins with it)
+        state["listed"] = True
+        return _item_first(row, marks) or row
+    if state["listed"] and state["last"] and all(mark[2] for mark in marks) and FENCE.match(row[len(lead):]):
+        return lead.rstrip() + "\n" + row  # (right under the item's text)
+    return row
+
+
+def _row_apart(row: str, after: str, state: dict, out: list) -> str:
+    """(_blocks_apart) one line outside code; *after*: the line under it; *out*: the lines before it."""
+    if not row.strip():
+        state["last"] = state["table"] = False
+        return row
+    if state["table"]:
+        lead = _QUOTE_LEAD.match(row, 0, LEAD_REACH).group(0)
+        if _ATX_OPEN.match(row, len(lead)) and len(lead) - len(lead.rstrip(" ")) < 4:
+            # (a heading right under a table's row: apart - Qt's own parser read it as one more row, "# head"
+            # in the table's first cell; the heading is then read as any line after an empty one)
+            state["last"] = state["table"] = False
+            return lead.rstrip() + "\n" + _row_apart(row, after, state, out)
+        if state["mirror"]:  # (a row of a table of right-to-left text)
+            if lead.count(">") == state["depth"] and _UNESCAPED_PIPE.search(row, len(lead)):
+                return lead + _mirrored_row(row[len(lead):], state["mirror"])
+            state["mirror"] = 0
+    lead, marks = _lead_of(row)
+    depth = sum(1 for mark in marks if mark[2])
+    listed = any(not mark[2] for mark in marks)
+    was, under, inside = state["last"], state["depth"], state["listed"]
+    shown = row
+    if listed:
+        last = max(index for index, mark in enumerate(marks) if not mark[2])
+        quote_first = last + 1 < len(marks)
+        code_first = not quote_first and _columns(lead, marks[last][1])[0] >= 5 and len(lead) < len(row)
+        if quote_first or code_first:
+            shown = _item_first(row, marks) or row
+        state["listed"] = True
+    elif marks and state["listed"] and was and depth > under:
+        # (a quote right under a list item's line: an empty line before it)
+        cut = [mark for mark in marks if mark[2]][under][0]
+        shown = row[:cut].rstrip() + "\n" + row
+    elif not marks and len(lead) < 2 or marks and max(
+            [marks[0][0]] + [second[0] - first[1] for first, second in zip(marks, marks[1:])]
+            + [len(lead) - marks[-1][1]]) < 2:
+        state["listed"] = False  # (no line of a list item: not indented)
+    rest = row[len(lead):]
+    if depth and not listed and shown is row:
+        heading = _ATX_MARKS.match(rest)
+        if heading is not None:  # (a heading in a quote: the quote's)
+            shown = lead + rest[:heading.end()] + QUOTED * depth + rest[heading.end():]
+        elif was and state["plain"] and under == depth and out and _QUOTED_UNDERLINE.match(rest) \
+                and not state["table"]:
+            # (an underlined one: the mark in the line over the underline)
+            index = len(out) - 1
+            while index >= 0 and out[index] == "\n":
+                index -= 1
+            if index >= 0 and len(out[index]) > state["lead"] and "\n" not in out[index]:
+                out[index] = out[index][:state["lead"]] + QUOTED * depth + out[index][state["lead"]:]
+    if "|" in rest and not state["table"] and "-" in after and "|" in after:
+        ruled = after[_QUOTE_LEAD.match(after, 0, LEAD_REACH).end():]
+        if TABLE_DELIMITER.match(ruled) and _cells(rest) == _cells(ruled) \
+                and after.count(">", 0, len(after) - len(ruled)) == depth:
+            state["table"] = True
+            state["mirror"] = _cells(ruled) if shown is row and _rtl(rest.lstrip(" |" + CHUNK)) else 0
+            if state["mirror"]:
+                rest = _mirrored_row(rest, state["mirror"], MIRRORED)
+                shown = row = lead + rest
+            if depth and not listed and shown is row and _small_table(state, _cells(ruled)):
+                # (a table in a quote: the quote's - one the page lays out whole; a bigger one is cut in
+                # parts that are joined at the page's top level, as before)
+                bar = len(rest) - len(rest.lstrip(" "))
+                bar += 1 if rest[bar:bar + 1] == "|" else 0
+                bar += 1 if rest[bar:bar + 1] == CHUNK else 0
+                bar += len(rest) - bar - len(rest[bar:].lstrip(" "))
+                shown = lead + rest[:bar] + QUOTED * depth + rest[bar:]
+            if was and not listed and under == depth and (state["listed"] or not inside):
+                # (right under a paragraph's line: apart - but not under a list item's line it is not
+                # indented to: that line is the item's text to GFM, no table)
+                shown = _QUOTE_LEAD.match(row, 0, LEAD_REACH).group(0).rstrip() + "\n" + shown
+    state["last"], state["depth"], state["plain"], state["lead"] = True, depth, not listed, len(lead)
+    return shown
+
+
+#: Cells and characters of a quote's table drawn in the quote's box (under what container_pieces and
+#: renderable cut a table in parts at: MD4C_TABLE_CELLS, CONTAINED_CHARS).
+BOXED_TABLE_CELLS, BOXED_TABLE_CHARS = 200, 4000
+
+
+def _small_table(state: dict, columns: int) -> bool:
+    """(_blocks_apart) whether the table whose header is the line read now is one the page lays out whole:
+    its rows counted to its first empty line, no further than the bounds."""
+    rows, cells, size = state["rows"], 0, 0
+    for index in range(state["row"], len(rows)):
+        if not rows[index].strip(" \t>"):
+            return True
+        cells += columns
+        size += len(rows[index])
+        if cells > BOXED_TABLE_CELLS or size > BOXED_TABLE_CHARS:
+            return False
+    return True
+
+
 def _tables_of_their_header(text: str) -> str:
     """*text* with a "table" whose header has more or fewer cells than its delimiter row as text - GFM
     reads none there; Qt's own parser made a table of it and dropped what did not fit (the spec's 203)."""
@@ -2482,6 +2745,8 @@ def _outside_code(text: str, notes: list | None = None, labels: set | frozenset 
     # holds Python's lock - 2 MB of a block tag's line, 0.05 to 0.1 s each)
     if "[![" in text:
         text = _LINKED_REMOTE_IMAGE.sub(lambda m: f"[{CHIP} {m.group(1) or _name_of(m.group(2))}]({m.group(3)})", text)
+    if "[![" in text:  # (a local one in a link: the link before it, the image its own - _linked_image)
+        text = _LINKED_IMAGE.sub(_linked_image, text)
     if "![" in text:
         text = _REMOTE_IMAGE.sub(lambda m: f"{CHIP} {m.group(1) or _md_escape(_name_of(m.group(2)))}", text)
     # an image without alt text: its file's name (Qt's own parser showed none at all)
@@ -2491,13 +2756,15 @@ def _outside_code(text: str, notes: list | None = None, labels: set | frozenset 
     # a link's address and an autolink as written: no pass changes them
     # (a look-alike host of a link's address in punycode: followed as markdown-it's page follows it)
     if "](" in text:
-        text = _DESTINATION.sub(lambda m: keep(_ADDRESS.sub(lambda a: a.group(1) + _safe_host(a.group(2)),
-                                                            m.group(0), count=1)), text)
+        text = _DESTINATION.sub(lambda m: keep(_decoded_destination(_ADDRESS.sub(
+            lambda a: a.group(1) + _safe_host(a.group(2)), m.group(0), count=1))), text)
     # (a look-alike host - "аррӏе.com" - in punycode, shown and followed: core.markdown_doc.safe_host_url)
     if "<" in text:  # (a piece at a time - an autolink holds no space: one call over 8 MB held the lock 0.3 s)
         text = by_lines(lambda piece: _AUTOLINK.sub(lambda m: keep("<" + _safe_shown(m.group(0)[1:-1]) + ">"),
                                                     piece), text)
     text = _bare_links(text, keep)
+    if "~" in text:
+        text = _struck_in_words(text)
     if "](" in text:  # (a link hiding javascript: behind a tab: its text - core.markdown_doc)
         from axross_markdown._ax.core import markdown_doc
 
@@ -2713,12 +2980,36 @@ _LINK_DEFINITION = re.compile(r"^([ \t>]*\[(?!\^)[^\]\n]+\]:[ \t]*)(?:<([^<>\n]*
                               r"((?:[ \t]+(?:\"[^\"\n]*\"|'[^'\n]*'|\([^()\n]*\)))?[ \t]*)$", re.MULTILINE)
 
 
+def _decoded_address(address: str) -> str:
+    """A link's *address* with its character references read, as CommonMark reads them there ("&amp;" is
+    "&", "&ouml;" is "%C3%B6" - Qt's own parser left them as written: a click asked for "?a=1&amp;b=2")."""
+    import html as html_module
+    from urllib.parse import quote
+
+    return _ENTITY.sub(lambda found: quote(html_module.unescape(found.group(0)), safe=_URL_SAFE), address)
+
+
+def _decoded_destination(written: str) -> str:
+    """(_DESTINATION's match, "](address "title")") with its address's character references read."""
+    if "&" not in written:
+        return written
+    begin = len(written) - len(written[2:].lstrip())
+    end = _WHITE.search(written, begin)
+    end = len(written) - 1 if end is None else end.start()
+    return written[:begin] + _decoded_address(written[begin:end]) + written[end:]
+
+
+_WHITE = re.compile(r"\s")
+
+
 def _link_definition(match: re.Match) -> str:
     """A link's reference definition as Qt's own parser reads it: its
     address without "<…>" (spaces in it as %20; a look-alike host in
     punycode) - an autolink pass made "<https://…>" a link of its own, the
     reference's address "[https://…](https://…)"."""
     address = (match.group(2) if match.group(2) is not None else match.group(3)).replace(" ", "%20")
+    if "&" in address:
+        address = _decoded_address(address)
     return match.group(1) + (_safe_host(address) if "://" in address else address) + match.group(4)
 
 
@@ -2750,16 +3041,29 @@ def _bare_links(text: str, keep) -> str:
 
     def linked(match: re.Match) -> str:
         written = match.group(0)
-        if written.startswith("www.") and "&" in written and not inside(match.string, match.start()):
-            # (one ending in what reads as a character reference - "&hl;": no part of it, GFM's 626 - a link of
-            # what is: Qt's own parser's own link of it ate the ";")
+        if written.startswith("www."):
+            # (a "www." address a link of what GFM reads as it - core.markdown_doc._bare_link, markdown-it's
+            # page's: Qt's own parser made none of "www.a.org/x:" or "www.a.org/(x)", and of one ending in what
+            # reads as a character reference - "&hl;": no part of it, GFM's 626 - one that ate the ";")
+            if inside(match.string, match.start()):
+                return written
             bare = markdown_doc._bare_link(written)
-            if bare is not None and bare[0] != written and written[len(bare[0]):].startswith("&"):
-                # (its address without "<…>": the "<http…>" in it was an autolink to a later pass - the href
-                # "[http://…](http://…)", a relative file name to a click)
-                target = _safe_host(bare[1]).replace(" ", "%20").replace("(", "%28").replace(")", "%29")
-                return keep(f"[{_md_escape(bare[0])}]({target})") + written[len(bare[0]):]
-            return written
+            if bare is None:
+                return written
+            # (its address without "<…>": the "<http…>" in it was an autolink to a later pass - the href
+            # "[http://…](http://…)", a relative file name to a click)
+            target, depth = _safe_host(bare[1]).replace(" ", "%20"), 0
+            for char in target:
+                depth += 1 if char == "(" else -1 if char == ")" else 0
+                if depth < 0:
+                    break
+            if depth:  # (parentheses that do not pair: no part of a destination as they are)
+                target = target.replace("(", "%28").replace(")", "%29")
+            # (its text's first "." escaped: the parser made a link of its own in the link's text)
+            # (a look-alike host shown in punycode, as markdown-it's page shows it)
+            shown = _safe_shown(bare[0])
+            shown = shown if shown.startswith("www.") else bare[0]
+            return keep(f"[www\\.{_md_escape(shown[4:])}]({target})") + written[len(bare[0]):]
         if "://" not in written or inside(match.string, match.start()):
             return written  # (in a link's text; in a raw HTML tag - its attribute: no link, the tag broken)
         bare = markdown_doc._bare_link(written)
@@ -2767,7 +3071,44 @@ def _bare_links(text: str, keep) -> str:
             return written
         return keep(f"<{_safe_host(bare[0])}>") + written[len(bare[0]):]
 
-    return markdown_doc._BARE_LINK.sub(linked, text) if "://" in text or ("www." in text and "&" in text) else text
+    return markdown_doc._BARE_LINK.sub(linked, text) if "://" in text or "www." in text else text
+
+
+#: (_struck_in_words) a run of one or two "~", not escaped; where a paragraph or a table's cell ends.
+_TILDE_RUN = re.compile(r"(?<![~\\])~{1,2}(?!~)|\n[ \t>]*\n|\|")
+
+
+def _struck_in_words(text: str) -> str:
+    """*text* with struck text whose "~" stands beside a letter or a digit marked as struck ("a~b~c",
+    "H~~2~~O": markdown-it's page strikes them, Qt's own parser strikes only what stands between spaces or
+    punctuation). A run that may open (no space after it) and the next of its length that may close (no
+    space before it), in one paragraph or cell; the others are left to the parser. Linear."""
+    opener, edits = {}, []
+    for found in _TILDE_RUN.finditer(text):
+        start, end = found.span()
+        if text[start] != "~":
+            opener = {}
+            continue
+        before = text[start - 1] if start else " "
+        after = text[end] if end < len(text) else " "
+        first = opener.get(end - start) if not before.isspace() else None
+        if first is not None:
+            beside = text[first[0] - 1] if first[0] else " "
+            if beside.isalnum() or after.isalnum():
+                edits += [(first[0], first[1], _open("strike")), (start, end, _close("strike"))]
+            opener = {}
+        elif not after.isspace():
+            opener = {end - start: (start, end)}
+        else:
+            opener = {}
+    if not edits:
+        return text
+    out, at = [], 0
+    for start, end, mark in edits:
+        out += [text[at:start], mark]
+        at = end
+    out.append(text[at:])
+    return "".join(out)
 
 
 def _short_code() -> re.Pattern:
@@ -3067,6 +3408,9 @@ def _alert_title(match: re.Match) -> str:
     from axross_markdown._ax.ui.markdown_html import _title
 
     sign, title = _title(match.group(2).lower())
+    under = match.string[match.end() + 1:match.end() + 1 + LEAD_REACH].split("\n", 1)[0]
+    if not under.lstrip(" \t").startswith(">") or not under.strip(" \t>"):
+        return f"{match.group(1)}**{sign} {title}**"  # (no text under it: no break - its "\\" showed)
     return f"{match.group(1)}**{sign} {title}**\\"  # (a line of its own: a hard break)
 
 
@@ -3176,6 +3520,7 @@ def _html_to_markdown(text: str, keep) -> str:
         return text
     text = _drop_comments(text)
     out, index = [], 0
+    last_row = None
     dropped = _HTML_DROPPED.search(text)
     whole = _HTML_WHOLE.search(text)
     while True:
@@ -3191,7 +3536,9 @@ def _html_to_markdown(text: str, keep) -> str:
             break
         out.append(_html_tags(text[index:found.start()], keep))
         name = found.group(1).lower()
-        close = re.compile(rf"</{name}\s*>", re.IGNORECASE).search(text, found.end())
+        # (a table's end tag not found once: none after any later "<table>" either - not looked for again)
+        close = None if name == "table" and last_row is not None else \
+            re.compile(rf"</{name}\s*>", re.IGNORECASE).search(text, found.end())
         line_start = text.rfind("\n", 0, found.start()) + 1
         if close is not None and found is dropped and text[line_start:found.start()].strip():
             # (in a paragraph: closed in it, or not at all - the next paragraph is no part of it)
@@ -3203,6 +3550,18 @@ def _html_to_markdown(text: str, keep) -> str:
             # text, as GitHub shows it; all that followed went with it)
             out.append(found.group(0))
             index = found.end()
+            continue
+        if close is None and name == "table":
+            # (never closed in its piece - a code block in a cell cuts the text there, or its end tag is
+            # missing: its whole rows a table, the cells after them paragraphs - _html_tags. All that
+            # followed "<table>" was fed to the table's reader, and what stood in no closed cell was lost:
+            # the text of a cell before a code block, the whole page after a table never closed.)
+            if last_row is None:  # (where the text's last row ends: looked for once)
+                last_row = max(text.rfind("</tr>", found.end()), text.rfind("</TR>", found.end()))
+            rows_end = last_row if last_row >= found.end() else -1
+            if rows_end >= 0:
+                out.append(_html_table(text[found.start():rows_end + 5] + "</table>"))
+            index = rows_end + 5 if rows_end >= 0 else found.end()
             continue
         inner_end, after = (close.start(), close.end()) if close else (len(text), len(text))
         if found is whole:
@@ -3457,12 +3816,48 @@ def _html_tags(text: str, keep) -> str:
         return text
     sanitizer = markdown_doc.sanitizer()
     out, links, scripts, index, opened = [], [], [], 0, []
+    # (the line a tag is on: whether text stands on it before the tag - *said* -, its quote marks and
+    # indentation - *lead* -, whether it holds a table's bar - *barred* - and begins with one - *edged* -,
+    # looked for once a line)
+    said, lead, line_at, barred, moved, breaks, edged = False, "", -1, False, True, 0, False
     for m in _HTML_TAG_QUOTED.finditer(text):
         backslashes = m.start() - len(text[max(0, m.start() - 64):m.start()].rstrip("\\")) - max(0, m.start() - 64)
         if backslashes % 2 or not _VALID_TAG.fullmatch(m.group(0)):
             continue  # ("\<br/>", "<a href="hi'>": no tag, as written - the first was a line break, "\" before it)
         out.append(text[index:m.start()])
+        newline = text.rfind("\n", index, m.start())
+        if newline >= 0:
+            moved = True
+            lead = _QUOTE_LEAD.match(text, newline + 1, min(m.start(), newline + 1 + LEAD_REACH)).group(0)
+            said = bool(text[newline + 1 + len(lead):m.start()].strip())
+        elif not said and m.start() > index:
+            said = bool(text[index:m.start()].strip())
         index = m.end()
+        special = _ROW_TAG.match(m.group(0))
+        if special is not None and special.group(1):
+            # (a line break in a table's row: a mark of one - "  \n" ended the row, the cell's second line
+            # was a row of its own; at a cell's end none, as a browser shows none)
+            if moved or line_at < 0:
+                moved, breaks = False, 0
+                line_at = text.find("\n", m.end())
+                line_at = len(text) if line_at < 0 else line_at
+                begins = text.rfind("\n", 0, m.start()) + 1
+                barred = text.find("|", begins, line_at) >= 0
+                edged = barred and text[begins:begins + LEAD_REACH].lstrip(" \t>").startswith("|")
+            follows = text[m.end():m.end() + 64].lstrip(" \t")[:1] if barred else ""
+            if barred and (follows not in ("\n", "") or edged):
+                # (not at the end of a line that begins with no bar: that may be a paragraph's, a break)
+                sanitizer.feed(m.group(0), markdown_doc.HTML_BLOCK)
+                breaks += 1
+                if follows not in ("|", "\n", ""):
+                    # (ROW_BREAKS of a row at most: each is a line of one block Qt lays out at once)
+                    out.append(HARD if breaks <= ROW_BREAKS else " ")
+                continue
+        elif special is not None and said:
+            # (a cell of a table never closed, the text after a table's end: a paragraph of its own - the
+            # cells ran into one word, "cell onecell two")
+            out.append("\n" + lead.rstrip() + "\n" + lead)
+            said = False
         for event in sanitizer.feed(m.group(0), markdown_doc.HTML_BLOCK) or [("end", "")]:
             out.append(_tag_markdown(event, links, scripts))
             if event[0] == "start" and event[1] == "a":
@@ -3474,6 +3869,14 @@ def _html_tags(text: str, keep) -> str:
         if at is not None:
             out[at] = out[at][:-1]
     return "".join(out)
+
+
+#: (_html_tags) line breaks of one table row that are kept (the others a space).
+ROW_BREAKS = 200
+#: (_html_tags) a line break's tag (group 1); a table's cell, its row or its end outside a table read whole.
+_ROW_TAG = re.compile(r"<(?:(br)|t[dhr]|/table)(?=[\s/>])", re.IGNORECASE)
+#: A line's quote marks and indentation.
+_QUOTE_LEAD = re.compile(r"[ \t>]*+")
 
 
 def _tag_markdown(event, links: list, scripts: list) -> str:
@@ -3569,43 +3972,108 @@ def _html_whole(name: str, written: str, inner: str, keep) -> str:
 
 def _html_table(written: str) -> str:
     """A raw-HTML table as a Markdown table (its cells' text, emphasis and
-    images; the first row its header, aligned as its cells say)."""
+    images; the first row its header, aligned as its cells say). A cell ends
+    where the next one, the next row or the table's end begins, as HTML reads
+    it ("<td>one<td>two": "one" was lost); text in no cell is a paragraph
+    under the table; a cell's Markdown after an empty line is Markdown, as
+    GFM reads it there (its paragraphs and list items lines of the cell)."""
     from axross_markdown._ax.core import markdown_doc
 
-    rows, cell, align, aligns, links, opened, headed = [], None, "", [], [], [], False
+    rows, cell, align, aligns, links, opened, headed, loose = [], None, "", [], [], [], False, []
+    span = (1, 1)
+
+    def closed() -> None:
+        nonlocal cell
+        if cell is None:
+            return
+        if not rows:
+            rows.append([])
+        shown = HARD.join(piece for piece in (" ".join(part.split()) for part in "".join(cell).split(HARD)) if piece)
+        rows[-1].append((shown.replace("|", "\\|"), *span))
+        if len(rows) == 1:
+            aligns.extend([align] * span[0])
+        cell = None
+
     for event in markdown_doc.sanitizer().feed(written, markdown_doc.HTML_BLOCK):
         kind, tag = event[0], event[1]
         if kind == "start" and tag == "tr":
+            closed()
             rows.append([])
         elif kind == "start" and tag in ("th", "td"):
+            closed()
             headed = headed or (tag == "th" and len(rows) <= 1)
             cell, align, links, opened = [], event[2].get("align", ""), [], []
-            span = (int(event[2].get("colspan", 1)), int(event[2].get("rowspan", 1)))
-        elif kind == "end" and tag in ("th", "td") and cell is not None:
-            if not rows:
-                rows.append([])
-            rows[-1].append((" ".join("".join(cell).split()).replace("|", "\\|"), *span))
-            if len(rows) == 1:
-                aligns.extend([align] * span[0])
-            cell = None
-        elif cell is not None:  # (a link of a cell: its address with it - "[link" lost it)
+            span = (_span(event[2].get("colspan")), _span(event[2].get("rowspan")))
+        elif kind == "end" and tag in ("th", "td", "tr", "table"):
+            closed()
+        elif kind == "start" and tag == "table":
+            continue  # (a table in a cell: its rows the outer one's)
+        elif cell is None:
+            if kind == "text" and event[1].strip():
+                loose.append(_md_escape(" ".join(event[1].split())))
+        elif kind == "start" and tag == "br":
+            cell.append(HARD)
+        elif kind == "text" and _BLANK_FIRST.match(event[1]):
+            cell.append(_cell_markdown(event[1]))
+        else:  # (a link of a cell: its address with it - "[link" lost it)
             cell.append(_tag_markdown(event, links, opened).replace("\n", " "))
+    closed()
     rows = [row for row in rows if row]
+    under = "\n\n" + "\n\n".join(loose) + "\n\n" if loose else ""
     if not rows:
-        return "\n\n"
+        return under or "\n\n"
     # (spans: every cell under its own column, the spanning one marked -
     # _merge_spans merges its cells once Qt laid the table out)
     grid, spans = markdown_doc.span_grid(rows)
     rows = [["" if cell is None else cell for cell in row] for row in grid]
     for row, column, down, across in spans:
         rows[row][column] = f"{SPAN_MARK}{down}:{across}{SPAN_END}{rows[row][column]}"
+    mirrored = not spans and _rtl(_MARK_CHARS.sub("", rows[0][0]))
     if not headed:  # (cells all: no header drawn bold on a tint - markdown-it's page shows none)
         rows[0][0] = NO_HEAD + rows[0][0]
     columns = max(len(row) for row in rows)
     rule = {"left": ":---", "center": ":---:", "right": "---:"}
+    aligns = aligns[:columns] + [""] * (columns - len(aligns))
+    if mirrored:  # (right-to-left text: its first column on the right - MIRRORED)
+        rows = [(row + [""] * (columns - len(row)))[::-1] for row in rows]
+        rows[0][0] = MIRRORED + rows[0][0]
+        aligns = aligns[::-1]
     lines = ["| " + " | ".join(row + [""] * (columns - len(row))) + " |" for row in rows]
-    delimiter = "|" + "|".join(rule.get(a, "---") for a in aligns + [""] * (columns - len(aligns))) + "|"
-    return "\n\n" + "\n".join([lines[0], delimiter] + lines[1:]) + "\n\n"
+    delimiter = "|" + "|".join(rule.get(a, "---") for a in aligns) + "|"
+    return "\n\n" + "\n".join([lines[0], delimiter] + lines[1:]) + "\n\n" + under.lstrip("\n")
+
+
+#: (_html_table) a cell's text that begins with an empty line: Markdown, as GFM reads it after one.
+_BLANK_FIRST = re.compile(r"[ \t]*\n[ \t]*\n")
+#: (_cell_markdown) a line that is a list item: its mark.
+_CELL_ITEM = re.compile(r"[ \t]*(?:[-+*]|(\d{1,9}[.)]))[ \t]+(?=\S)")
+#: (_cell_markdown) what Qt's own parser would read as a tag or a character reference: text there.
+_CELL_LITERAL = re.compile(r"[<&]")
+
+
+def _span(written) -> int:
+    """A cell's colspan or rowspan as a number (one that is none: 1)."""
+    return int(written) if isinstance(written, str) and written.isdigit() and 0 < len(written) < 5 else 1
+
+
+def _cell_markdown(text: str) -> str:
+    """(_html_table) a cell's text after an empty line as a table's cell holds it: its inline Markdown as
+    it is, its paragraphs and list items lines of the cell (hard breaks), a list item behind a bullet or its
+    number."""
+    lines, fresh = [], True
+    for row in text.split("\n"):
+        if not row.strip():
+            fresh = True
+            continue
+        item = _CELL_ITEM.match(row)
+        if item is not None:
+            lines.append((item.group(1) or "\u2022") + " " + row[item.end():].strip())
+        elif fresh or not lines:
+            lines.append(row.strip())
+        else:
+            lines[-1] += " " + row.strip()
+        fresh = False
+    return HARD.join(_CELL_LITERAL.sub(lambda found: "\\" + found.group(0), line) for line in lines)
 
 
 # -- fenced code --
@@ -4030,8 +4498,11 @@ def collector_held():
     tokens: millions of objects for a big text) made each of them longer - 0.43 s each, Python's lock held,
     the window frozen 1.3 s while a page was exported. The young generations are still collected (their
     passes stay short - the collector switched off instead left all of it to one pass of 0.2 s after); the
-    full pass comes after, over what is left alive. Only around a page's making - pure Python, it ends -
-    never around a read that may wait on a slow server."""
+    full pass comes after, over what is left alive - which must be little: a making leaves no heap of
+    garbage only the collector can free (core.markdown_doc's _Sanitizer kept the events of the HTML it read
+    last, in a cycle with its parser - a raw table of 150,000 rows left 1.6 million tuples for that pass:
+    one turn of 0.55 s of the GUI thread as the page was opened). Only around a page's making - pure
+    Python, it ends - never around a read that may wait on a slow server."""
     import gc
 
     # (one page made at a time - see _MAKING; never waited for on the GUI thread: a small page made there goes
@@ -4063,6 +4534,41 @@ def collector_held():
 #: of it taken by the other: the window did not answer 0.16 to 0.24 s. Python runs one of them at a time
 #: anyway; the second waits without the lock. (Re-entrant: a making within a making.)
 _MAKING = threading.RLock()
+
+
+#: Characters of a text past which the worker that made its page collects before it hands the page over
+#: (_collected_here).
+COLLECT_CHARS = 100_000
+
+
+def _collected_here(size: int) -> None:
+    """(a worker, a page of a text of *size* characters just made) Python's collector run here, in full:
+    what the page holds - headings by the hundred thousand for a text of underlines - is new, and the
+    collector walks what is new at its next passes, three of them, in whatever thread makes an object next:
+    the GUI thread's, as the page is shown. After a full pass here they are old, and the next full pass is
+    far off. A short text's page is small: nothing to walk."""
+    if size > COLLECT_CHARS:
+        import gc
+
+        gc.collect()
+
+
+#: Seconds _dropped_elsewhere holds what a view lets go of (the view's own reference goes within its turn).
+DROP_SECONDS = 2.0
+
+
+def _dropped_elsewhere(*things) -> None:
+    """*things* (a page shown before, what it was made from) let go of on a thread of its own: freeing a
+    big page's objects is the work of whoever holds them last - not the GUI thread's turn."""
+    kept = [thing for thing in things if thing is not None]
+    if not kept:
+        return
+
+    def drop() -> None:  # (held here until the view has let go of them: theirs is the last reference then)
+        time.sleep(DROP_SECONDS)
+        kept.clear()
+
+    threading.Thread(target=drop, name="markdown-dropped", daemon=True).start()
 
 
 def held_while(fn, *args):
@@ -4259,27 +4765,51 @@ class ImageSource:
         return found
 
 
-def _page(text: str, dark: bool, toggled=frozenset(), first_details: int = 0, notes=None):
+def _page(text: str, dark: bool, toggled=frozenset(), first_details: int = 0, notes=None,
+          after_code: bool = False):
     """(the HTML of *text* in parts, its headings) through markdown-it - pure
     Python, so it may run on a worker thread. *toggled*: the <details> a
     click opened or folded (ui.markdown_html.fold_details); *notes*: a long
-    text's footnotes, numbered across its pieces (markdown_doc.parse)."""
+    text's footnotes, numbered across its pieces (markdown_doc.parse);
+    *after_code*: the piece of the text before this one ended with a code
+    block and this one begins with one - the line between them is drawn
+    (ui.markdown_html's code gap: without it Qt joined the two)."""
     from axross_markdown._ax.core import markdown_doc
     from axross_markdown._ax.ui.markdown_html import to_html_parts
 
     with _window_emoji():
         doc = markdown_doc.parse(text, notes=notes)
+    _code_after_code(doc, after_code)
     hidden: dict = {}
     try:
-        return to_html_parts(doc, dark, PART_BLOCKS, toggled, hidden, first_details), doc.headings, hidden
+        return to_html_parts(doc, dark, PART_BLOCKS, toggled, hidden, first_details), _Headings(doc.headings), hidden
     except (Exception, RecursionError) as exc:  # noqa: BLE001 - a fault of one block: the text as written,
         log.warning("A page could not be rendered; shown as written", exc_info=True)  # never a blank page
         doc, hidden = markdown_doc.as_written(doc.source or text, exc), {}
-        return to_html_parts(doc, dark, PART_BLOCKS, toggled, hidden, first_details), doc.headings, hidden
+        return to_html_parts(doc, dark, PART_BLOCKS, toggled, hidden, first_details), _Headings(doc.headings), hidden
+
+
+class _Headings(list):
+    """A page's headings and their titles by anchor - made with the page, on its worker: read from 150,000
+    headings as the page was shown (lines of "=", each a heading's underline), the titles were 0.08 s of
+    that turn - 0.17 s with the rest of it, at each pause of the preview."""
+
+    def __init__(self, headings=()):
+        super().__init__(headings)
+        self.titles = {heading.anchor: heading.text for heading in self}
+
+
+def _code_after_code(doc, after_code: bool) -> None:
+    """(a piece of a long text that begins with a code block after one - _page) its first block told."""
+    first = doc.tokens[0] if after_code and getattr(doc, "tokens", None) else None
+    if first is not None and first.type in ("fence", "code_block"):
+        first.meta = {**(first.meta or {}), "after_code": True}
 
 
 #: (MarkdownView._fresh_document) a page of more blocks than this is let go of a piece of so many a turn.
 DISPOSE_BLOCKS = 2000
+#: (a document let go of) the blocks of it deleted a turn: DISPOSE_BLOCKS, fewer as it holds more images.
+_DISPOSE_STEP = "axrossDisposeStep"
 
 #: Blocks of a part of the page printed or saved as PDF (print_parts): each a
 #: document of its own, laid out and drawn in a turn of its own - as many as
@@ -4307,7 +4837,38 @@ def print_parts(text: str, full: bool) -> tuple[str, list[str]]:
             parts.extend(to_html_parts(doc, False, PRINT_BLOCKS, first_details=number * DETAILS_SPAN))
         return "html", parts
     shown = markdown_doc.clean(renderable(text, min(MD4C_TABLE_CELLS, PRINT_TABLE_CELLS))[0])
-    return "md4c", list(_md4c_page(shown)[0])
+    return "md4c", list(_md4c_page(shown, ALL_OPEN)[0])  # (every <details> open: nothing is left out)
+
+
+#: (lean_qt_html) a style attribute as Qt's toHtml writes one.
+_QT_STYLE = re.compile(r' style="([^"<>]{1,2000})"')
+
+
+def lean_qt_html(head: str, bodies: list[str]) -> tuple[str, list[str]]:
+    """Qt's own HTML (QTextDocument.toHtml: *head* up to and with "<body …>", the *bodies* of a page's
+    parts) with each style it writes out again and again as a class of the page's style sheet: toHtml
+    writes every block's and every span's whole style into its tag - a page of 3,000 sections was 9.2 MB,
+    4.4 times markdown-it's export of it. Pure Python, a part a call (for a worker thread); at most
+    LEAN_CLASSES classes, the styles beyond as they are."""
+    classes: dict[str, str] = {}
+
+    def named(match: re.Match) -> str:
+        style = match.group(1)
+        name = classes.get(style)
+        if name is None:
+            if len(classes) >= LEAN_CLASSES:
+                return match.group(0)
+            name = classes[style] = f"q{len(classes)}"
+        return f' class="{name}"'
+
+    bodies = [_QT_STYLE.sub(named, body) for body in bodies]
+    if not classes or "</head>" not in head:
+        return head, bodies
+    sheet = "\n".join(f".{name} {{{style.strip()}}}" for style, name in classes.items())
+    return head.replace("</head>", f'<style type="text/css">\n{sheet}\n</style></head>', 1), bodies
+
+
+LEAN_CLASSES = 2000
 
 
 def parsed_pieces(shown: str):
@@ -4324,11 +4885,14 @@ def parsed_pieces(shown: str):
     notes = notes_of(shown) if len(placed) > 1 else None
     anchors: dict = {}
     held: dict = {}  # (a <details> around many pieces: open in the next one - markdown_doc.parse's *held*)
+    from axross_markdown._ax.core.markdown_term import begins_after_code
+
     for number, (piece, line) in enumerate(placed):
         last = number == len(placed) - 1
         with _window_emoji():
             doc = markdown_doc.parse(piece, notes=(notes, last, line) if notes else None,
                                      anchors=anchors, held=(held, last))
+        _code_after_code(doc, bool(number) and begins_after_code(placed[number - 1][0], piece))
         yield doc
         del doc
 
@@ -4608,7 +5172,7 @@ class MarkdownBrowser(QTextBrowser):
 
     def resizeEvent(self, event):  # noqa: N802 - Qt
         document = self.document()
-        if self.lineWrapMode() == QTextBrowser.LineWrapMode.FixedPixelWidth and document.blockCount() > RESIZE_BLOCKS \
+        if self.lineWrapMode() == QTextBrowser.LineWrapMode.FixedPixelWidth and self.view._weight() > RESIZE_BLOCKS \
                 and round(document.pageSize().width()) == self.lineWrapColumnOrWidth() \
                 and not getattr(self.view, "_replacing_now", False):
             # (the page's width is the wrap's, the window's size whatever: QTextEdit's own resizeEvent laid all of
@@ -4889,14 +5453,7 @@ class MarkdownView(QWidget):
         self.dark = bool(dark)
         self._theme_ground = dark if self._chosen_theme() is not None else None
         toggled = frozenset(self.folds)
-        self._page_generation += 1
-        generation = self._page_generation
-        self._page, self._rest, self._readable, self._whole, self._scheduled = None, None, False, False, False
-        self._stand_in = False
-        self._target = None
-        self._more_text = None
-        self._pieces = 1
-        self._gaps, self._want, self._starts, self._on_laid = [], None, {}, []
+        generation = self._page_begun()
         # (a copy under way when the page is made anew: said, not dropped silently - until the next page)
         self._cancelled = tr("Copy cancelled: the page was made anew.") if self._copying() else ""
         self.browser.document().setProperty(_WIDENED, False)  # (a new page: its own tables say)
@@ -4905,6 +5462,7 @@ class MarkdownView(QWidget):
         self._copy_job = None
         self._copy_waiting = False
         self._clamped_room, self._unclamped = None, 0
+        self._images_gone, self._images_laid = getattr(self, "_images_laid", 0), 0
         made_key = (text, full, cells, dark, toggled)
         made_last = getattr(self, "_made", None)
         again_made = again is not None and made_last is not None and made_last[0] == made_key
@@ -4933,7 +5491,7 @@ class MarkdownView(QWidget):
                 return why, (made, [part_headings("md4c", piece) for piece in made[0]], hidden)
             # (a long text parsed in parts, its first shown as soon as it is:
             # markdown-it took 7.8 s for 3.8 MB before the page showed anything)
-            from axross_markdown._ax.core.markdown_term import labeled_inline_notes, notes_of, text_parts_at
+            from axross_markdown._ax.core.markdown_term import begins_after_code, labeled_inline_notes, notes_of, text_parts_at
 
             part = labeled_inline_notes(part)  # (a text with inline notes in parts too: one, 10 s)
             placed = text_parts_at(part)
@@ -4943,16 +5501,20 @@ class MarkdownView(QWidget):
             # the line it begins at)
             notes = notes_of(part) if len(pieces) > 1 else None
             first = _page(pieces[0], dark, toggled, notes=(notes, len(pieces) == 1, placed[0][1]) if notes else None)
+            after = frozenset(number for number in range(1, len(pieces))
+                              if begins_after_code(pieces[number - 1], pieces[number]))
             return why, (first, pieces[1:], [part_headings("html", piece) for piece in first[0]],
-                         (notes, [line for _piece, line in placed]))
+                         (notes, [line for _piece, line in placed], after))
 
         def made():  # (the page made and a copy of it to lay out: the copy made on the worker too - _fresh of
             # 100,000 headings' outline was 0.16 s of a zoom's turn)
             with collector_held():
                 result = prepare()
-                return result, _fresh(result)
+                pair = result, _fresh(result)
+            _collected_here(len(raw))
+            return pair
 
-        def done(pair, error):
+        def done(pair, error, generation=generation, where=where):
             if generation != self._page_generation:
                 return  # (a newer page is on its way)
             if error is not None:
@@ -4961,6 +5523,9 @@ class MarkdownView(QWidget):
                 self.status.setText(_t("Cannot render: {error}", error=printable(error)))
                 return
             result, copy = pair
+            # (the page before, let go of on a thread of its own: 150,000 headings freed in this turn, and
+            # the collector's walks of the new ones, were 0.17 s of a preview's second rendering)
+            _dropped_elsewhere(getattr(self, "_made", None), self._page, getattr(self, "_pieces_made", None))
             self._made = (made_key, result)  # (a zoom lays it out again: relaid)
             pieces_made = getattr(self, "_pieces_made", None)
             if pieces_made is None or pieces_made[0] != made_key:  # (the later pieces parsed of this page: kept)
@@ -4970,8 +5535,14 @@ class MarkdownView(QWidget):
             why, page = copy
             self.notice.setText(why)
             self.notice.setVisible(bool(why))
+            reading = getattr(self, "_reading_next", None)
+            if again is None and reading is not None and tuple(reading[0]) != (0, 0) and self.isVisible():
+                # (a page read far on shown anew - its theme switched, its file read again: the view's
+                # picture kept until the place read is shown again - its top was painted meanwhile, 0.2 to
+                # 0.56 s of a page of 2,000 sections)
+                self._freeze_view(generation, RELOAD_FROZEN_MS)
             if full:
-                page, pieces, heads, (self._notes, self._piece_lines) = page
+                page, pieces, heads, (self._notes, self._piece_lines, self._after_code) = page
                 self._more_text = (generation, list(pieces)) if pieces else None
                 self._pieces = len(pieces) + 1  # (_show_page: the page's share parsed so far)
                 self._show_page(generation, page, None, dark, where, began, heads)
@@ -4980,6 +5551,10 @@ class MarkdownView(QWidget):
                 page, heads, self.hidden = page
                 self._show_pieces(generation, page, where, began, heads)
 
+        if not full and again is None and self.pending is None and len(raw) > MD4C_HEAD_CHARS \
+                and "[^" not in raw and (self._reading_next is None or tuple(self._reading_next[0]) == (0, 0)):
+            self._head_first(raw, cells, toggled, generation, where, began, done)
+            return
         if again_made:  # (the page as it was made: laid out anew a part a turn - the copy to lay out made on a
             # worker: _fresh of 100,000 headings' outline was 0.16 s of the zoom's turn)
             kept = made_last[1]
@@ -4999,6 +5574,107 @@ class MarkdownView(QWidget):
             in_background(made, owner=self, done=done)
         else:
             done(made(), None)
+
+    def _head_first(self, raw: str, cells: int, toggled, generation: int, where: int, began: float, done) -> None:
+        """(Qt's own parser, a long text shown from its top) its first part made and shown before the rest is
+        made: every pass over the text and the colours of all of its code came before the first screen - 1 MB
+        of sections with a code block each 9 s, 3 MB 26 s, 7 MB 54 s, 60,000 small code blocks 45 s of an
+        empty window. The first part (text_parts_at's: cut before a block of the top level, the definitions
+        its links name with it) is a page of its own, shown as "Rendering…" goes on; the whole page takes
+        its place when it is made, the reader where they were (as a reload keeps the place). Not with
+        footnotes (they are numbered across the text), a fold in the first part, a link's anchor to go to,
+        or a place far on to come back to: then the whole page first, as before."""
+        from axross_markdown._ax.core.markdown_doc import clean
+
+        def headed():
+            from axross_markdown._ax.core.markdown_term import text_parts_at
+
+            with collector_held():
+                emoji_ready(raw)
+                part, why = renderable(raw, cells)
+                part = clean(part)
+                first = text_parts_at(part)[0][0]
+                if len(first) >= len(part) or "<details" in first.lower():
+                    return part, why, None
+                hidden: dict = {}
+                made = _md4c_page(first, toggled, hidden)
+                return part, why, _fresh((why, (made, [part_headings("md4c", piece) for piece in made[0]], hidden)))
+
+        def whole(part, why):
+            with collector_held():
+                hidden: dict = {}
+                made = _md4c_page(part, toggled, hidden)
+                result = why, (made, [part_headings("md4c", piece) for piece in made[0]], hidden)
+                return result, _fresh(result)
+
+        job: dict = {"generation": generation, "text": None, "waiting": [], "whole": False}
+
+        def shown_whole(pair, error) -> None:
+            if generation != self._page_generation or sip.isdeleted(self):
+                return  # (a newer page is on its way)
+            self._head_job = None
+            if self._page is not None and self._page.get("head"):
+                # (the head's page gives way: the place read in it kept, nothing of it laid out on)
+                self._reading_next = self._reading()
+                place = self.browser.verticalScrollBar().value()
+                done(pair, error, self._page_begun(), place)
+            else:
+                done(pair, error)
+            # (what was asked of the page while only its first part was there: all of it laid out, an anchor
+            # or its end gone to - now, on the whole page)
+            if job["whole"] and error is None:
+                self.load_rest()
+            for then in job["waiting"]:
+                then()
+
+        def whole_now() -> None:
+            """(load_rest_now: the whole page is waited for) made here, the worker's dropped when it comes."""
+            part, why = job["text"]
+            shown_whole(whole(part, why), None)
+
+        def shown_head(result, error) -> None:
+            if generation != self._page_generation or sip.isdeleted(self):
+                return
+            if error is not None:
+                done(None, error)
+                return
+            part, why, head = result
+            job["text"] = (part, why)
+            if head is not None:
+                why, (page, heads, self.hidden) = head
+                self.notice.setText(why)
+                self.notice.setVisible(bool(why))
+                self._show_pieces(generation, page, where, began, heads)
+                if self._page is not None:
+                    self._page["head"] = True
+                self._busy(tr("Rendering…"), True)
+                job["now"] = whole_now
+                self._head_job = job
+            in_background(lambda: whole(part, why), owner=self, done=shown_whole)
+
+        self._head_job = None
+        self._busy(tr("Rendering…"), True)
+        in_background(headed, owner=self, done=shown_head)
+
+    def _head_only(self) -> dict | None:
+        """(see _head_first) what waits for the whole page while only the text's first part is shown - else
+        None."""
+        job = getattr(self, "_head_job", None)
+        if job is None or self._page is None or not self._page.get("head") \
+                or job["generation"] != self._page_generation:
+            return None
+        return job
+
+    def _page_begun(self) -> int:
+        """A page about to be made: nothing of the one before goes on being laid out. Its generation."""
+        self._page_generation += 1
+        self._page, self._rest, self._readable, self._whole, self._scheduled = None, None, False, False, False
+        self._stand_in = False
+        self._target = None
+        self._more_text = None
+        self._pieces = 1
+        self._gaps, self._want, self._starts, self._on_laid = [], None, {}, []
+        return self._page_generation
 
     def _new_document(self) -> None:
         """(a new page's first part about to be shown) a big page's document swapped for an empty one, the old
@@ -5027,6 +5703,8 @@ class MarkdownView(QWidget):
             new.setProperty(bytes(name).decode("utf-8"), old.property(bytes(name).decode("utf-8")))
         old.setParent(self)  # (not the browser's control's: setDocument deleted it then - the same 0.17 s; the view's,
         # gone with it)
+        images = max(getattr(self, "_images_gone", 0), getattr(self, "_images_laid", 0))
+        old.setProperty(_DISPOSE_STEP, int(DISPOSE_BLOCKS * old.blockCount() / max(1, old.blockCount() + images)))
         self._old_documents.append(old)
         try:  # (its pieces let go of are no change of the page's text: _laid_text)
             old.contentsChange.disconnect(self._laid_changed)
@@ -5050,9 +5728,11 @@ class MarkdownView(QWidget):
         if sip.isdeleted(self) or not self._old_documents:
             return
         old = self._old_documents[0]
-        if old.blockCount() > DISPOSE_BLOCKS:
+        # (fewer blocks a turn the more images they hold: 2,000 blocks of ten images each were 0.09 s)
+        step = max(50, int(old.property(_DISPOSE_STEP) or DISPOSE_BLOCKS))
+        if old.blockCount() > step:
             cursor = QTextCursor(old)
-            cursor.setPosition(old.findBlockByNumber(old.blockCount() - DISPOSE_BLOCKS).position())
+            cursor.setPosition(old.findBlockByNumber(old.blockCount() - step).position())
             cursor.movePosition(QTextCursor.MoveOperation.End, QTextCursor.MoveMode.KeepAnchor)
             cursor.removeSelectedText()
         else:
@@ -5183,6 +5863,9 @@ class MarkdownView(QWidget):
         self.fit_text()
         body = "".join(parts)
         self.page_images = "<img " in body
+        if "<img " in parts[0]:
+            _plain_images(document)
+            _keep_reader(self.browser, 0, 0)  # (an image put in anew at the page's start moved the cursor on)
         self.names = anchor_names(body)  # (all of the page's - also of parts not laid out yet)
         waiting = getattr(self, "_more_text", None)
         texts = list(waiting[1]) if waiting else []
@@ -5192,7 +5875,8 @@ class MarkdownView(QWidget):
                       "parts": list(parts) + [_Unparsed(number + 1) for number in range(len(texts))],
                       "texts": [""] + texts, "where": where, "began": began,
                       "loading": bool(texts), "pieces": (1, getattr(self, "_pieces", 1)),
-                      "titles": {heading.anchor: heading.text for heading in headings},
+                      "titles": dict(getattr(headings, "titles", None)
+                                     or {heading.anchor: heading.text for heading in headings}),
                       # (where each entry comes from: (its piece of the text, its part there) - a
                       # place kept across a reload, the parts' numbers moved as pieces came)
                       "origin": [(0, number) for number in range(len(parts))]
@@ -5235,6 +5919,7 @@ class MarkdownView(QWidget):
             self._parse_next(generation, dark, toggled)
 
         notes = self._pieces_notes(piece, len(page["texts"]))
+        after_code = piece in (getattr(self, "_after_code", None) or ())
         made_key = (getattr(self, "_made", None) or (None,))[0]
         pieces_made = getattr(self, "_pieces_made", None)
         kept = pieces_made[1] if pieces_made is not None and pieces_made[0] == made_key else None
@@ -5253,7 +5938,8 @@ class MarkdownView(QWidget):
             return
 
         def parse():  # (its <details> numbered from a place of its own: the same whatever came first)
-            made = _page(text, dark, toggled, piece * DETAILS_SPAN, notes)
+            # (said only when it is so: a piece after a code block that begins with one)
+            made = _page(text, dark, toggled, piece * DETAILS_SPAN, notes, **({"after_code": True} if after_code else {}))
             return made + ([part_headings("html", part) for part in made[0]],)
 
         in_background(lambda: held_while(parse), owner=self, done=done_kept)
@@ -5290,7 +5976,8 @@ class MarkdownView(QWidget):
             self._page["ratio"] = made / max(1, written)
         parsed, total = self._page.get("pieces", (1, 1))
         self._page["pieces"] = (min(total, parsed + 1), total)
-        self._page["titles"].update({heading.anchor: heading.text for heading in headings})
+        self._page["titles"].update(getattr(headings, "titles", None)
+                                    or {heading.anchor: heading.text for heading in headings})
         body = "".join(parts)
         self.page_images = self.page_images or "<img " in body
         self.names |= anchor_names(body)
@@ -5299,7 +5986,7 @@ class MarkdownView(QWidget):
         if (self._want is not None or self._gaps and self._gap_in_view()[0] is not None) and not self._scheduled:
             self._schedule()  # (a jump - or a gap in view - waited for this piece)
         elif self._rest is not None and not self._scheduled:
-            if self._whole or (self.browser.document().blockCount() <= EAGER_BLOCKS and self._rest <= EAGER_PARTS) \
+            if self._whole or (self._weight() <= EAGER_BLOCKS and self._rest <= EAGER_PARTS) \
                     or self._near_end():
                 self._schedule()
             else:  # (paused: said so - "Rendering…" stayed until the page was scrolled)
@@ -5320,6 +6007,7 @@ class MarkdownView(QWidget):
         time (a list of 100,000 items held the window 2.5 s at a time)."""
         page = self._page
         self._settle(start, done - 1)
+        self._images_in(done - 1)
         count = len(page["parts"])
         if done >= count:
             if page.get("loading"):
@@ -5334,7 +6022,7 @@ class MarkdownView(QWidget):
             self._finish()
             return
         self._rest = done
-        if not self._whole and (self.browser.document().blockCount() > EAGER_BLOCKS or done > EAGER_PARTS) \
+        if not self._whole and (self._weight() > EAGER_BLOCKS or done > EAGER_PARTS) \
                 and not self._near_end() and not self._on_laid:  # (a part waited for: laid out on to it)
             self._finish()
             self._shown(_t("Shown: {percent} of the page – the rest as you scroll on",
@@ -5350,6 +6038,20 @@ class MarkdownView(QWidget):
         if getattr(self, "_target", None) is not None:  # (the thumb where it was dropped meanwhile)
             self._hold_target()
         self._schedule()
+
+    def _images_in(self, number: int) -> None:
+        """(the part *number* laid out) its images counted: _weight."""
+        part = self._page["parts"][number] if 0 <= number < len(self._page["parts"]) else None
+        if isinstance(part, str):
+            self._images_laid = getattr(self, "_images_laid", 0) \
+                + part.count("<img " if self._page["kind"] == "html" else "![")
+
+    def _weight(self) -> int:
+        """What is laid out of the page, as blocks: its blocks and its images, each of which Qt asks for its
+        size when its line is laid out - a page of ten images a paragraph was 2,200 blocks of 22,000 images
+        laid out before it paused: under every bound counted in blocks, 0.36 s of one turn at each zoom,
+        resize and theme switch that laid it out again."""
+        return self.browser.document().blockCount() + getattr(self, "_images_laid", 0)
 
     def _progress(self, done: int) -> str:
         """How much of the page is laid out with *done* parts in it - of the
@@ -5547,7 +6249,7 @@ class MarkdownView(QWidget):
             return document.documentLayout().blockBoundingRect(document.lastBlock()).top()
         return bar.maximum() + bar.pageStep()
 
-    def _freeze_view(self, generation: int) -> None:
+    def _freeze_view(self, generation: int, at_most: int | None = None) -> None:
         """(a page made anew as it is - a zoom, a resize - away from its first part) the view's picture kept
         until the place read is shown again (_thaw_view), at most FROZEN_MS: the page's top was painted
         meanwhile - empty, then its first part for 0.65 s (10,000 sections), then the place again; at every
@@ -5556,8 +6258,8 @@ class MarkdownView(QWidget):
         self._frozen = generation
         if viewport.updatesEnabled():
             viewport.setUpdatesEnabled(False)
-        QTimer.singleShot(FROZEN_MS, lambda: None if sip.isdeleted(self) or getattr(self, "_frozen", None)
-                          != generation else self._thaw_view())
+        QTimer.singleShot(at_most or FROZEN_MS, lambda: None if sip.isdeleted(self)
+                          or getattr(self, "_frozen", None) != generation else self._thaw_view())
 
     def _thaw_view(self) -> None:
         """The view painted again (see _freeze_view)."""
@@ -5575,7 +6277,13 @@ class MarkdownView(QWidget):
         *seconds* while the page's layout changes - unless the reader
         scrolls meanwhile (a zoom laid the page out again in steps, the view
         drifted a paragraph or two each)."""
-        self._held = (anchor or self._view_anchor(), time.monotonic() + seconds)
+        cursor, offset = anchor or self._view_anchor()
+        # (its block is the place, whatever is put in right at its start: the page's last block takes the
+        # next part's first - a cursor there rode on to that part's end, and with each part after it; a
+        # zoom out on a page not read to its end drifted on from section 746 to 794)
+        cursor = QTextCursor(cursor)
+        cursor.setKeepPositionOnInsert(True)
+        self._held = ((cursor, offset), time.monotonic() + seconds)
         self._keep_view(self._held[0])
 
     @contextlib.contextmanager
@@ -5610,14 +6318,15 @@ class MarkdownView(QWidget):
         self._held = None
 
     def _moved(self, *args) -> None:
-        if self._held is not None and not getattr(self, "_placing", False):
+        if self._held is not None and not getattr(self, "_placing", False) and not getattr(self, "_zooming", False):
             self._held = None  # (moved by something else: find, a jump)
         self._scrolled(*args)
 
     def _scrolled(self, *_args) -> None:
         bar = self.browser.verticalScrollBar()
         if self._readable and not getattr(self, "_placing", False) and self._page is not None:
-            far = self._dropped_far()
+            # (never during a zoom: the page's height changes under the bar's value then - no drop)
+            far = self._dropped_far() if not getattr(self, "_zooming", False) else None
             if far is not None:  # (the scroll bar dropped far on: the part of that place first)
                 self._want, self._target, self._want_at = far, None, bar.value()
                 self._busy(_t("Rendering… {percent}", percent=self._progress(self._rest or 0)))
@@ -5625,7 +6334,7 @@ class MarkdownView(QWidget):
                 return
             if self._gap_in_view()[0] is not None:  # (a jump's gap scrolled to: its parts there)
                 self._schedule()
-        if self._stand_in and not getattr(self, "_placing", False):
+        if self._stand_in and not getattr(self, "_placing", False) and not getattr(self, "_zooming", False):
             # (the scroll bar dropped beyond what is laid out: laid out up to
             # there, the thumb kept there - it snapped back)
             self._target = bar.value() if bar.value() + bar.pageStep() > self._content_end() else None
@@ -5672,6 +6381,11 @@ class MarkdownView(QWidget):
         browser, document = self.browser, self.browser.document()
         flags = flags if flags is not None else (QTextDocument.FindFlag.FindBackward if backward
                                                  else QTextDocument.FindFlag(0))
+        if again is not None and needle:
+            folded = self._laid_text()[1]
+            if folded is not None and not self._skeleton(folded).done:
+                self._skeleton_then = again  # (a long text read for Find in turns of its own: then *again()*)
+                return None
         cursor = browser.textCursor()
         since, self._found_part = getattr(self, "_found_part", None), None
         if since is not None and self._is_laid(since) and since in self._starts:
@@ -5685,6 +6399,33 @@ class MarkdownView(QWidget):
                 edge = QTextCursor(document)
                 edge.movePosition(QTextCursor.MoveOperation.End if backward else QTextCursor.MoveOperation.Start)
                 hit = self._find_laid(needle, edge, flags)
+        head = self._head_only() if hit.isNull() or wrapped else None
+        if head is not None and again is not None:
+            # (only the text's first part is there, and nothing more of it after the cursor: looked for in
+            # the whole page when it comes - "not found" was said of a word further down)
+            kept = browser.textCursor()
+            at = (kept.anchor(), kept.position())
+
+            def go_on() -> None:
+                if head.get("find") is not go_on:
+                    return  # (a later Find waits instead: one find goes on, from where the last one was)
+                head["find"] = None
+                # (the whole page's first part is the first part shown: the match find had got to selected
+                # there again - find went on from the page's top, the matches of the first part once more)
+                start = self._starts.get(0) if self._page is not None else None
+                if self._page is None or (start is not None and self._is_laid(0)):
+                    offset = start.position() if start is not None else 0
+                    document = self.browser.document()
+                    if offset + max(at) < document.characterCount():
+                        place = QTextCursor(document)
+                        place.setPosition(offset + at[0])
+                        place.setPosition(offset + at[1], QTextCursor.MoveMode.KeepAnchor)
+                        self.browser.setTextCursor(place)
+                again()
+
+            head["find"] = go_on
+            head["waiting"].append(go_on)
+            return None
         if self._page is not None and self.more():
             numbers = self._before_match(cursor.position(), None if hit.isNull() else hit.position(),
                                          wrapped, backward, needle)
@@ -5703,8 +6444,9 @@ class MarkdownView(QWidget):
         if not needle or any(ch in needle for ch in "\n\u2029\u2028\xa0\ufffc"):  # (toPlainText's own)
             return True
         plain, folded = self._laid_text()
-        if folded is not None and _plainly_found(needle):
-            return _folded(needle) in folded
+        if folded is not None and _plainly_found(_find_key(_folded(needle))):
+            wanted = _find_key(_folded(needle))
+            return not wanted or wanted in self._skeleton(folded).text()
         return needle.casefold() in plain.casefold()
 
     def _laid_text(self) -> tuple[str, str | None]:
@@ -5745,7 +6487,48 @@ class MarkdownView(QWidget):
             folded = _folded(plain)
             folded = folded if len(folded) == len(plain) else None
         self._plain_kept, self._laid_from = (document, count, plain, folded, wide), count
+        self._skeleton_from = min(getattr(self, "_skeleton_from", 0), start)  # (_skeleton: read again from there)
         return plain, folded
+
+    def _skeleton(self, folded: str) -> _Skeleton:
+        """_laid_text's lower case text as Find compares it (_Skeleton: normal forms and unseen characters
+        aside), kept and read again from where the page changed."""
+        kept = getattr(self, "_skeleton_kept", None)
+        if kept is None:
+            kept = self._skeleton_kept = _Skeleton()
+            self._skeleton_from = 0
+        if kept.folded is not folded:
+            kept.update(folded, self._skeleton_from)
+            self._skeleton_from = len(folded)
+        if not kept.done and not getattr(self, "_skeleton_later", False) \
+                and (len(folded) > SKELETON_AT_ONCE or not kept.more(SKELETON_TURN)):
+            # (a long text of such characters - 5 MB written with combining accents: read on in turns of its
+            # own, a piece of it a turn - find_match waits for it -, then Find's marks and count once more; a
+            # turn of 0.19 s read at once)
+            self._skeleton_later = True
+            QTimer.singleShot(0, self._skeleton_on)
+        return kept
+
+    def _skeleton_on(self) -> None:
+        """(a turn of its own) _skeleton's text read on; all of it read - or the page another since: the find
+        that waited for it goes on (find_match), else Find's marks and count are made once more."""
+        if sip.isdeleted(self):
+            return
+        self._skeleton_later = False
+        kept = getattr(self, "_skeleton_kept", None)
+        if kept is None:
+            return
+        plain_kept = getattr(self, "_plain_kept", None)
+        same = plain_kept is not None and plain_kept[3] is kept.folded
+        if same and not kept.done and not kept.more(SKELETON_TURN):
+            self._skeleton_later = True
+            QTimer.singleShot(0, self._skeleton_on)
+            return
+        then, self._skeleton_then = getattr(self, "_skeleton_then", None), None
+        if then is not None:
+            then()  # (the find that waited: it looks again - and waits again for a page read anew)
+        elif same:
+            self.returned.emit()  # (the window's Find marks and counts again: ui.markdown_viewer._marks_again)
 
     def _position_of(self, index: int) -> int:
         """The document's position of the index *index* of _laid_text's text."""
@@ -5769,21 +6552,29 @@ class MarkdownView(QWidget):
         backward = bool(flags & QTextDocument.FindFlag.FindBackward)
         _plain, folded = self._laid_text()
         if folded is None or flags & ~QTextDocument.FindFlag.FindBackward or not needle \
-                or any(ch in needle for ch in "\n\u2029\u2028\xa0\ufffc") or not _plainly_found(needle):
+                or any(ch in needle for ch in "\n\u2029\u2028\xa0\ufffc") \
+                or not _plainly_found(_find_key(_folded(needle))):
             return document.find(needle, cursor, flags)
         wanted = _folded(needle)
         if len(wanted) != len(needle):
             return document.find(needle, cursor, flags)
+        # (normal forms and unseen characters aside - _Skeleton: "café" composed found one written with a
+        # combining accent not, a soft hyphen in a word hid it; the match is the page's own characters)
+        wanted, skeleton = _find_key(wanted), self._skeleton(folded)
+        if not wanted:
+            return document.find(needle, cursor, flags)
+        text = skeleton.text()
         if backward:  # (as Qt's: a match that begins before the selection - none before the page's start)
-            before = self._at_position(cursor.selectionStart())
-            at = folded.rfind(wanted, 0, before - 1 + len(wanted)) if before > 0 else -1
+            before = skeleton.index_of(self._at_position(cursor.selectionStart()))
+            at = text.rfind(wanted, 0, before - 1 + len(wanted)) if before > 0 else -1
         else:
-            at = folded.find(wanted, self._at_position(cursor.selectionEnd()))
+            at = text.find(wanted, skeleton.index_of(self._at_position(cursor.selectionEnd())))
         hit = QTextCursor()
         if at >= 0:
+            begin, end = skeleton.span(at, at + len(wanted))
             hit = QTextCursor(document)
-            hit.setPosition(self._position_of(at))
-            hit.setPosition(self._position_of(at + len(wanted)), QTextCursor.MoveMode.KeepAnchor)
+            hit.setPosition(self._position_of(begin))
+            hit.setPosition(self._position_of(end), QTextCursor.MoveMode.KeepAnchor)
         return hit
 
     def laid_matches(self, needle: str):
@@ -5794,15 +6585,19 @@ class MarkdownView(QWidget):
             return None
         _plain, folded = self._laid_text()
         wanted = _folded(needle)
-        if folded is None or len(wanted) != len(needle) or not _plainly_found(needle):
+        if folded is None or len(wanted) != len(needle) or not _plainly_found(_find_key(wanted)):
             return None
-        position = self._position_of
+        wanted, skeleton = _find_key(wanted), self._skeleton(folded)
+        if not wanted:
+            return None
+        position, text = self._position_of, skeleton.text()
 
         def places():
-            at = folded.find(wanted)
+            at = text.find(wanted)
             while at >= 0:
-                yield position(at), position(at + len(wanted))
-                at = folded.find(wanted, at + len(wanted))
+                begin, end = skeleton.span(at, at + len(wanted))
+                yield position(begin), position(end)
+                at = text.find(wanted, at + len(wanted))
 
         return places()
 
@@ -5857,8 +6652,9 @@ class MarkdownView(QWidget):
         self.say(tr("Searching the rest of the page…"))
 
         def look():  # (pure Python on strings: a worker thread - 4 MB looked through took the window's time)
+            key = _find_key(wanted)  # (normal forms and unseen characters aside, as in the page laid out)
             for index, number in enumerate(numbers):
-                if wanted in _plain_text(page, parts[index]):
+                if key in _find_key(_plain_text(page, parts[index])):
                     return index
             return None
 
@@ -6125,6 +6921,10 @@ class MarkdownView(QWidget):
 
     def go_end(self) -> None:
         """Ctrl+End: the page's last part laid out first, its end in view."""
+        head = self._head_only()
+        if head is not None:  # (the end of the whole page, when it comes)
+            head["waiting"].append(self.go_end)
+            return
         if self._page is None or not self.more():
             self.to_end()
             return
@@ -6342,6 +7142,10 @@ class MarkdownView(QWidget):
         *then()* (find, a jump, print)."""
         if then is not None:
             self._then.append(then)
+        head = self._head_only()
+        if head is not None:  # (only the text's first part is there: all of the whole page, when it comes)
+            head["whole"] = True
+            return
         if self._rest is None and not self._scheduled and not self._gaps:
             self._run_then()
             return
@@ -6352,7 +7156,10 @@ class MarkdownView(QWidget):
     def load_rest_now(self) -> None:
         """The rest of the page laid out at once (an export, a print asked
         for in code: it is waited for) - a long text's parts not parsed yet
-        parsed here."""
+        parsed here, the whole page of a text shown by its first part made here."""
+        head = self._head_only()
+        if head is not None:
+            head["now"]()
         self._whole = True
         page = self._page
         if page is not None and page.get("loading"):
@@ -6360,8 +7167,9 @@ class MarkdownView(QWidget):
             dark, toggled, _current = page.get("parse") or (self.theme, frozenset(self.folds), None)
             self._more_text = None
             for piece in [part.piece for part in page["parts"] if isinstance(part, _Unparsed)]:
+                gap = {"after_code": True} if piece in (getattr(self, "_after_code", None) or ()) else {}
                 self._page_more(_page(page["texts"][piece], dark, toggled, piece * DETAILS_SPAN,
-                                      self._pieces_notes(piece, len(page["texts"]))), piece)
+                                      self._pieces_notes(piece, len(page["texts"])), **gap), piece)
             page["loading"], page["parse"] = False, None
             if getattr(self, "_copy_waiting", False):  # (a copy waited for the text to be parsed: it is)
                 QTimer.singleShot(0, self.copy_selection)
@@ -6420,7 +7228,10 @@ class MarkdownView(QWidget):
             self._bar_kept(False)
             self._whole = False
             self._idle()
-            self._run_then()
+            if page.get("head"):  # (the text's first part only: the whole page is still being made -
+                self._busy(tr("Rendering…"))  # what waits for all of it waits for that one)
+            else:
+                self._run_then()
         else:
             if self._rest is not None:
                 self._stand_in_put()
@@ -6669,6 +7480,8 @@ class MarkdownView(QWidget):
         _going_on(part, 0)
         _join_lists(part, 0)
         _unbroken_cells(part, 0, self.browser.lineWrapColumnOrWidth())
+        if self.page_images:
+            _plain_images(part)
         return part
 
     def _insert_before(self, block, part) -> tuple[int, int]:
@@ -6791,6 +7604,7 @@ class MarkdownView(QWidget):
         gap["lo"] = number + 1
         height = layout.documentSize().height()
         part = self._part_document(number)
+        self._images_in(number)
         start, end = self._insert_before(block, part)
         part.deleteLater()
         self._starts[number] = QTextCursor(document.findBlock(start))
@@ -6906,6 +7720,8 @@ class MarkdownView(QWidget):
         part.setDefaultStyleSheet(document.defaultStyleSheet())
         part.setDefaultFont(document.defaultFont())
         fill(part)
+        if self.page_images:
+            _plain_images(part)
         _tex_names(part)  # (before it goes into the page: see _TEX)
         ruler = QTextFormat.Property.BlockTrailingHorizontalRulerWidth
         first = part.begin()
@@ -7209,6 +8025,10 @@ class MarkdownView(QWidget):
         position = self.anchors.get(name)
         if position is None:
             position = self.anchors.get(slug(name))
+        head = self._head_only() if position is None else None
+        if head is not None:  # (not in the text's first part: looked for in the whole page, when it comes)
+            head["waiting"].append(lambda: self.go_to_anchor(name, remember))
+            return True
         if position is None and self.more() and name in self.names:
             position = self._named_position(name)  # (a note's, laid out)
         if position is not None:
@@ -7270,10 +8090,14 @@ class MarkdownView(QWidget):
         # of the parts laid out since the last time only, unless the room changed)
         since = self._unclamped if getattr(self, "_clamped_room", None) == room else 0
         self._clamped_room, self._unclamped = room, document.characterCount()
-        found, seen = document.find("\ufffc", since), 0
+        found, seen, began = document.find("\ufffc", since), 0, time.thread_time()
         while not found.isNull():
             seen += 1
-            if seen > CLAMPED_AT_ONCE:  # (the rest in the next turn: 14,000 images were 0.3 s in one)
+            # (the rest in the next turn: 14,000 images were 0.3 s in one - and by the turn's time as well
+            # as their number: 2,000 images that are read and shown, each one's size worked out, were
+            # 0.075 s, with their part's layout a turn of 0.12 s)
+            if seen > CLAMPED_AT_ONCE or (seen > CLAMPED_AT_LEAST
+                                          and time.thread_time() - began > CLAMPED_SECONDS):
                 self._unclamped = found.selectionStart()
                 QTimer.singleShot(0, self.clamp_images)
                 break
@@ -7337,7 +8161,7 @@ class MarkdownView(QWidget):
         self._margins(side, room - wrap - side - trimmed)
         document = browser.document()
         if browser.lineWrapColumnOrWidth() != wrap and self._page is not None and self._readable and self.markdown \
-                and (document.blockCount() > ZOOM_BLOCKS or document.characterCount() > ZOOM_CHARS) \
+                and (self._weight() > ZOOM_BLOCKS or document.characterCount() > ZOOM_CHARS) \
                 and getattr(self, "_made", None) and not getattr(self, "_replacing_now", False):
             # (a big page laid out at the new width a part a turn, from the place read - as a zoom: Qt laid all
             # of it out again in one turn, 0.19 s for 10,000 sections read to their end, at each step of a drag;
@@ -7616,7 +8440,16 @@ class MarkdownView(QWidget):
     def _theme_chosen(self, _theme_id: str = "") -> None:
         """(View > Theme) another theme: the page made anew in it - the old one shown, in its colours,
         until the new one is there (_paint_ground: the ground with it, in one change)."""
-        if sip.isdeleted(self) or self._look() is self.theme:
+        if sip.isdeleted(self):
+            return
+        if self._look() is self.theme:
+            # (the theme the page shows already - Light chosen while "auto" showed Light: the ground's colours
+            # the theme's own now, or the window's again; the selection stayed Qt's, 3.69:1)
+            want = self.theme if self._chosen_theme() is not None else None
+            if want is not getattr(self, "_theme_ground", None):
+                self._theme_ground = want
+                if not self._rendering:  # (a page being made: painted with it)
+                    self._paint_ground()
             return
         if self.markdown:
             slow = self.timer.interval() > RENDER_DELAY
@@ -7642,12 +8475,15 @@ class MarkdownView(QWidget):
         if want is self._ground:
             return
         self._ground = want
+        from axross_markdown._ax.ui.markdown_theme_ui import page_palette, scroll_bar_style
+
         if want is None:
             self.browser.setPalette(QPalette())  # (the window's again: nothing set of its own)
         else:
-            from axross_markdown._ax.ui.markdown_theme_ui import page_palette
-
             self.browser.setPalette(page_palette(want, self.palette()))
+        for bar in (self.browser.verticalScrollBar(), self.browser.horizontalScrollBar()):
+            # (the page's scroll bars in its theme: a dark page kept the window's - a white handle)
+            bar.setStyleSheet(scroll_bar_style(want) if want is not None else "")
         self.ground_changes += 1
         self._repaint_placeholders(dirty=False)  # (the page shown next is laid out with them)
 
@@ -7728,6 +8564,11 @@ class MarkdownView(QWidget):
         found = self.images.get(name)
         if found is not None:
             return found
+        if name not in self.asked and len(self.asked) >= IMAGES and len(self.images) >= 2 * IMAGES \
+                and self.too_many is not None:
+            # (past every bound, whatever kind it is: not looked at - where each of 100,000 names leads was
+            # asked of the folder as its part was laid out, 0.15 to 0.3 s a part)
+            return self.too_many
         kind, where = self.source.kind(name) if self.source is not None else ("outside", name)
         if kind in ("local", "data") and (name in self.asked or len(self.asked) < IMAGES):
             self.asked.add(name)  # (read by read_missing)
@@ -7907,17 +8748,28 @@ class MarkdownView(QWidget):
         in the turn that next needed a place past the view - a table of 20,000
         rows read to its end, 0.65 to 1.6 s at the next scroll or Find."""
         if self._page is not None and self._readable and self.markdown \
-                and (self.browser.document().blockCount() > ZOOM_BLOCKS
+                and (self._weight() > ZOOM_BLOCKS
                      or self.browser.document().characterCount() > ZOOM_CHARS) and getattr(self, "_made", None):
             self.render(self.markdown, again=lambda: self._zoomed(steps))
             return
         anchor = self._view_anchor() if self._page is not None and self._readable else None
         size = self.browser.document().defaultFont().pointSizeF()
-        self._zoomed(steps)
+        # (the page's height changes under the scroll bar's value while the letters do: that is no move of
+        # the reader's - with smaller letters the old value lay far into the stand-in for what is not laid
+        # out, read as the thumb dropped there: the view jumped hundreds of sections on at a zoom out, once
+        # the place held by a zoom before was let go)
+        wanted, self._zooming = self._want, True
+        try:
+            self._zoomed(steps)
+            if anchor is not None:
+                ratio = self.browser.document().defaultFont().pointSizeF() / max(1.0, size)
+                self._scale_stand_ins(ratio)
+                self._hold((anchor[0], anchor[1] * ratio))
+        finally:
+            self._zooming = False
         if anchor is not None:
-            ratio = self.browser.document().defaultFont().pointSizeF() / max(1.0, size)
-            self._scale_stand_ins(ratio)
-            self._hold((anchor[0], anchor[1] * ratio))
+            self._want = wanted
+            self._hold((anchor[0], anchor[1] * ratio))  # (once more: the stand-ins' heights are the new ones)
 
     def _scale_stand_ins(self, ratio: float) -> None:
         """Every gap's stand-in (and the end's) *ratio* times as high: the
@@ -7979,6 +8831,8 @@ ZOOM_RANGE = (0.25, 4.0)
 ZOOM_BLOCKS = 3000
 #: How long a zoom's or a resize's page made anew keeps the view's picture at most (ms: _freeze_view).
 FROZEN_MS = 1500
+#: ... and a page parsed anew (a theme switch, a reload): the piece of the place read is parsed first.
+RELOAD_FROZEN_MS = 4000
 #: Blocks past which a resize of the view leaves the page's layout as it is when its width stays (resizeEvent).
 RESIZE_BLOCKS = 3000
 #: ... or characters (a few long lines of signs no font has - the Ogham space mark - were laid out again in
@@ -7996,6 +8850,9 @@ def _fresh(made):
     return made
 #: Image characters clamp_images looks at in one event-loop turn (the rest in the next).
 CLAMPED_AT_ONCE = 2000
+#: ... and the GUI thread's time they may take in it (seconds), once CLAMPED_AT_LEAST are looked at.
+CLAMPED_SECONDS = 0.02
+CLAMPED_AT_LEAST = 100
 
 
 #: Where clamp_images keeps the size an image was asked to have (0: its own).
@@ -8025,6 +8882,8 @@ _NAMES = QTextFormat.Property.UserProperty.value + 9
 _NAMED = QTextFormat.Property.UserProperty.value + 11
 #: A block of no height a part going on inside an item begins with (_going_on): no text of the page.
 _GOING = QTextFormat.Property.UserProperty.value + 10
+#: (Qt's own parser) a table's format: the level of the quote the table is in (QUOTED)
+_QUOTED_TABLE = QTextFormat.Property.UserProperty.value + 31
 #: The most pixels an image is zoomed to (ImageZoom): 8 times a photo of
 #: 40 million pixels was a picture of gigabytes.
 ZOOM_PIXELS = 64_000_000
@@ -8345,6 +9204,7 @@ def _mark_block(document, cursor, block, text: str, palette: dict) -> None:
 
     base, wide, opened, spans, align, marks = block.position(), 0, {}, [], None, []
     colour_at = named_at = None
+    quoted, linked, mirrored = 0, [], False
     for index, ch in enumerate(text):
         position = base + index + wide
         if ord(ch) > 0xFFFF:
@@ -8391,6 +9251,19 @@ def _mark_block(document, cursor, block, text: str, palette: dict) -> None:
         elif ch == NOTE_BLOCK:
             align = align or "note"
             marks.append(position)
+        elif ch == ITEM_FIRST:
+            marks.append(position)
+        elif ch == QUOTED:
+            quoted += 1
+            marks.append(position)
+        elif ch == MIRRORED:
+            mirrored = True
+            marks.append(position)
+        elif ch == LINKED:
+            marks.append(position)
+            if text[index + 1:index + 2] == "\ufffc":  # (the image after it: the link's)
+                cursor.setPosition(position + 1)
+                linked.append((position + 1, cursor.charFormat().anchorHref()))
         elif ch in _MARK_OF:
             name, starts = _MARK_OF[ch]
             marks.append(position)
@@ -8435,10 +9308,41 @@ def _mark_block(document, cursor, block, text: str, palette: dict) -> None:
         cursor.setPosition(first)
         cursor.setPosition(last, QTextCursor.MoveMode.KeepAnchor)
         cursor.mergeCharFormat(fmt)
+    for position, href in linked:
+        if href:
+            fmt = QTextCharFormat()
+            fmt.setAnchor(True)
+            fmt.setAnchorHref(href)
+            cursor.setPosition(position)
+            cursor.setPosition(position + 1, QTextCursor.MoveMode.KeepAnchor)
+            cursor.mergeCharFormat(fmt)
     for position in reversed(marks):
         cursor.setPosition(position)
         cursor.setPosition(position + 1, QTextCursor.MoveMode.KeepAnchor)
         cursor.removeSelectedText()
+    if quoted or mirrored:
+        cursor.setPosition(block.position())
+        table = cursor.currentTable()
+        if quoted and table is None:  # (a heading in a quote: the quote's - _box_md4c draws it in its box)
+            fmt = block.blockFormat()
+            fmt.setProperty(QTextFormat.Property.BlockQuoteLevel, quoted)
+            cursor.setBlockFormat(fmt)
+        elif table is not None:
+            shape = table.format()
+            if quoted:  # (a table in a quote)
+                shape.setProperty(_QUOTED_TABLE, quoted)
+            if mirrored:  # (a table of right-to-left text: on the right, its cells' lines from the right)
+                shape.setAlignment(Qt.AlignmentFlag.AlignRight)
+                shape.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+            table.setFormat(shape)
+            if mirrored:
+                from PyQt6.QtGui import QTextBlockFormat
+
+                leading = QTextBlockFormat()
+                leading.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+                cursor.setPosition(table.firstPosition())
+                cursor.setPosition(table.lastPosition(), QTextCursor.MoveMode.KeepAnchor)
+                cursor.mergeBlockFormat(leading)
     if align == "note":  # (a footnote: small, muted letters, as GitHub's)
         small = QTextCharFormat()
         small.setFontPointSize(max(6.0, document.defaultFont().pointSizeF() * 0.92))  # (13-14 pixels: readable)
@@ -8915,7 +9819,12 @@ def _style_md4c(document: QTextDocument, start: int, dark: bool, quotes: bool = 
             cursor.setBlockFormat(fmt)
             _heading_spans(cursor, block)
         elif fmt.hasProperty(ruler):
-            cursor.setBlockFormat(_rule_format(palette, 14, 14))
+            rule = _rule_format(palette, 14, 14)
+            if fmt.intProperty(quote):  # (in a quote - under its heading: the quote's too)
+                if block.previous().blockFormat().headingLevel() in (1, 2):
+                    rule = _rule_format(palette, 0, 10)
+                rule.setProperty(quote, fmt.intProperty(quote))
+            cursor.setBlockFormat(rule)
         elif block.text() == "\u200b":  # (the line between a long list's parts: renderable)
             _lowest(cursor, block)
             block = block.next()
@@ -8979,6 +9888,10 @@ def _style_md4c(document: QTextDocument, start: int, dark: bool, quotes: bool = 
                 continue
             char = QTextCharFormat()
             char.setForeground(link if anchor else QBrush(QColor(palette["code_fg"] if code else colour)))
+            if anchor and piece.text() != _NOTE_BACK and not piece.charFormat().isImageFormat():
+                # (a link underlined: told from the text by its hue alone it was, and in some themes the two
+                # hues are as light as each other. A footnote's way back is a sign, not text.)
+                char.setFontUnderline(True)
             if anchor and anchor.startswith("#" + FOLD):  # (a <details>' summary: the text's colour, as
                 char.setForeground(QBrush(QColor(colour or palette["text"])))  # markdown-it's page shows it)
                 char.setFontUnderline(False)
@@ -8989,24 +9902,49 @@ def _style_md4c(document: QTextDocument, start: int, dark: bool, quotes: bool = 
             cursor.mergeCharFormat(char)
         if level in (1, 2) and not block.next().blockFormat().hasProperty(ruler):
             cursor.setPosition(block.position() + block.length() - 1)
-            cursor.insertBlock(_rule_format(palette, 0, 10), QTextCharFormat())
+            rule = _rule_format(palette, 0, 10)
+            if fmt.intProperty(quote):  # (a heading in a quote: its rule in the quote's box with it)
+                rule.setProperty(quote, fmt.intProperty(quote))
+            cursor.insertBlock(rule, QTextCharFormat())
             block = block.next()  # (the rule)
         block = block.next()
     _style_tables(document, start, palette)
     cursor.endEditBlock()
 
 
+#: (Qt's own parser) the sign that leads from a footnote back to its mark in the text.
+_NOTE_BACK = "\u21a9"
+
+
+def _rtl(text: str) -> bool:
+    """Whether *text* reads right to left: by its first letter with a direction (as HTML's dir="auto"),
+    looked for in its first RTL_REACH characters."""
+    import unicodedata
+
+    for ch in text[:RTL_REACH]:
+        if "\ue000" <= ch <= "\uf8ff":
+            continue  # (a mark of the text passes: no letter)
+        kind = unicodedata.bidirectional(ch)
+        if kind in ("R", "AL"):
+            return True
+        if kind == "L":
+            return False
+    return False
+
+
+RTL_REACH = 200
+
+
 def _heading_spans(cursor: QTextCursor, block) -> None:
     """(Qt's own parser) a heading's size and weight on all of its text: Qt's Markdown reader puts them on
-    its first piece only - "# foo *bar*" was half heading, half the text's ("bar" 11 pt, not bold). Code in it
-    the heading's size too (its own point size taken off), as markdown-it's page."""
-    pieces = block.begin()
-    if pieces.atEnd():
-        return
-    first = pieces.fragment().charFormat()
+    the piece its text begins with only, and on none when that is a span - "# foo *bar*" was half heading,
+    half the text's ("bar" 11 pt, not bold), "# `code` first", "## *em* first" and "# [link](…)" all of them
+    the text's size and weight. The size by the block's heading level (markdown-it's page's steps:
+    _HEADING_SIZES), bold; code in it the heading's size too (its own point size taken off, its letters
+    kept), a link its colour."""
     size = QTextFormat.Property.FontSizeAdjustment
-    adjust, weight = first.intProperty(size), first.fontWeight()
-    pieces += 1
+    adjust, weight = _HEADING_SIZES.get(block.blockFormat().headingLevel(), 0), int(QFont.Weight.Bold)
+    pieces = block.begin()
     while not pieces.atEnd():
         piece = pieces.fragment()
         pieces += 1
@@ -9021,6 +9959,12 @@ def _heading_spans(cursor: QTextCursor, block) -> None:
         cursor.setPosition(piece.position() + piece.length(), QTextCursor.MoveMode.KeepAnchor)
         cursor.setCharFormat(fmt)
     cursor.setPosition(block.position())
+
+
+#: (Qt's own parser) a heading's size by its level, in Qt's steps (QTextFormat.FontSizeAdjustment), as
+#: markdown-it's page has them: its fifth level the text's size, its sixth one step under (Qt's Markdown
+#: reader made them one and two steps under: smaller than the text's small print).
+_HEADING_SIZES = {1: 3, 2: 2, 3: 1, 4: 0, 5: 0, 6: -1}
 
 
 def _safe_href(href: str) -> bool:
@@ -9054,7 +9998,7 @@ def _style_tables(document: QTextDocument, start: int, palette: dict) -> None:
     """(Qt's own parser) its tables from *start* on as markdown-it's page
     draws them: thin lines in the rule's colour, padded cells, the header on
     a tint, every second row on another (a formula's table aside)."""
-    from PyQt6.QtGui import QBrush, QTextTable
+    from PyQt6.QtGui import QBrush, QTextBlockFormat, QTextTable
 
     rule, head, zebra = QBrush(QColor(palette["rule"])), QBrush(QColor(palette["th_bg"])), \
         QBrush(QColor(palette["zebra"]))
@@ -9080,6 +10024,21 @@ def _style_tables(document: QTextDocument, start: int, palette: dict) -> None:
         fmt.setTopMargin(8)  # (two tables in a row, a table after raw HTML: apart)
         fmt.setBottomMargin(14)
         frame.setFormat(fmt)
+        if frame.rows() > 1:  # (the header's cells aligned as their columns: ":-:" - Qt's reader aligns the
+            # other rows' only)
+            sides = Qt.AlignmentFlag.AlignHorizontal_Mask
+            for column in range(frame.columns()):
+                head_cell, under = frame.cellAt(0, column), frame.cellAt(1, column)
+                if under.column() != column or head_cell.column() != column or under.row() != 1:
+                    continue
+                side = under.firstCursorPosition().blockFormat().alignment() & sides
+                inside = head_cell.firstCursorPosition()
+                if side in (Qt.AlignmentFlag.AlignHCenter, Qt.AlignmentFlag.AlignRight) \
+                        and inside.blockFormat().alignment() & sides != side:
+                    aligned = QTextBlockFormat()
+                    aligned.setAlignment(side)
+                    inside.setPosition(head_cell.lastCursorPosition().position(), QTextCursor.MoveMode.KeepAnchor)
+                    inside.mergeBlockFormat(aligned)
         mark = document.find(NO_HEAD, frame.firstPosition())
         plain = not mark.isNull() and mark.selectionEnd() <= frame.lastPosition()
         if plain:  # (raw HTML's cells, no header: none drawn)
@@ -9140,13 +10099,39 @@ def _box_md4c(document: QTextDocument, dark: bool, start: int = 0, most: int = M
     begins = block.position()
     while block.isValid() and len(runs) < most:
         cursor.setPosition(block.position())
-        top = cursor.currentTable() is None and not block.textList() and not block.blockFormat().indent()
-        if top and block.blockFormat().intProperty(quote) == 1:
+        table = cursor.currentTable()
+        top = table is None and not block.textList() and not block.blockFormat().indent()
+        if table is not None and (not table.format().intProperty(_QUOTED_TABLE)
+                                  or table.parentFrame() != document.rootFrame()):
+            table = None
+        if table is not None:  # (a quote that begins with a table: from the line Qt keeps before one)
+            before = document.findBlock(table.firstPosition() - 1)
+            if before.position() < start or before.text() or QTextCursor(before).currentTable() is not None:
+                block = document.findBlock(table.lastPosition()).next()
+                continue
+            block = before
+        if table is not None or top and block.blockFormat().intProperty(quote) == 1:
             kind = titles.get(block.text().split("\u2028", 1)[0].strip())
             first = last = block
             count = 1
-            while _in_quote(last.next()) and not titles.get(last.next().text().split("\u2028", 1)[0].strip()):
-                last, count = last.next(), count + 1
+            while True:
+                more = _quote_on(last)
+                if more is None or titles.get(more.text().split("\u2028", 1)[0].strip()):
+                    break
+                count += max(1, more.blockNumber() - last.blockNumber())
+                last = more
+            if _quoted_table(last) is not None:  # (ends with a table: with the empty line Qt keeps after it)
+                after = last.next()
+                if not after.isValid() or after.text() or QTextCursor(after).currentTable() is not None:
+                    block = after
+                    continue
+                last = after
+            for edge in (first, last):  # (the empty lines around a quote's table: as low as they get)
+                if not edge.text() and not edge.blockFormat().intProperty(quote):
+                    small = QTextCharFormat()
+                    small.setFontPointSize(1)
+                    cursor.setPosition(edge.position())
+                    cursor.setBlockCharFormat(small)
             if count <= BOX_BLOCKS:
                 runs.append(("alert" if kind else "quote", first, last, kind))
             block = last.next()
@@ -9190,7 +10175,8 @@ def _box_md4c(document: QTextDocument, dark: bool, start: int = 0, most: int = M
                 last = last.next()
             label = block.previous() if block.previous().blockFormat().boolProperty(_CODE_LABEL) else None
             lang = block.blockFormat().stringProperty(QTextFormat.Property.BlockCodeLanguage)
-            alert = table.cellAt(0, 1).format().background().style() != Qt.BrushStyle.NoBrush
+            # (the cell the code is in: a right-to-left quote's text is in the first one, its bar the second)
+            alert = table.cellAt(block.position()).format().background().style() != Qt.BrushStyle.NoBrush
             ends = not last.next().isValid() or QTextCursor(last.next()).currentTable() != table \
                 or not last.next().text().strip() and QTextCursor(last.next().next()).currentTable() != table
             runs.append(("code", first, last, (lang, label, alert, ends)))
@@ -9210,6 +10196,38 @@ def _box_md4c(document: QTextDocument, dark: bool, start: int = 0, most: int = M
             _box(document, palette, kind, first, last, info)
     cursor.endEditBlock()
     return count + len(runs)
+
+
+def _quoted_table(block):
+    """(Qt's own parser) the table of the page's top level *block* is in, if that table is a quote's
+    (QUOTED) - else None."""
+    table = QTextCursor(block).currentTable()
+    if table is None or not table.format().intProperty(_QUOTED_TABLE) \
+            or table.parentFrame() != block.document().rootFrame():
+        return None
+    return table
+
+
+def _quote_on(last):
+    """(_box_md4c) the block a quote's run goes on to after *last*: the next block of the quote - a
+    table of it: that table's last block, and over the empty line Qt keeps after a table -, or None."""
+    after = last.next()
+    if not after.isValid():
+        return None
+    if _in_quote(after):
+        return after
+    document = after.document()
+    table = _quoted_table(after)
+    if table is not None:
+        return document.findBlock(table.lastPosition())
+    if after.text() or after.blockFormat().headingLevel() or after.textList() \
+            or QTextCursor(after).currentTable() is not None or _quoted_table(last) is None:
+        return None
+    beyond = after.next()  # (the empty line after the quote's table: the quote goes on under it)
+    if _in_quote(beyond):
+        return after
+    table = _quoted_table(beyond) if beyond.isValid() else None
+    return after if table is not None else None
 
 
 def _first_block(document, start: int):
@@ -9303,7 +10321,9 @@ def _box(document, palette: dict, kind: str, first, last, info: str, below: int 
     start, end = first.position(), last.position() + last.length() - 1
     formats = []
     block = first
+    words = ""  # (the text it begins with: whether it reads right to left)
     while True:
+        words = words or block.text().strip()[:RTL_REACH]
         formats.append(block.blockFormat())
         if block == last:
             break
@@ -9326,21 +10346,29 @@ def _box(document, palette: dict, kind: str, first, last, info: str, below: int 
     table_format.setTopMargin(2 if kind == "code" else 6)
     table_format.setBottomMargin(below)
     columns = 1 if kind == "code" else 2
+    mirrored = False
     if columns == 2:
         table_format.setColumnWidthConstraints([QTextLength(QTextLength.Type.FixedLength, 4),
                                                 QTextLength(QTextLength.Type.VariableLength, 0)])
+        mirrored = _rtl(words)
+        if mirrored:  # (a quote of right-to-left text: its bar on the right, where its lines begin - the
+            # bar's column the second one: Qt lays a table's first column out on the left whatever its
+            # direction)
+            table_format.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+            table_format.setColumnWidthConstraints([QTextLength(QTextLength.Type.VariableLength, 0),
+                                                    QTextLength(QTextLength.Type.FixedLength, 4)])
     background = {"code": palette["pre_bg"], "alert": palette["alert_bg"]}.get(kind)
     table = cursor.insertTable(1, columns, table_format)
     if columns == 2:
         bar = QTextTableCellFormat()
         bar.setBackground(QBrush(QColor(palette.get(info, palette["rule"]) if kind == "alert" else palette["rule"])))
-        table.cellAt(0, 0).setFormat(bar)
-    cell = table.cellAt(0, columns - 1)
+        table.cellAt(0, 1 if mirrored else 0).setFormat(bar)
+    cell = table.cellAt(0, 0 if mirrored else columns - 1)
     padding = QTextTableCellFormat()
     padding.setTopPadding(10 if kind == "code" else 6)
     padding.setBottomPadding(10 if kind == "code" else 6)
-    padding.setLeftPadding(12)
-    padding.setRightPadding(10)
+    padding.setLeftPadding(10 if mirrored else 12)
+    padding.setRightPadding(12 if mirrored else 10)
     if background:  # (Qt paints a cell's background, not its table's)
         padding.setBackground(QBrush(QColor(background)))
     cell.setFormat(padding)
@@ -9610,7 +10638,11 @@ _WIDE = re.compile("[\U00010000-\U0010ffff]")
 
 def _wide_in(text: str, offset: int = 0) -> list:
     """The indices (plus *offset*) of *text*'s characters beyond the BMP, in order."""
-    return [] if text.isascii() else [offset + found.start() for found in _WIDE.finditer(text)]
+    if text.isascii() or (len(text) > 256 and sys.getsizeof(text) < 3 * len(text)):
+        # (CPython keeps a text without such characters in two bytes a character at most: nothing to look
+        # for - the pattern read 5 MB of accented text for 0.03 s of Find's first turn)
+        return []
+    return [offset + found.start() for found in _WIDE.finditer(text)]
 
 
 def _index_at(wide: list, position: int) -> int:
@@ -9626,6 +10658,207 @@ def _folded(text: str) -> str:
     character that lower case writes as two ("İ"). (Case folded as Qt's find folds it only for a needle of
     _plainly_found: all of the page translated was 0.12 s of a turn.)"""
     return text.lower()
+
+
+#: (Find) characters a reader does not see, left out of what Find compares: a soft hyphen, zero-width spaces
+#: and joiners, direction marks, variation selectors.
+_UNSEEN = ("\u00ad\u034f\u061c\u180e\u200b\u200c\u200d\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2060\u2066\u2067"
+           "\u2068\u2069\ufe0e\ufe0f\ufeff")
+_UNSEEN_SET = frozenset(_UNSEEN)
+#: (_Skeleton) the characters of a piece of the page's text Find's key is made of at a time.
+SKELETON_PIECE = 2048
+#: (_Skeleton) the time a turn reads a page's text for Find's key at most, in seconds.
+SKELETON_TURN = 0.02
+#: (_Skeleton) a text of more characters is read in turns of its own only, not in the turn that asked for it
+#: (which read the page's text: 0.06 s for 5 MB).
+SKELETON_AT_ONCE = 1_000_000
+
+
+def _find_key(text: str, unseen=_UNSEEN) -> str:
+    """*text* (in lower case) as Find compares it: without the characters no reader sees (*unseen*: those of
+    _UNSEEN it may hold), in Unicode's composed normal form (NFC) - *text* itself where that changes
+    nothing."""
+    if text.isascii():
+        return text
+    for char in unseen:
+        if char in text:
+            text = text.replace(char, "")
+    return unicodedata.normalize("NFC", text)  # (the text itself when it is in that form)
+
+
+@functools.lru_cache(maxsize=1)
+def _clinging() -> tuple[frozenset, re.Pattern]:
+    """(the characters that belong to the one before them - combining marks, a Hangul syllable's vowel and
+    final, _UNSEEN -, a pattern of a character and those that cling to it)"""
+    points = [point for point in range(0xad, 0x10000)
+              if chr(point) in _UNSEEN_SET or 0x1160 <= point <= 0x11ff
+              or unicodedata.category(chr(point)) in ("Mn", "Mc", "Me")]
+    ranges: list[list[int]] = []
+    for point in points:
+        if ranges and ranges[-1][1] == point - 1:
+            ranges[-1][1] = point
+        else:
+            ranges.append([point, point])
+    inside = "".join(f"\\u{low:04x}" if low == high else f"\\u{low:04x}-\\u{high:04x}" for low, high in ranges)
+    return frozenset(map(chr, points)), re.compile(f"[^{inside}][{inside}]+")
+
+
+class _Skeleton:
+    """(Find) The page's text in lower case as Find compares it (_find_key: normal forms and unseen characters
+    aside), and which of the page's characters each of its characters stands for. The text is read in pieces of
+    SKELETON_PIECE characters, cut where no character clings to the one before (an accent to its letter); only
+    a piece whose key differs from it is kept apart - a page without such characters is its own skeleton, and
+    nothing is copied. Where in a changed piece a character is, is worked out for the pieces a match (or the
+    cursor) is in only."""
+
+    def __init__(self) -> None:
+        self.folded = ""
+        self.pieces: list[tuple[int, int, int, str]] = []  # (from, to in the page's text; from in the key's; key)
+        self._plain: list[int] = []  # (each piece's place in the page's text, and in the key's: for bisect)
+        self._key: list[int] = []
+        self._text: str | None = None
+        self._maps: dict[int, tuple[list[int], list[int]]] = {}
+        self.scanned = 0  # (the text read up to here: more)
+        self._number = 0
+
+    def _cut(self, at: int) -> int:
+        """The first place from *at* on where a piece may end: before a character that clings to none (at most
+        SKELETON_PIECE on)."""
+        folded, limit = self.folded, min(len(self.folded), at + SKELETON_PIECE)
+        while at < limit and (folded[at] >= "\u0300" or folded[at] == "\u00ad") and folded[at] in _clinging()[0]:
+            at += 1
+        return min(at, len(folded))
+
+    def update(self, folded: str, start: int = 0) -> None:
+        """*folded* to be read (more): the text it had up to *start* is read already."""
+        self.folded = folded
+        self._text, self._maps = None, {}
+        number = max(0, min(start, self.scanned) // SKELETON_PIECE - 1)  # (the piece before the change's: its
+        begin = self._cut(number * SKELETON_PIECE) if number else 0  # end may move)
+        while self.pieces and self.pieces[-1][1] > begin:
+            self.pieces.pop()
+        del self._plain[len(self.pieces):], self._key[len(self.pieces):]
+        self.scanned, self._number = begin, number
+        if folded.isascii():
+            self.scanned = len(folded)
+
+    @property
+    def done(self) -> bool:
+        return self.scanned >= len(self.folded)
+
+    def more(self, seconds: float) -> bool:
+        """The text read on for *seconds* of this thread's time at most (what is not read yet is compared as it
+        is meanwhile); whether all of it is read."""
+        folded, begin, number = self.folded, self.scanned, self._number
+        if begin >= len(folded):
+            return True
+        deadline = time.thread_time() + seconds
+        shorter = self.pieces[-1][1] - self.pieces[-1][2] - len(self.pieces[-1][3]) if self.pieces else 0
+        while begin < len(folded):
+            number += 1
+            end = self._cut(max(begin + 1, number * SKELETON_PIECE))
+            piece = folded[begin:end]
+            key = _find_key(piece)
+            if key is not piece and key != piece:
+                self.pieces.append((begin, end, begin - shorter, key))
+                self._plain.append(begin)
+                self._key.append(begin - shorter)
+                shorter += len(piece) - len(key)
+                self._text = None
+            begin = end
+            if not number & 15 and time.thread_time() > deadline:
+                break
+        self.scanned, self._number = begin, number
+        return begin >= len(folded)
+
+    def text(self) -> str:
+        """The text Find looks in."""
+        if not self.pieces:
+            return self.folded
+        if self._text is None:
+            folded, parts, at = self.folded, [], 0
+            for begin, end, _in_key, key in self.pieces:
+                parts += (folded[at:begin], key)
+                at = end
+            parts.append(folded[at:])
+            self._text = "".join(parts)
+        return self._text
+
+    def _map(self, number: int) -> tuple[list[int], list[int]]:
+        """(where each character of piece *number*'s key begins in the piece, where it ends) - a letter and
+        its accents composed to one: all of them."""
+        found = self._maps.get(number)
+        if found is not None:
+            return found
+        begin, end, _in_key, key = self.pieces[number]
+        piece = self.folded[begin:end]
+        starts: list[int] = []
+        ends: list[int] = []
+
+        def plain(low: int, high: int) -> None:  # (characters none clings to: each its own - or its normal form's)
+            stretch = piece[low:high]
+            if unicodedata.is_normalized("NFC", stretch):
+                starts.extend(range(low, high))
+                ends.extend(range(low + 1, high + 1))
+                return
+            for offset, char in enumerate(stretch, low):
+                made = len(unicodedata.normalize("NFC", char))
+                starts.extend([offset] * made)
+                ends.extend([offset + 1] * made)
+
+        at = 0
+        for cluster in _clinging()[1].finditer(piece):
+            low, high = cluster.span()
+            plain(at, low)
+            at = high
+            seen = [offset for offset in range(low, high) if piece[offset] not in _UNSEEN_SET]
+            kept = "".join(piece[offset] for offset in seen)
+            made = unicodedata.normalize("NFC", kept)
+            if made == kept:
+                starts.extend(seen)
+                ends.extend(offset + 1 for offset in seen)
+            elif made:
+                # (composed: the marks at its end that stayed as they are each their own, what is before them
+                # the letter they were composed with - "e", a dot below, an acute: "ẹ" and the acute)
+                same = 0
+                while same < len(made) - 1 and same < len(kept) - 1 and made[-1 - same] == kept[-1 - same]:
+                    same += 1
+                head, last = len(made) - same, seen[len(kept) - same - 1] + 1
+                starts.extend([low] + [last] * (head - 1) + seen[len(kept) - same:])
+                ends.extend([last] * head + [offset + 1 for offset in seen[len(kept) - same:]])
+        plain(at, len(piece))
+        if len(starts) != len(key):  # (never, but then: a character a place - no index out of the piece)
+            starts = [min(offset, len(piece) - 1) for offset in range(len(key))]
+            ends = [offset + 1 for offset in starts]
+        if len(self._maps) >= 256:
+            self._maps.clear()
+        self._maps[number] = (starts, ends)
+        return starts, ends
+
+    def span(self, begin: int, end: int) -> tuple[int, int]:
+        """The page's characters (from, to) that the key's characters *begin* to *end* stand for."""
+        return self._place(begin)[0], self._place(end - 1)[1]
+
+    def _place(self, index: int) -> tuple[int, int]:
+        number = bisect.bisect_right(self._key, index) - 1
+        if number < 0:
+            return index, index + 1
+        begin, end, in_key, key = self.pieces[number]
+        if index < in_key + len(key):
+            starts, ends = self._map(number)
+            return begin + starts[index - in_key], begin + ends[index - in_key]
+        index += end - in_key - len(key)
+        return index, index + 1
+
+    def index_of(self, place: int) -> int:
+        """The key's first character that begins at the page's character *place* or after it."""
+        number = bisect.bisect_right(self._plain, place) - 1
+        if number < 0:
+            return place
+        begin, end, in_key, key = self.pieces[number]
+        if place < end:
+            return in_key + bisect.bisect_left(self._map(number)[0], place - begin)
+        return place - (end - in_key - len(key))
 
 
 def _plainly_found(needle: str) -> bool:
@@ -10127,6 +11360,42 @@ class _Piece:
 
     def charFormat(self):  # noqa: N802 - as QTextFragment's
         return self._format
+
+
+def _plain_images(document: QTextDocument) -> None:
+    """Each image of *document* (a part about to go into the page) without the object's number Qt's HTML
+    reader gives it - a frame of its own for every image, which the layout walks at every change: with them,
+    every change to a page costs time growing with the images it holds - a part
+    of 370 images put in 0.03 s after 74,000 of them, each of the five changes that puts a part in 0.03 to
+    0.06 s in the view after 100,000; a piece of a page let go of 0.48 s. Its other properties stay (its name,
+    its size, its alt text, a link around it); an image that floats keeps its number (it is its frame's).
+    (Read from the fragments: a cursor's charFormat never tells the number.)"""
+    from PyQt6.QtGui import QTextFrame, QTextFrameFormat
+
+    in_flow = QTextFrameFormat.Position.InFlow
+    if document.find("\ufffc").isNull():
+        return
+    numbered, block = [], document.begin()
+    while block.isValid():
+        pieces = block.begin()
+        while not pieces.atEnd():
+            piece = pieces.fragment()
+            fmt = piece.charFormat()
+            if fmt.isImageFormat() and fmt.objectIndex() != -1:
+                frame = document.objectForFormat(fmt)  # (a frame for each, in the text's flow or beside it)
+                if not isinstance(frame, QTextFrame) or frame.frameFormat().position() == in_flow:
+                    numbered.extend(range(piece.position(), piece.position() + piece.length()))
+            pieces += 1
+        block = block.next()
+    cursor = QTextCursor(document)
+    cursor.beginEditBlock()
+    for at in numbered:
+        cursor.setPosition(at)
+        cursor.setPosition(at + 1, QTextCursor.MoveMode.KeepAnchor)
+        fmt = cursor.charFormat()  # (as it is, but its number)
+        if fmt.isImageFormat():
+            cursor.insertImage(fmt.toImageFormat())
+    cursor.endEditBlock()
 
 
 class _PageCopy(QTextDocument):

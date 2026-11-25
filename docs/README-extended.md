@@ -136,6 +136,12 @@ a file can send the terminal an escape sequence of its own.
 - At most 200 pictures a text, as in the window; then a line says the rest are not drawn.
 - It stops as soon as the program it writes into has ended (`axross-mdcat big.md | head`).
 - Output that cannot be written (a full disk) is said; the exit status is 1.
+- Muted text (a link's address, the front matter, a note's number) is the theme's muted
+  colour, never faint as well: what is written is at AA in every theme.
+- A text of thousands of code blocks: the first 500 are always coloured, further ones while
+  the colouring has taken under 3 s in all; then a line says the rest are shown plain.
+- `--help` and the errors are German under a German locale (`LC_ALL`, `LC_MESSAGES`, `LANG`)
+  or when German is chosen in axross; the options keep their names.
 
 ## Updates
 
@@ -152,10 +158,12 @@ axross-markdown --update                # install it (axross-mdcat --update on W
 axross-markdown --update-mode off       # or notify, auto
 ```
 
-A pip or pipx install is never replaced: it is told `pip install -U axross-markdown`. The
+A pip or pipx install is never replaced: it is told the command - `pip install -U
+axross-markdown`, or, while PyPI lags behind the releases, the release's own wheel (see Install). The
 terminal view asks no network itself; it says (on standard error, in a terminal) when the
 last check found a newer version. `AXROSS_MARKDOWN_NO_UPDATE_CHECK=1` keeps the automatic
-checks off whatever the setting says.
+checks off whatever the setting says; `--check-update` and `--update` are asked for by hand
+and ask GitHub all the same.
 
 Before anything is replaced:
 
@@ -257,6 +265,13 @@ pip install axross-markdown              # or: pipx install axross-markdown
 pip install "axross-markdown[linkify]"   # bare addresses linked as GitHub links them
 ```
 
+- **PyPI may lag behind the releases** (`axross-markdown --version` says which one pip gave you).
+  Every release carries its wheel; this one's, 0.17.5:
+  `pip install https://github.com/c0decave/axross-markdown/releases/download/v0.17.5/axross_markdown-0.17.5-py3-none-any.whl` - or, checked first: download `axross_markdown-0.17.5-py3-none-any.whl`,
+  `SHA256SUMS` and `SHA256SUMS.sig` from the
+  [release](https://github.com/c0decave/axross-markdown/releases/tag/v0.17.5), check them
+  ([Checking a download by hand](#checking-a-download-by-hand)) and `pip install ./axross_markdown-0.17.5-py3-none-any.whl`
+  (with the extra: `pip install "./axross_markdown-0.17.5-py3-none-any.whl[linkify]"`).
 - **Python 3.11 or newer** with PyQt6 6.6 to 6.11, markdown-it-py, mdit-py-plugins,
   Pygments and Pillow (installed with it).
 - **One-file programs without Python** from the

@@ -16,6 +16,10 @@ picture protocol (kitty, iTerm2 / WezTerm, else coloured half-blocks;
 ``--images``). Through ``less`` (search with ``/``, ``n``), links stay links
 only where that less passes them on (566 and later); else they are plain
 text with their address beside it.
+
+What it says itself - ``--help``, its errors - is in the language of the locale (LC_ALL, LC_MESSAGES,
+LANG) or the one chosen in axross, through core.i18n's ``tr()`` as the window's strings; the option
+names, ``--version`` and ``--self-test`` (read by programs) stay as they are.
 """
 
 from __future__ import annotations
@@ -28,10 +32,14 @@ import stat
 import subprocess
 import sys
 
+from axross_markdown._ax.core.i18n import tr
+
 #: Bytes of one file that are read (as the Qt viewer).
 TEXT_LIMIT = 8 << 20
-#: What is said of a file that is no text.
+#: What is said of a file that is no text (said through tr()).
 BINARY = "not a text file (it holds binary data) – not shown"
+#: ... of standard input that is closed ("axross-mdcat - <&-": a traceback).
+NO_INPUT = "standard input is closed: nothing to read"
 #: The widest a text is set unless --width says otherwise (long lines read badly).
 MAX_WIDTH = 100
 #: The narrowest (a bullet, a quote's bar and a table's borders take room:
@@ -58,7 +66,14 @@ def folder_page(path: str) -> str:
 def _read(name: str) -> tuple[str, str]:
     """(text, "") of the file *name* ("-": standard input), or ("", why)."""
     if name == "-":
-        data = sys.stdin.buffer.read(TEXT_LIMIT + 1)
+        # (closed - "<&-", a service without one: sys.stdin is None, or its read fails - said, exit 1)
+        source = getattr(sys.stdin, "buffer", None)
+        if source is None:
+            return "", tr(NO_INPUT)
+        try:
+            data = source.read(TEXT_LIMIT + 1)
+        except (OSError, ValueError) as exc:
+            return "", getattr(exc, "strerror", None) or tr(NO_INPUT)
     else:
         try:
             st = os.stat(name)
@@ -67,25 +82,94 @@ def _read(name: str) -> tuple[str, str]:
         if stat.S_ISDIR(st.st_mode):  # (a folder: its README, as the window opens a link to one)
             page = folder_page(name)
             if page == name:
-                return "", "a folder without a README"
+                return "", tr("a folder without a README")
             return _read(page)
-        if not stat.S_ISREG(st.st_mode):
-            return "", "not a regular file"
-        # The file the user named is shown, as the viewer shows it (only a
-        # regular file; its contents decide nothing - the agent's read policy,
+        # (a pipe or a character device given as a path - "<(printf ...)", /dev/stdin: read as standard
+        # input is, up to the same bound; it was "not a regular file". A block device, a socket: no)
+        stream = stat.S_ISFIFO(st.st_mode) or stat.S_ISCHR(st.st_mode)
+        if not stat.S_ISREG(st.st_mode) and not stream:
+            return "", tr("not a regular file")
+        # The file the user named is shown, as the viewer shows it (its contents
+        # decide nothing - the agent's read policy,
         # core.protected_places.read_refusal, refused a text that only
         # mentioned a private key). What the *document* names - its images -
         # is checked (core.markdown_term.read_picture), as in the viewer.
-        with open(name, "rb") as fh:
-            data = fh.read(TEXT_LIMIT + 1)
+        try:  # (a file no one may read: said - it was a traceback)
+            if stat.S_ISFIFO(st.st_mode):
+                data = _piped(name)
+                if data is None:  # (never waited for: a pipe without a writer would hold the program for good)
+                    return "", tr("a pipe no one writes to")
+            else:
+                with open(name, "rb") as fh:
+                    data = _bounded(fh) if stream else fh.read(TEXT_LIMIT + 1)
+        except OSError as exc:
+            return "", exc.strerror or str(exc)
     from axross_markdown._ax.core.markdown_doc import decode_text, looks_binary
 
     if looks_binary(data):  # (a picture, a program: said - it was shown as garbage)
-        return "", BINARY
+        return "", tr(BINARY)
     text = decode_text(data[:TEXT_LIMIT])
+    if not _utf8(data[:TEXT_LIMIT]) and sys.stderr is not None:
+        # (shown all the same, as the window shows it - said: its letters past ASCII are a guess)
+        print(f"{PROG[0]}: {_shown(name)}: " + tr("not valid UTF-8: shown as Latin-1"), file=sys.stderr)
     if len(data) > TEXT_LIMIT:
-        text += f"\n\n---\n\n*(only the first {TEXT_LIMIT >> 20} MiB are shown)*\n"
+        text += "\n\n---\n\n*" + tr("(only the first {size} MiB are shown)").format(size=TEXT_LIMIT >> 20) + "*\n"
     return text, ""
+
+
+def _shown(value: str) -> str:
+    """*value* (the environment's) fit for a terminal: its printable characters, at most 40."""
+    return "".join(ch if ch.isprintable() else "?" for ch in value[:40])
+
+
+def _utf8(data: bytes) -> bool:
+    """Whether *data* is text decode_text reads without a guess: UTF-8 (cut short at its end or not), or
+    marked as UTF-16 / UTF-32 by a byte order mark."""
+    import codecs
+
+    if data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE, codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)):
+        return True
+    try:
+        codecs.getincrementaldecoder("utf-8")().decode(data, False)
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
+def _piped(name: str) -> bytes | None:
+    """What the named pipe *name* gives, up to TEXT_LIMIT + 1 bytes: read until its writer ends it - or
+    None when no one has it open to write (opened without waiting: "<(printf ...)" has its writer before
+    this program starts; a pipe lying in a folder has none, and a read of it never came back)."""
+    import select
+
+    fd = os.open(name, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    try:
+        chunks, size = [], 0
+        while size <= TEXT_LIMIT:
+            try:  # (read first: without a writer it ends at once - a wait for it would never come back)
+                chunk = os.read(fd, min(1 << 16, TEXT_LIMIT + 1 - size))
+            except BlockingIOError:  # (a writer has it open and has written nothing yet: waited for)
+                select.select([fd], [], [])
+                continue
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        return b"".join(chunks) if chunks else None
+    finally:
+        os.close(fd)
+
+
+def _bounded(source) -> bytes:
+    """At most TEXT_LIMIT + 1 bytes of the stream *source* (a pipe gives what it has at each read)."""
+    chunks, size = [], 0
+    while size <= TEXT_LIMIT:
+        chunk = source.read(min(1 << 16, TEXT_LIMIT + 1 - size))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        size += len(chunk)
+    return b"".join(chunks)
 
 
 def program_version() -> str:
@@ -114,56 +198,93 @@ def program_version() -> str:
 PROG = ["axross-mdcat"]
 
 
+class _Help(argparse.HelpFormatter):
+    """--help in the language of the program's messages: "usage:" too."""
+
+    def add_usage(self, usage, actions, groups, prefix=None):
+        return super().add_usage(usage, actions, groups, tr("usage: ") if prefix is None else prefix)
+
+
+#: argparse's own complaints (English: its gettext has no catalogue of ours), each as a pattern and the
+#: message said instead - through tr(), its groups filled in.
+_ARGPARSE_ERRORS = (
+    (re.compile(r"unrecognized arguments: (?P<args>.*)\Z", re.DOTALL), "unrecognized arguments: {args}"),
+    (re.compile(r"argument (?P<name>\S+): invalid choice: (?P<value>.*?) \(choose from (?P<choices>.*)\)\Z", re.DOTALL),
+     "argument {name}: invalid choice: {value} (choose from {choices})"),
+    (re.compile(r"argument (?P<name>\S+): expected one argument\Z"), "argument {name}: expected one argument"),
+    (re.compile(r"argument (?P<name>\S+): (?P<why>.*)\Z", re.DOTALL), "argument {name}: {why}"),
+)
+
+
+class _Parser(argparse.ArgumentParser):
+    """The command line, its errors said as the program's other messages are (tr())."""
+
+    def error(self, message: str):
+        for pattern, text in _ARGPARSE_ERRORS:
+            found = pattern.match(message)
+            if found:
+                message = tr(text).format(**found.groupdict())
+                break
+        self.print_usage(sys.stderr)
+        self.exit(2, f"{self.prog}: {tr('error')}: {message}\n")
+
+
 def _parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(
-        prog=PROG[0], description="Show Markdown files in the terminal, in colour.")
-    ap.add_argument("files", nargs="*", default=["-"], help="Markdown files; - for standard input")
-    ap.add_argument("-w", "--width", type=_columns, default=0, help=f"columns (default: the terminal's, "
-                    f"at most {MAX_WIDTH}; at least {MIN_WIDTH})")
+    ap = _Parser(prog=PROG[0], description=tr("Show Markdown files in the terminal, in colour."),
+                 formatter_class=_Help, add_help=False)
+    ap._positionals.title, ap._optionals.title = tr("files"), tr("options")
+    ap.add_argument("-h", "--help", action="help", help=tr("show this help and exit"))
+    ap.add_argument("files", nargs="*", default=["-"], help=tr("Markdown files (- for standard input)"))
+    ap.add_argument("-w", "--width", type=_columns, default=0,
+                    help=tr("columns (default: the terminal's, at most {most}; at least {least})").format(
+                        most=MAX_WIDTH, least=MIN_WIDTH))
     ap.add_argument("--color", "--colour", dest="color", default="auto",
                     choices=("auto", "always", "never", "truecolor", "256", "16"),
-                    help="colours: auto (a terminal's, NO_COLOR / FORCE_COLOR / COLORTERM), always, never, "
-                         "or a depth (default: auto)")
+                    help=tr("colours: auto (a terminal's, NO_COLOR / FORCE_COLOR / COLORTERM), always, never, "
+                            "or a depth (default: auto)"))
     from axross_markdown._ax.core.markdown_themes import CHOICES
 
     ap.add_argument("--theme", default=None, choices=CHOICES, metavar="NAME",
-                    help="the colours: auto (the terminal's own ground - COLORFGBG says dark or light, else dark) "
-                         "or a theme (--list-themes), its ground painted; default: $AXROSS_MDCAT_THEME, else "
-                         "terminal_theme in ~/.config/axross-markdown/settings.json, else auto")
-    ap.add_argument("--list-themes", action="store_true", help="list the themes, with their contrast, and exit")
+                    help=tr("the colours: auto (the terminal's own ground – COLORFGBG says dark or light, else "
+                            "dark) or a theme (--list-themes), its ground painted; default: $AXROSS_MDCAT_THEME, "
+                            "else terminal_theme in ~/.config/axross-markdown/settings.json, else auto"))
+    ap.add_argument("--list-themes", action="store_true",
+                    help=tr("list the themes, with their contrast, and exit"))
     ap.add_argument("--background", default="auto", choices=("auto", "on", "off"),
-                    help="paint the theme's ground behind the text (default: auto - for a theme, not for auto)")
+                    help=tr("paint the theme's ground behind the text (default: auto – for a theme, not for auto)"))
     ap.add_argument("--images", default="auto", choices=("auto", "kitty", "iterm", "blocks", "none"),
-                    help="pictures with kitty's or iTerm2's protocol, in coloured half-blocks, or none "
-                         "(default: auto - the terminal's)")
-    ap.add_argument("--image-width", type=_columns, default=0, help="columns an image may take")
-    ap.add_argument("--no-links", action="store_true", help="no terminal hyperlinks (OSC 8)")
+                    help=tr("pictures with kitty's or iTerm2's protocol, in coloured half-blocks, or none "
+                            "(default: auto – the terminal's)"))
+    ap.add_argument("--image-width", type=_columns, default=0, help=tr("columns an image may take"))
+    ap.add_argument("--no-links", action="store_true", help=tr("no terminal hyperlinks (OSC 8)"))
     ap.add_argument("--pager", dest="pager", action="store_true", default=None,
-                    help="always page with less -R")
+                    help=tr("always page with less -R"))
     ap.add_argument("--no-pager", dest="pager", action="store_false",
-                    help="never page (default: less -R when the text is longer than the screen)")
-    ap.add_argument("--toc", action="store_true", help="list the headings only")
+                    help=tr("never page (default: less -R when the text is longer than the screen)"))
+    ap.add_argument("--toc", action="store_true", help=tr("list the headings only"))
     ap.add_argument("--watch", action="store_true",
-                    help="draw the file anew whenever it changes (Ctrl+C ends)")
-    ap.add_argument("--version", action="store_true", help="show the version and exit")
+                    help=tr("draw the file anew whenever it changes (Ctrl+C ends)"))
+    ap.add_argument("--version", action="store_true", help=tr("show the version and exit"))
     ap.add_argument("--check-update", action="store_true",
-                    help="ask GitHub whether a newer release is out, and exit")
+                    help=tr("ask GitHub whether a newer release is out, and exit (asked for here, so also "
+                            "with AXROSS_MARKDOWN_NO_UPDATE_CHECK=1: that stops the window's own checks only)"))
     ap.add_argument("--update", action="store_true",
-                    help="install a newer release (the one-file programs; pip: says the command), and exit")
+                    help=tr("install a newer release (the one-file programs; pip: says the command), and exit"))
     ap.add_argument("--update-mode", choices=("off", "notify", "auto"),
-                    help="the window's checks for updates: off, notify (the default) or auto (install), kept")
+                    help=tr("the window's checks for updates: off, notify (the default) or auto (install), kept"))
     ap.add_argument("--self-test", action="store_true", help=argparse.SUPPRESS)
     return ap
 
 
 def _columns(value: str) -> int:
-    """A number of columns (0: the default); a negative one is refused."""
+    """A number of columns (0: the default); a negative one is refused - and one not written in the
+    digits 0 to 9 ("٣٠" was read as 30 without a word)."""
     try:
-        number = int(value)
+        number = int(value) if value.isascii() else -1
     except ValueError:
         number = -1
     if number < 0:
-        raise argparse.ArgumentTypeError(f"not a number of columns: {value}")
+        raise argparse.ArgumentTypeError(tr("not a number of columns: {value}").format(value=value))
     return number
 
 
@@ -172,8 +293,10 @@ def _depth(choice: str) -> str:
 
     if choice == "never":
         return "none"
-    if choice == "always":
-        return colour_depth(environ={**os.environ, "FORCE_COLOR": "1"}) or "256"
+    if choice == "always":  # (asked for on the command line: whatever NO_COLOR says - it gave none)
+        environ = {key: value for key, value in os.environ.items() if key != "NO_COLOR"}
+        depth = colour_depth(environ={**environ, "FORCE_COLOR": "1"})
+        return depth if depth != "none" else "256"
     if choice in ("truecolor", "256", "16"):
         return choice
     return colour_depth()
@@ -220,18 +343,49 @@ def main(argv: list[str] | None = None, prog: str | None = None) -> int:
         from axross_markdown._ax.core.lex_worker import _child_main
 
         return _child_main()
+    restore = _language()
     try:
         status = _main(argv)
         _write("")  # (what print left in the buffer - --help, --version: its error said too)
         return status
     except OutputGone as gone:
         return gone.status
+    except KeyboardInterrupt:  # (Ctrl+C while a long text is drawn: the shell's 130, no traceback)
+        _quiet_stdout()
+        return 130
     except SystemExit as stop:  # (--help: printed by argparse - a full disk said, not a traceback at the exit)
         try:
             _write("")
         except OutputGone as gone:
             return gone.status or (stop.code if isinstance(stop.code, int) else 1)
         raise
+    finally:
+        restore()
+
+
+def _language(environ=None):
+    """The language of what the program says, set for this run: its own (View > Language in the window,
+    $LANGUAGE), else the one chosen in axross (its session.json), else the locale's (LC_ALL, LC_MESSAGES, LANG) - no guess from the time zone, as the
+    window makes: a terminal's programs follow its locale. Returns what sets the language back (a
+    program that runs main() in its own process - a test - keeps its own)."""
+    from axross_markdown._ax.core import i18n
+
+    try:
+        from axross_markdown._ax.core.markdown_settings import chosen_language
+
+        # (its own choice - View > Language, $LANGUAGE - first; then the one chosen in axross)
+        chosen = chosen_language(environ) or i18n.stored_language()
+        wanted = chosen or i18n.language_from_locale(environ)
+        before = i18n.active()
+        if wanted is None or wanted == before.language:  # (English, nothing asked for: no catalogue is read)
+            return lambda: None
+        language = i18n.detect_language(configured=chosen, env=environ, timezone=None)
+        if language == before.language:
+            return lambda: None
+        i18n.install(language)
+    except Exception:  # noqa: BLE001 - unreadable settings, a broken catalogue: English
+        return lambda: None
+    return lambda: i18n.install(before.language)
 
 
 def _main(argv: list[str] | None = None) -> int:
@@ -248,16 +402,24 @@ def _main(argv: list[str] | None = None) -> int:
     from axross_markdown._ax.core import markdown_doc as MD
 
     if not MD.available():
-        print(f"{PROG[0]} needs markdown-it-py and mdit-py-plugins: "
-              "pip install markdown-it-py mdit-py-plugins", file=sys.stderr)
+        print(tr("{program} needs markdown-it-py and mdit-py-plugins: {command}").format(
+            program=PROG[0], command="pip install markdown-it-py mdit-py-plugins"), file=sys.stderr)
         return 2
     from axross_markdown._ax.core import markdown_term as T
 
     size = shutil.get_terminal_size((80, 24))
     width = max(MIN_WIDTH, args.width or min(size.columns, MAX_WIDTH))
+    if 0 < args.width < MIN_WIDTH:  # (said: "-w 1" drew at 20 columns without a word)
+        print(f"{PROG[0]}: " + tr("{asked} columns are too few: drawn at {least}").format(
+            asked=args.width, least=MIN_WIDTH), file=sys.stderr)
     depth = _depth(args.color)
     from axross_markdown._ax.core import markdown_themes as MT
 
+    named = os.environ.get(MT.ENV_TERM, "").strip()
+    if not args.theme and named and named.lower() != MT.AUTO and MT.get(named.lower()) is None:
+        # (a theme's name mistyped in the environment: said - it fell back without a word)
+        print(f"{PROG[0]}: " + tr("{variable}={value} names no theme (--list-themes): not used").format(
+            variable=MT.ENV_TERM, value=_shown(named)), file=sys.stderr)
     theme_id = MT.normalize(args.theme or MT.terminal_default())
     theme = MT.get(theme_id)
     dark = T.dark_background() if theme is None else theme.dark
@@ -272,7 +434,7 @@ def _main(argv: list[str] | None = None) -> int:
     hyperlinks = not args.no_links
     if args.watch:
         if len(args.files) != 1 or args.files[0] == "-":
-            print(f"{PROG[0]}: --watch shows one file (not standard input)", file=sys.stderr)
+            print(f"{PROG[0]}: " + tr("--watch shows one file (not standard input)"), file=sys.stderr)
             return 2
         return _watch(args, width, depth, dark, images, hyperlinks)
     status: list[int] = [0]
@@ -347,6 +509,10 @@ class OutputGone(Exception):
 def _write(text: str, program: str = "axross-mdcat") -> None:
     """*text* on standard output - OutputGone once it can be written no more: a pipe closed ("| head
     -2": it rendered all the rest for nothing) or an error ("> /dev/full": a traceback), said."""
+    if sys.stdout is None:  # (closed - ">&-": said, not a traceback)
+        print(f"{program}: " + tr("cannot write the output: {error}").format(error=tr("standard output is closed")),
+              file=sys.stderr)
+        raise OutputGone(1)
     _encodable_output()
     try:
         sys.stdout.write(text)
@@ -356,7 +522,8 @@ def _write(text: str, program: str = "axross-mdcat") -> None:
         raise OutputGone(0) from None
     except OSError as exc:  # (a full disk, a closed terminal: said, exit 1)
         _quiet_stdout()
-        print(f"{program}: cannot write the output: {exc.strerror or exc}", file=sys.stderr)
+        print(f"{program}: " + tr("cannot write the output: {error}").format(error=exc.strerror or exc),
+              file=sys.stderr)
         raise OutputGone(1) from None
 
 
@@ -437,8 +604,8 @@ def _watch(args, width, depth, dark, images, hyperlinks, poll: float = 0.5, roun
                 if not missing:  # (said once - it was silent for ever - and waited for)
                     from axross_markdown._ax.core.markdown_doc import clean
 
-                    print(f"{PROG[0]}: {clean(name)}: {exc.strerror or exc} - waiting for it (Ctrl+C ends)",
-                          file=sys.stderr, flush=True)
+                    print(f"{PROG[0]}: {clean(name)}: {exc.strerror or exc} - "
+                          + tr("waiting for it (Ctrl+C ends)"), file=sys.stderr, flush=True)
                     missing = True
                 seen = now
             else:
@@ -468,7 +635,8 @@ def _screenful(text: str, rows: int, name: str) -> str:
     rest = len(lines) - (rows - 2)
     from axross_markdown._ax.core.markdown_doc import clean
 
-    note = f"… {rest} more lines - the whole file: axross-mdcat {clean(name)}"
+    whole = " ".join(("axross-mdcat", clean(name)))  # (the command that shows all of it)
+    note = tr("… {count} more lines – the whole file: {command}").format(count=rest, command=whole)
     reset = "\x1b[0m\x1b]8;;\x1b\\" if "\x1b" in text else ""  # (a style or link cut off ends)
     return "\n".join(lines[:rows - 2]) + "\n" + reset + note + "\n"
 
@@ -505,7 +673,7 @@ def _rendered(args, width, depth, dark, images, hyperlinks, status: list[int]):
             painter = T.painter_of(options)
             lines = [painter.paint("  " * (h.level - 1) + MD.clean(h.text), T.Style(fg=f"h{h.level}",
                                                                                       bold=h.level <= 2))
-                     + painter.paint(f"  #{h.anchor}", T.Style(fg="muted", dim=True)) for h in doc.headings]
+                     + painter.paint(f"  #{h.anchor}", T.Style(fg="muted")) for h in doc.headings]
             body = iter([T.on_ground("\n".join(lines) + "\n", ground, width, depth, T.ground_text(options))])
         else:
             body = T.render_parts(text, options)
@@ -523,7 +691,7 @@ def list_themes(depth: str) -> int:
     from axross_markdown._ax.core import markdown_term as T
     from axross_markdown._ax.core import markdown_themes as MT
 
-    print(f"{'auto':22} the terminal's own ground: Dark's or Light's colours (COLORFGBG says which)")
+    print(f"{'auto':22} " + tr("the terminal's own ground: Dark's or Light's colours (COLORFGBG says which)"))
     for theme in MT.THEMES.values():
         page = theme.term
         text, link = MT.contrast(page["text"], page["page_bg"]), MT.contrast(page["link"], page["page_bg"])
@@ -535,6 +703,7 @@ def list_themes(depth: str) -> int:
             sample = "  " + T.on_ground(painter.paint(" Heading ", T.Style(fg="h1", bold=True))
                                         + "text " + painter.paint("link", T.Style(fg="link", underline=True))
                                         + " ", page["page_bg"], 0, depth, page["text"])
+        # (the columns' words stay English: programs read this list - tests, the README's table)
         print(f"{theme.id:22} {theme.label:20} {'dark' if theme.dark else 'light':5}  text {text:5.2f}:1  "
               f"links {link:5.2f}:1  {level}{sample}")
     return 0
@@ -547,11 +716,11 @@ def self_test() -> int:
     from axross_markdown._ax.core import markdown_term as T
 
     if not MD.available():
-        print(f"{PROG[0]}: markdown-it-py is missing", file=sys.stderr)
+        print(f"{PROG[0]}: " + tr("markdown-it-py is missing"), file=sys.stderr)
         return 1
     shown = T.render("# Self-test\n\n| a |\n|---|\n| 1 |\n", T.Options(width=40, depth="none"))
     if "Self-test" not in shown:
-        print(f"{PROG[0]}: the page was not rendered", file=sys.stderr)
+        print(f"{PROG[0]}: " + tr("the page was not rendered"), file=sys.stderr)
         return 1
     print(f"{PROG[0]} {program_version()} ok")
     return 0
@@ -565,9 +734,10 @@ def update_main(args) -> int:
         try:
             MU.set_mode(args.update_mode)
         except OSError as exc:
-            print(f"{PROG[0]}: the setting could not be kept: {exc.strerror or exc}", file=sys.stderr)
+            print(f"{PROG[0]}: " + tr("the setting could not be kept: {error}").format(error=exc.strerror or exc),
+                  file=sys.stderr)
             return 1
-        print(f"{PROG[0]}: updates: {args.update_mode}")
+        print(f"{PROG[0]}: " + tr("updates: {mode}").format(mode=args.update_mode))
         if not (args.check_update or args.update):
             return 0
     install = MU.detect_install()
@@ -587,11 +757,13 @@ def update_main(args) -> int:
         print(f"{PROG[0]}: {exc}", file=sys.stderr)
         return 1
     except (OSError, Exception) as exc:  # noqa: BLE001 - (a reset connection, a full disk: said, no traceback)
-        print(f"{PROG[0]}: the update failed: {type(exc).__name__}: {exc}"[:400], file=sys.stderr)
+        print((f"{PROG[0]}: " + tr("the update failed: {error}").format(error=f"{type(exc).__name__}: {exc}"))[:400],
+              file=sys.stderr)
         return 1
     if result.newer:
         how = f"{PROG[0]} --update" if install.can_update else (
-            f"installed with pip - to update it: {MU.pip_hint(result.release.version)}" if install.kind == "pip"
+            tr("installed with pip – to update it: {command}").format(command=MU.pip_hint(result.release.version))
+            if install.kind == "pip"
             else install.why_not())
         print(f"{result.text} - {how}")
     else:
@@ -615,7 +787,7 @@ def newer_notice(stream=None) -> str:
         return ""
     install = MU.detect_install()
     how = f"{PROG[0]} --update" if install.can_update else install.why_not()
-    return f"{PROG[0]}: axross-markdown {newer} is available - {how}"
+    return f"{PROG[0]}: " + tr("axross-markdown {version} is available – {how}").format(version=newer, how=how)
 
 
 if __name__ == "__main__":

@@ -180,7 +180,7 @@ THEMES: dict[str, Theme] = {theme.id: theme for theme in (
         bg="#2e3440", text="#e5e9f0", muted="#b0b8c8", link="#88c0d0",
         headings=("#8fbcbb", "#88c0d0", "#81a1c1", "#a3be8c", "#ebcb8b", "#b0b8c8"),
         code_bg="#3b4252", code_fg="#eceff4", pre_bg="#3b4252", quote_bg="#353b49", quote_fg="#c0c7d4",
-        rule="#4c566a", th_bg="#3b4252", zebra="#333947", mark="#a3be8c", math="#b9a3cf",
+        rule="#4c566a", th_bg="#3b4252", zebra="#333947", mark="#a3be8c", math="#bca7d1",
         alerts=("#88c0d0", "#a3be8c", "#c7a8d4", "#ebcb8b", "#e48c94"), alert_bg="#353b49",
         highlight="#ebcb8b", highlight_bg="#4f4a33", selection_bg="#4c566a", selection_fg="#eceff4"),
         _code("#96b1cc", "#a3be8c", "#a7aebe", "#c7a8d4", "#88c0d0", "#8fbcbb", "#d6a58e", "#96b1cc", "#e799a0")),
@@ -188,7 +188,7 @@ THEMES: dict[str, Theme] = {theme.id: theme for theme in (
         bg="#282828", text="#ebdbb2", muted="#bdae93", link="#88a99c",
         headings=("#fabd2f", "#b8bb26", "#8ec07c", "#83a598", "#fe8019", "#bdae93"),
         code_bg="#3c3836", code_fg="#fe8019", pre_bg="#32302f", quote_bg="#32302f", quote_fg="#d5c4a1",
-        rule="#504945", th_bg="#3c3836", zebra="#2f2d2c", mark="#b8bb26", math="#d3869b",
+        rule="#504945", th_bg="#3c3836", zebra="#2f2d2c", mark="#b8bb26", math="#d58e9d",
         alerts=("#83a598", "#b8bb26", "#d3869b", "#fabd2f", "#fc6857"), alert_bg="#32302f",
         highlight="#fabd2f", highlight_bg="#504228", selection_bg="#504945", selection_fg="#fbf1c7"),
         _code("#fc7b6c", "#b8bb26", "#aea08c", "#d68ea2", "#8ec07c", "#fabd2f", "#d68ea2", "#88a99c", "#fc7b6c")),
@@ -332,6 +332,36 @@ def contrast(a, b) -> float:
     return (high + 0.05) / (low + 0.05)
 
 
+def readable(colour: str, ground: str, least: float, toward: str) -> str:
+    """*colour* where it reaches *least* on *ground*; else the nearest mix of it with *toward* (the text's
+    colour there) that does - its hue kept as far as the contrast allows."""
+    a, b = rgb(colour), rgb(toward)
+    for step in range(MIX_STEPS + 1):
+        mixed = "#" + "".join(f"{round(x + (y - x) * step / MIX_STEPS):02x}" for x, y in zip(a, b))
+        if contrast(mixed, ground) >= least:
+            return mixed
+    return toward
+
+
+#: (readable) the steps from a colour to the text's.
+MIX_STEPS = 32
+#: The colours of a link, of muted (struck) text and of a formula inside a <mark>: the page's own where
+#: they reach AA (AAA in a High Contrast theme) on the mark's ground, else as near to them as does (a link
+#: in a mark was 3.60:1 in Dark, 3.81 in Retro; struck text 3.83 in Dark, 4.07 in Slate).
+MARK_ROLES = {"mark_link": "link", "mark_muted": "muted", "mark_math": "math"}
+
+
+def _mark_colours(page: dict, aaa: bool) -> dict:
+    least = 7.0 if aaa else 4.5
+    return {key: readable(page[role], page["highlight_bg"], least, page["text"]) for key, role in MARK_ROLES.items()}
+
+
+for _theme_ in THEMES.values():
+    _theme_.page.update(_mark_colours(_theme_.page, _theme_.aaa))
+del _theme_
+PAGE_KEYS = tuple(LIGHT_PAGE)  # (with the mark's colours)
+
+
 #: (foreground role, background role, the least ratio) a theme's page must reach - AA's 4.5 for text on
 #: every ground it is drawn on (a link in a table's header and in inline code, muted text - struck, a code
 #: block's label - in tables and code, an alert's title: bold, but of the text's size, no large text), 3 for
@@ -342,6 +372,8 @@ PAGE_PAIRS = (
     ("code_fg", "code_bg", 4.5), ("text", "pre_bg", 4.5), ("text", "code_bg", 4.5), ("quote_fg", "quote_bg", 4.5),
     ("text", "th_bg", 4.5), ("text", "zebra", 4.5),
     ("text", "highlight_bg", 4.5),  # (a <mark>, and Find's marks: ui.markdown_viewer.find_mark_format)
+    *((role, "highlight_bg", 4.5) for role in MARK_ROLES),  # (a link, struck text, a formula in a <mark>)
+    *(("math", ground, 4.5) for ground in ("th_bg", "zebra", "quote_bg", "alert_bg")),  # (a formula in a table, a quote)
     *(("link", ground, 4.5) for ground in ("th_bg", "zebra", "code_bg")),
     *(("muted", ground, 4.5) for ground in ("th_bg", "zebra", "pre_bg", "code_bg")),
     ("mark", "page_bg", 3.0), ("selection_fg", "selection_bg", 4.5), ("text", "alert_bg", 4.5),
@@ -351,7 +383,8 @@ PAGE_PAIRS = (
 #: The text and links of a High Contrast theme: AAA - on the page and on every ground a link is drawn on.
 AAA_PAIRS = (("text", "page_bg", 7.0), ("link", "page_bg", 7.0), ("text", "pre_bg", 7.0),
              ("code_fg", "code_bg", 7.0), ("text", "highlight_bg", 7.0),  # (<mark> and Find's marks)
-             *(("link", ground, 7.0) for ground in ("th_bg", "zebra", "code_bg")))
+             *(("link", ground, 7.0) for ground in ("th_bg", "zebra", "code_bg")),
+             ("mark_link", "highlight_bg", 7.0), ("mark_muted", "highlight_bg", 7.0))
 #: The terminal's text roles (core.markdown_term): each on the theme's ground - an alert's title, a heading,
 #: a link, a quote, a task's box, an image's name, a formula, muted notes.
 TERM_TEXT = ("text", "muted", "link", *(f"h{n}" for n in range(1, 7)), "quote", "mark", "open", "image", "math",
@@ -412,7 +445,7 @@ def readable256(fg: str, bg: str) -> int:
     want = rgb(fg)
     ranked = sorted(range(16, 256), key=lambda i: _distance(xterm256_rgb(i), want))
     for index in ranked:
-        if contrast(xterm256_rgb(index), ground) >= target - 0.05:
+        if contrast(xterm256_rgb(index), ground) >= target:
             return index
     return ranked[0]
 
@@ -441,6 +474,6 @@ def terminal_default(environ=None, path: Path | None = None) -> str:
 
 
 __all__ = ["AUTO", "CHOICES", "CODE_KEYS", "DARK_CODE", "DARK_PAGE", "DARK_TERM", "ENV_TERM", "LIGHT_CODE",
-           "LIGHT_PAGE", "LIGHT_TERM", "PAGE_KEYS", "SETTING_PAGE", "SETTING_TERM", "TERM_KEYS", "TERM_TEXT", "THEMES",
+           "LIGHT_PAGE", "LIGHT_TERM", "MARK_ROLES", "PAGE_KEYS", "SETTING_PAGE", "SETTING_TERM", "TERM_KEYS", "TERM_TEXT", "THEMES",
            "Theme", "code_of", "colours_of", "contrast", "contrast_report", "for_dark", "get", "luminance",
-           "nearest256", "normalize", "pygments_style", "readable256", "terminal_default", "xterm256_rgb"]
+           "nearest256", "normalize", "pygments_style", "readable", "readable256", "terminal_default", "xterm256_rgb"]

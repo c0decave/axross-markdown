@@ -181,6 +181,96 @@ def page_palette(theme: MT.Theme, base):
     return palette
 
 
+def rendered_contrasts(document, theme: MT.Theme) -> list[tuple[str, str, str, float]]:
+    """(text, its colour, the ground it is drawn on, their contrast) of every fragment of text of *document*
+    (a QTextDocument of a page in *theme*) - measured on the page as rendered, not from the theme's roles: a
+    fragment's own colour (the theme's text where it has none) against its own ground, else its block's, its
+    table cell's, its table's, a table's around that, the page's. What core.markdown_themes.contrast_report
+    lists by role - a link in a <mark>, a formula in a table's header - is checked here as it is drawn."""
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtGui import QTextCursor, QTextTable
+
+    def ground_of(fmt) -> str | None:
+        brush = fmt.background()
+        return brush.color().name() if brush.style() != Qt.BrushStyle.NoBrush and brush.color().alpha() else None
+
+    def around(block) -> str:
+        found = ground_of(block.blockFormat())
+        frame, place = QTextCursor(block).currentFrame(), block.position()
+        while found is None and frame is not None:
+            if isinstance(frame, QTextTable):
+                cell = frame.cellAt(place)
+                found = (ground_of(cell.format()) if cell.isValid() else None) or ground_of(frame.format())
+            place = frame.firstPosition() - 1
+            frame = frame.parentFrame()
+        return found or theme.page["page_bg"]
+
+    rows, block = [], document.begin()
+    while block.isValid():
+        at, behind = block.begin(), None
+        while not at.atEnd():
+            fragment = at.fragment()
+            fmt, text = fragment.charFormat(), fragment.text().strip()
+            if text and not fmt.isImageFormat():
+                if behind is None:
+                    behind = around(block)
+                ground = ground_of(fmt) or behind
+                brush = fmt.foreground()
+                colour = brush.color().name() if brush.style() != Qt.BrushStyle.NoBrush else theme.page["text"]
+                rows.append((text, colour, ground, MT.contrast(colour, ground)))
+            at += 1
+        block = block.next()
+    return rows
+
+
+def scroll_bar_style(theme: MT.Theme) -> str:
+    """The style sheet of a scroll bar beside a page of *theme*: its groove the page's ground, its handle the
+    theme's muted colour (the text's when the pointer is on it) - a dark page kept the window's bar, a white
+    handle beside it."""
+    page = theme.page
+    return (f"QScrollBar {{ background: {page['page_bg']}; border: none; margin: 0px; }}"
+            "QScrollBar:vertical { width: 14px; } QScrollBar:horizontal { height: 14px; }"
+            f"QScrollBar::handle {{ background: {page['muted']}; border: 3px solid {page['page_bg']}; "
+            "border-radius: 7px; }"
+            "QScrollBar::handle:vertical { min-height: 32px; } QScrollBar::handle:horizontal { min-width: 32px; }"
+            f"QScrollBar::handle:hover, QScrollBar::handle:pressed {{ background: {page['text']}; }}"
+            "QScrollBar::add-line, QScrollBar::sub-line { width: 0px; height: 0px; border: none; "
+            "background: none; }"
+            "QScrollBar::add-page, QScrollBar::sub-page { background: none; }")
+
+
+def window_style(theme: MT.Theme) -> str:
+    """The style sheet of the reader's window around a page of *theme* (axross-markdown: its toolbar, its find
+    field, the outline and the status line - they stayed in the window's light colours beside a dark page):
+    the page's ground and text, buttons and fields outlined in its muted colour, what is chosen in its
+    selection's colours, the focus in its link's."""
+    page = theme.page
+    ground, text, muted, raised = page["page_bg"], page["text"], page["muted"], page["code_bg"]
+    chosen, chosen_text = page["selection_bg"], page["selection_fg"]
+    return (
+        f"QDialog {{ background-color: {ground}; color: {text}; }}"
+        f"QLabel {{ color: {text}; background: transparent; }}"
+        f"QPushButton, QToolButton {{ background-color: {raised}; color: {text}; border: 1px solid {muted}; "
+        "border-radius: 4px; padding: 3px 8px; }"
+        f"QPushButton:hover, QToolButton:hover {{ background-color: {page['th_bg']}; border-color: {text}; }}"
+        f"QPushButton:pressed, QPushButton:checked, QToolButton:pressed {{ background-color: {chosen}; "
+        f"color: {chosen_text}; }}"
+        f"QPushButton:focus, QToolButton:focus, QLineEdit:focus {{ border: 2px solid {page['link']}; }}"
+        f"QPushButton:disabled, QToolButton:disabled {{ color: {muted}; border-color: {page['rule']}; }}"
+        f"QLineEdit {{ background-color: {ground}; color: {text}; border: 1px solid {muted}; border-radius: 4px; "
+        f"padding: 2px 4px; selection-background-color: {chosen}; selection-color: {chosen_text}; "
+        f"placeholder-text-color: {muted}; }}"
+        f"QListWidget {{ background-color: {ground}; color: {text}; border: 1px solid {page['rule']}; }}"
+        f"QListWidget::item:selected {{ background-color: {chosen}; color: {chosen_text}; }}"
+        f"QListWidget::item:hover {{ background-color: {raised}; }}"
+        f"QSplitter::handle {{ background-color: {page['rule']}; }}"
+        f"QMenu {{ background-color: {ground}; color: {text}; border: 1px solid {muted}; }}"
+        f"QMenu::item:selected {{ background-color: {chosen}; color: {chosen_text}; }}"
+        f"QMenu::item:disabled {{ color: {muted}; }}"
+        f"QToolTip {{ background-color: {raised}; color: {text}; border: 1px solid {muted}; }}"
+        + scroll_bar_style(theme))
+
+
 def add_theme_menu(menu):
     """A "Theme" submenu of *menu* (View): :func:`fill_theme_menu`. The submenu."""
     from axross_markdown._ax.core.i18n import tr
@@ -192,4 +282,4 @@ def add_theme_menu(menu):
 
 
 __all__ = ["MIN_INTERVAL_MS", "ThemeHub", "add_theme_menu", "auto_label", "fill_theme_menu", "hub",
-           "page_palette", "standalone", "store_theme", "stored_theme"]
+           "page_palette", "rendered_contrasts", "scroll_bar_style", "standalone", "store_theme", "stored_theme", "window_style"]

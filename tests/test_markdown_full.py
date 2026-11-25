@@ -357,7 +357,8 @@ def test_sad_mdcat_says_why_a_file_is_not_shown(folder, capsys, monkeypatch):
     os.mkfifo(folder / "pipe.md")
     assert C.main(["--color", "never", str(folder / "missing.md"), str(folder / "pipe.md")]) == 1
     err = capsys.readouterr().err
-    assert "missing.md" in err and "not a regular file" in err
+    # (a pipe no one writes to: said at once, never waited for - one with a writer is read)
+    assert "missing.md" in err and "a pipe no one writes to" in err
     # The document the user named is shown as the viewer shows it: the
     # agent's read policy (which sniffs contents) decides nothing about it.
     monkeypatch.setattr(protected_places, "read_refusal", lambda path, **kw: "secret")

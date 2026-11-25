@@ -29,6 +29,8 @@ for _name, _sub in (("XDG_CONFIG_HOME", ".config"), ("XDG_DATA_HOME", ".local/sh
                     ("XDG_CACHE_HOME", ".cache"), ("XDG_STATE_HOME", ".local/state")):
     os.environ[_name] = os.path.join(_home, _sub)
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+# (the tests read what the programs say in English: axross-mdcat follows the locale - a German one is no test's)
+os.environ.update({"LC_ALL": "C.UTF-8", "LC_MESSAGES": "C.UTF-8", "LANG": "C.UTF-8"})
 os.environ.setdefault("AXROSS_MARKDOWN_NO_UPDATE_CHECK", "1")  # (no test asks GitHub: the updater's use a fake)
 os.environ.pop("AXROSS_MARKDOWN_SETTINGS", None)  # (a settings file of the user's is no test's)
 
@@ -61,6 +63,17 @@ def _reset_theme():
             hub._pending, hub._theme, hub._applied, hub.clock = None, "auto", float("-inf"), time.monotonic
 
 
+@pytest.fixture(autouse=True)
+def _collector_settled():
+    """Before each test: the windows the tests before it closed are deleted
+    (tests/markdown_heartbeat.py's settle_collector) - a test's turns and gaps are the window's own, not
+    the leavings of the 2,000 tests one process runs."""
+    from tests.markdown_heartbeat import settle_collector
+
+    settle_collector()
+    yield
+
+
 def pytest_configure(config):
     """The markers ``timing`` and ``budgets`` (tests/markdown_timing.py); under ``-m "not timing"`` (the
     blocking job) a duration over its budget is a warning, its test's content still asserted."""
@@ -89,11 +102,19 @@ def pytest_collection_modifyitems(config, items):
 def pytest_runtest_call(item):
     """A stress test whose heartbeat froze (tests/markdown_heartbeat.py's Frozen) is run once more before it
     fails: a second job beside it can take its few tenths of a second now and then - a freeze of the
-    window's own fails both times."""
+    window's own fails both times. And no heartbeat a test stopped saw a turn of the GUI thread over the
+    gate (gate_turns: CPU time, whatever the machine's load - it fails in every job)."""
+    heartbeat = sys.modules.get("tests.markdown_heartbeat")
+    mark = len(heartbeat.STOPPED) if heartbeat is not None else 0
+    result = None
     try:
-        return (yield)
+        result = yield
     except AssertionError as error:
         heartbeat = sys.modules.get("tests.markdown_heartbeat")
-        if heartbeat is None or not isinstance(error, heartbeat.Frozen):
+        if heartbeat is None:
             raise
-        return heartbeat.measure_again(item.runtest, error)
+        mark = heartbeat.after_failure(item, error) or mark
+    heartbeat = sys.modules.get("tests.markdown_heartbeat")
+    if heartbeat is not None:
+        heartbeat.gate_turns(item, mark)
+    return result

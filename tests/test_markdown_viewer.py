@@ -406,11 +406,15 @@ def test_happy_the_pane_opens_markdown_rendered_and_f4_still_edits(docs):
     opener.assert_called_once()
     assert opener.call_args.args[1] == str(docs / "README.md")
     source = Path(FP.__file__).read_text()
-    view = source[source.index("def _view_selected"):source.index("def _looks_like_image")]
+    # F3 and a double-click ask the one dispatch (core.open_dispatch), whose MARKDOWN opens the
+    # viewer; F4 edits.
+    view = source[source.index("def _view_selected"):source.index("def _abilities")]
     activate = source[source.index("def _activate_file"):source.index("def _open_by_kind")]
+    run = source[source.index("def _run_opener"):source.index("def _say_why_not_viewed")]
     edit = source[source.index("def _edit_selected"):]
     edit = edit[:edit.index("\n    def ", 10)]
-    assert "_open_markdown_viewer" in view and "_open_markdown_viewer" in activate
+    assert "_open_by_dispatch" in view and "_open_by_dispatch" in activate
+    assert "OD.MARKDOWN" in run and "_open_markdown_viewer" in run
     assert "_open_markdown_viewer" not in edit
 
 

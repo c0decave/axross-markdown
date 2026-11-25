@@ -25,6 +25,7 @@ import html
 import logging
 import posixpath
 import re
+import unicodedata
 
 from axross_markdown._ax.core import markdown_doc as MD
 from axross_markdown._ax.core import markdown_themes as MT
@@ -87,7 +88,9 @@ li ul {{ list-style-type: circle; }}
 li li ul {{ list-style-type: square; }}
 div {{ margin-bottom: 10px; }}
 dd {{ line-height: 6px; -qt-line-height-type: line-distance; }}
-a {{ color: {c['link']}; text-decoration: none; }}
+a {{ color: {c['link']}; text-decoration: underline; }}
+.footnote-ref a, a.footnote-backref {{ text-decoration: none; }}
+s a, del a {{ text-decoration: underline line-through; }}
 code {{ background-color: {c['code_bg']}; color: {c['code_fg']}; font-family: monospace; }}
 pre {{ background-color: {c['pre_bg']}; font-family: monospace; margin-top: 0px; margin-bottom: 0px; }}
 pre code {{ background-color: {c['pre_bg']}; color: {c['text']}; }}
@@ -111,6 +114,9 @@ s, del {{ color: {c['muted']}; }}
 a .image-chip {{ color: {c['link']}; }}
 .kbd {{ background-color: {c['code_bg']}; font-family: monospace; }}
 .mark {{ background-color: {c['highlight_bg']}; color: {c['text']}; }}
+.mark a {{ color: {c['mark_link']}; }}
+.mark s, .mark del {{ color: {c['mark_muted']}; }}
+.mark .math {{ color: {c['mark_math']}; }}
 .summary {{ margin-top: 6px; }}
 a.fold {{ color: {c['text']}; text-decoration: none; }}
 .details {{ margin-left: 0px; }}
@@ -185,6 +191,10 @@ def _image_html(src: str, alt: str, extra: str, env) -> str:
         src = found
     elif _remote(src):
         return image_chip(src, alt, tr_text("Remote image, not loaded"))
+    elif alt and not extra:
+        # (in the window: its alt text is its tooltip where it has no title - an image said nothing of
+        # itself but its picture)
+        extra = f' title="{html.escape(alt)}"'
     return f'<img src="{html.escape(src)}" alt="{html.escape(alt)}"{extra} />'
 
 
@@ -263,6 +273,10 @@ def events_html(events, browser: bool = False, images: dict | None = None, links
         if event[0] == "end":
             if tag == "a" and links and not links.pop():
                 continue  # (an anchor without an address: closed where it began)
+            if not browser and tag == "a" and len(event) > 2 and event[2].get("infold"):
+                # (a link in a folded <details>' summary - fold_details: the fold's own link goes on after it)
+                out.append(f'</b></a><a class="fold" href="#{FOLD}{event[2]["infold"]}"><b>')
+                continue
             if tag not in MD.HTML_BLOCK or tag in ("br", "img", "hr"):
                 continue
             if not browser and tag == "summary" and len(event) > 2:
@@ -287,6 +301,8 @@ def events_html(events, browser: bool = False, images: dict | None = None, links
                 continue
             if browser:
                 values = {**values, "src": images[src]}
+            elif values.get("alt") and not values.get("title"):
+                values = {**values, "title": values["alt"]}  # (its alt text its tooltip, as a Markdown image's)
         attrs = "".join(f' {name}="{html.escape(value)}"' for name, value in values.items()
                         if name in ("align", "src", "alt", "title", "width", "height", "href", "name",
                                     "colspan", "rowspan"))
@@ -296,6 +312,8 @@ def events_html(events, browser: bool = False, images: dict | None = None, links
             attrs += " open"
         if tag in ("br", "hr", "img"):
             out.append(f"<{tag}{attrs} />")
+        elif not browser and tag == "a" and values.get("infold"):
+            out.append(f"</b></a><a{attrs}><b>")
         elif not browser and tag == "summary" and values.get("fold"):
             # (a folded <details>' summary: a click on it shows what it holds)
             out.append(f'<p class="summary"><a class="fold" href="#{FOLD}{values["fold"]}"><b>'
@@ -346,6 +364,8 @@ def fold_details(tokens: list, toggled=frozenset(), hidden: dict | None = None, 
     hiding = 0  # the depth of the stack whose details' contents are left out (0: none)
     level = 0  # the level of the tokens of that details
     dropped = 0  # the nesting of the tokens left out (their ends go too)
+
+    linked: list[bool] = []  # (the <a> open in a summary: whether each has an address)
 
     def summary(entry) -> list[tuple]:
         mark = {"fold": str(entry[0]), "open": "1" if entry[1] else ""}
@@ -411,7 +431,15 @@ def fold_details(tokens: list, toggled=frozenset(), hidden: dict | None = None, 
                     summarised(top)
                     continue
                 if tag == "a":
-                    continue  # (a link in the summary: the summary is the fold's link)
+                    # (a link in the summary: a link of its own between the fold's two halves - it was bold
+                    # text, its address gone; one without an address is dropped as before)
+                    if kind == "start":
+                        linked.append(bool(event[2].get("href")))
+                        if linked[-1]:
+                            kept.append(("start", "a", {**event[2], "infold": str(top[0])}))
+                    elif linked and linked.pop():
+                        kept.append(("end", "a", {"infold": str(top[0])}))
+                    continue
             if visible:
                 kept.append(event)
             elif kind == "text":
@@ -1179,6 +1207,9 @@ def _install_rules(md, dark: bool) -> None:
         made = renderer.renderToken(tokens, idx, options, env)
         if (tokens[idx].meta or {}).get("going_on"):  # (cut inside the item: a first block of no height)
             made += f"<p>{GOING_ON}</p>\n"
+        elif not env.get("browser") and idx + 1 < len(tokens) and tokens[idx + 1].type == "list_item_close":
+            # (an item of nothing: Qt draws none for "<li></li>" - "1. foo / 2. / 3. bar" showed 1 and 2)
+            made += "&nbsp;"
         return made
 
     def ordered_list_open(tokens, idx, options, env):
@@ -1187,14 +1218,18 @@ def _install_rules(md, dark: bool) -> None:
     def quote_open(tokens, idx, options, env):
         kind = MD.alert_of(tokens[idx])
         boxes = env.setdefault("boxes", [])  # (each quote open: drawn as a box (1) or not (0))
+        # (its direction - _directions: said where it is not what it is in; right-to-left, its bar on the right)
+        said = tokens[idx].attrGet("dir")
+        said = f' dir="{said}"' if said in ("rtl", "ltr") else ""
+        rtl = (tokens[idx].meta or {}).get("dir") == "rtl"
         if not env.get("browser") and sum(boxes) >= BOXES:
             # (Qt lays out tables inside each other in time that grows fast with
             # their depth: 30 quotes inside each other held the window minutes)
             boxes.append(0)
             if kind:
                 sign, title = _title(kind)
-                return f'<blockquote>\n<p class="alert-title">{sign} {html.escape(title)}</p>\n'
-            return "<blockquote>\n"
+                return f'<blockquote{said}>\n<p class="alert-title">{sign} {html.escape(title)}</p>\n'
+            return f"<blockquote{said}>\n"
         boxes.append(0 if env.get("browser") else 1)
         # (each quote open: an alert's tint (1) or none (0) - a code box in
         # an alert on the alert's own grey was no box)
@@ -1202,24 +1237,28 @@ def _install_rules(md, dark: bool) -> None:
             env.setdefault("tints", []).append(1 if kind else 0)
         if not kind:
             if env.get("browser"):
-                return "<blockquote>\n"
+                return f"<blockquote{said}>\n"
             # (as GitHub's: a bar in the rule's colour beside muted text - a
             # grey box was all Qt's <blockquote> drew, all but lost in dark)
+            bar = f'<td width="4" bgcolor="{palette["rule"]}" style="padding: 0px"></td>'
+            env.setdefault("bars", []).append(bar if rtl else "")
             return (f'<table width="100%" cellspacing="0" cellpadding="4" border="0" class="quote" '
                     f'style="margin-top: 10px; margin-bottom: 10px">'
-                    f'<tr><td width="4" bgcolor="{palette["rule"]}" style="padding: 0px"></td>'
-                    f'<td style="color: {palette["quote_fg"]}; padding-left: 12px">\n')
+                    f'<tr>{"" if rtl else bar}'
+                    f'<td{said} style="color: {palette["quote_fg"]}; padding-{"right" if rtl else "left"}: 12px">\n')
         sign, title = _title(kind)
         colour = palette.get(kind, palette["link"])
         heading = f'<p class="alert-title" style="color: {colour}">{sign} {html.escape(title)}</p>\n'
         if env.get("browser"):
-            return f'<div class="markdown-alert markdown-alert-{kind}">\n{heading}'
+            return f'<div class="markdown-alert markdown-alert-{kind}"{said}>\n{heading}'
         # Qt's rich text draws no border of one side: a narrow cell in the
         # alert's colour is the bar beside it.
+        bar = f'<td width="4" bgcolor="{colour}" style="padding: 0px"></td>'
+        env.setdefault("bars", []).append(bar if rtl else "")
         return (f'<table width="100%" cellspacing="0" cellpadding="6" border="0" bgcolor="{palette["alert_bg"]}" '
                 f'style="margin-top: 10px; margin-bottom: 10px">'
-                f'<tr><td width="4" bgcolor="{colour}" style="padding: 0px"></td>'
-                f'<td style="padding-left: 12px">\n{heading}')
+                f'<tr>{"" if rtl else bar}'
+                f'<td{said} style="padding-{"right" if rtl else "left"}: 12px">\n{heading}')
 
     def blockquote_close(tokens, idx, options, env):
         boxed = env.setdefault("boxes", []).pop() if env.get("boxes") else 0
@@ -1227,12 +1266,14 @@ def _install_rules(md, dark: bool) -> None:
             env["tints"].pop()
         if not env.get("browser") and not boxed:
             return "</blockquote>\n"
+        # (a right-to-left quote's bar: after its text's cell - on the right)
+        bar = env["bars"].pop() if boxed and env.get("bars") else ""
         # (a quote of nothing - a footnote's definition was all it held - a line of its own in it: Qt laid
         # an empty cell's table out with no line after it, a part ending there with one - in parts not whole)
         empty = "<p>&nbsp;</p>\n" if idx and tokens[idx - 1].type == "blockquote_open" else ""
         if not MD.alert_of(tokens[idx]):
-            return "</blockquote>\n" if env.get("browser") else empty + "</td></tr></table>\n"
-        return "</div>\n" if env.get("browser") else empty + "</td></tr></table>\n"
+            return "</blockquote>\n" if env.get("browser") else empty + f"</td>{bar}</tr></table>\n"
+        return "</div>\n" if env.get("browser") else empty + f"</td>{bar}</tr></table>\n"
 
     def image(tokens, idx, options, env):
         token = tokens[idx]
@@ -1328,10 +1369,10 @@ def _install_rules(md, dark: bool) -> None:
         return f'<code style="white-space: pre-wrap">{html.escape(tokens[idx].content, quote=False)}</code>'
 
     renderer.rules["code_inline"] = code_inline
-    renderer.rules["fence"] = fence
-    renderer.rules["code_block"] = code_block
+    renderer.rules["fence"] = _left_to_right(fence)
+    renderer.rules["code_block"] = _left_to_right(code_block)
     renderer.rules["math_inline"] = renderer.rules["math_inline_double"] = math_inline
-    renderer.rules["math_block"] = renderer.rules["math_block_label"] = math_block
+    renderer.rules["math_block"] = renderer.rules["math_block_label"] = _left_to_right(math_block)
     renderer.rules["blockquote_open"] = blockquote_open
     renderer.rules["list_item_open"] = list_item_open
     renderer.rules["blockquote_close"] = blockquote_close
@@ -1357,7 +1398,7 @@ def _install_rules(md, dark: bool) -> None:
     renderer.rules["safe_html_block"] = safe_html_block
     renderer.rules["safe_html_inline"] = lambda tokens, idx, options, env: events_html(
         MD.html_events(tokens[idx]), bool(env.get("browser")), env.get("images"), env.setdefault("links", []))
-    renderer.rules["front_matter"] = front_matter
+    renderer.rules["front_matter"] = _left_to_right(front_matter)
     if "footnote_caption" in renderer.rules:
         renderer.rules["footnote_caption"] = footnote_caption
 
@@ -1369,7 +1410,7 @@ def _install_rules(md, dark: bool) -> None:
 #: footnote that far down is not.
 ANCHORS = 2000
 _ID = re.compile(r'<(\w+)([^<>]*?) id="([^"<>]*)"([^<>]*)>')
-_ALIGN = re.compile(r'<(th|td) style="text-align:(left|center|right)">')
+_ALIGN = re.compile(r'<(th|td) style="text-align:(left|center|right)"((?: dir="[a-z]+")?)>')
 _TASK = re.compile(r'<input [^<>]*?type="checkbox"[^<>]*?>')  # (only the task list makes an input)
 
 
@@ -1495,6 +1536,144 @@ def _widths(table) -> list[int]:
     return [max(1, round(100 * n / total)) for n in longest]
 
 
+#: The characters of a block's text read for its direction at most (and four times as many spans of it).
+DIRECTION_REACH = 400
+#: The blocks that take their direction from their own text, and the containers that hand theirs on.
+_DIR_LEAVES = frozenset(("paragraph_open", "heading_open", "th_open", "td_open", "dt_open"))
+_DIR_BOXES = {"list_item_open": "list_item_close", "blockquote_open": "blockquote_close",
+              "table_open": "table_close", "dd_open": "dd_close"}
+_DIR_CLOSES = frozenset(_DIR_BOXES.values())
+#: The blocks that stay left-to-right whatever they are in: code, formulas.
+_DIR_LTR = frozenset(("fence", "code_block", "math_block", "math_block_label", "front_matter"))
+
+
+def text_direction(text: str) -> str:
+    """"rtl" or "ltr" by the first strong character of *text* (as HTML's dir="auto"), "" with none (digits,
+    signs; this module's own marks - private use - count as none)."""
+    if text.isascii():
+        return "ltr" if text.lower() != text.upper() else ""
+    for char in text:
+        kind = unicodedata.bidirectional(char)
+        if kind == "L":
+            if not "\ue000" <= char <= "\uf8ff":
+                return "ltr"
+        elif kind in ("R", "AL"):
+            return "rtl"
+    return ""
+
+
+def _direction(inline) -> str:
+    """The direction of a line's tokens: its text's and its code spans' first strong character within
+    DIRECTION_REACH (text_direction)."""
+    left, spans = DIRECTION_REACH, 4 * DIRECTION_REACH
+    for child in inline.children or ():
+        spans -= 1
+        if child.type in ("text", "code_inline") and child.content:
+            text = child.content[:left]
+            found = text_direction(text)
+            if found:
+                return found
+            left -= len(text)
+        if left <= 0 or spans <= 0:
+            break
+    return ""
+
+
+def _directed(token, own: str, base: str) -> None:
+    """*token*'s dir attribute: *own* where it differs from what it is in (*base*), else none."""
+    if own and own != base:
+        token.attrSet("dir", own)
+    elif token.attrs and "dir" in token.attrs:
+        del token.attrs["dir"]
+
+
+def _directions(tokens) -> None:
+    """Each block's direction from its own text, as dir="auto" (every block was left-to-right: Arabic and
+    Hebrew paragraphs and headings on the left, their bullets too, the full stop at the wrong end): a
+    paragraph, a heading, a cell by its first strong character; a list item, a quote, a table, a definition
+    by the first text in it - what is in them takes theirs unless its own text says otherwise (an English
+    paragraph in an Arabic item: "ltr"). Code and formulas in a right-to-left container stay left-to-right
+    (meta "ltr"). One pass: each container decided once, by the first text after it opens."""
+    stack: list[list] = []  # [the container's token, its direction or ""]
+    decided = 0  # (stack[:decided] have a direction)
+    for index, token in enumerate(tokens):
+        kind = token.type
+        if kind in _DIR_BOXES:
+            if token.meta and "dir" in token.meta:
+                del token.meta["dir"]
+            stack.append([token, ""])
+        elif kind in _DIR_CLOSES:
+            if stack:
+                entry = stack.pop()
+                if not entry[1]:
+                    _directed(entry[0], "", "")
+                decided = min(decided, len(stack))
+        elif kind == "inline":
+            own = _direction(token)
+            base = stack[decided - 1][1] if decided else "ltr"
+            if own:
+                for entry in stack[decided:]:
+                    _directed(entry[0], own, base)
+                    entry[0].meta = {**(entry[0].meta or {}), "dir": own}
+                    entry[1] = base = own
+                decided = len(stack)
+            if index and tokens[index - 1].type in _DIR_LEAVES:
+                _directed(tokens[index - 1], own, base)
+        elif kind in _DIR_LTR:
+            rtl = decided and stack[decided - 1][1] == "rtl"
+            if rtl:
+                token.meta = {**(token.meta or {}), "ltr": True}
+            elif token.meta and "ltr" in token.meta:
+                del token.meta["ltr"]
+
+
+def _mirrored(tokens: list) -> list:
+    """*tokens* with the cells of each row of a right-to-left table (_directions) in the opposite order, the
+    table on the right: Qt lays a table's columns out from the left whatever its direction - a browser
+    mirrors it itself."""
+    if not any(token.type == "table_open" and (token.meta or {}).get("dir") == "rtl" for token in tokens):
+        return tokens
+    out, index, mirror = [], 0, False
+    while index < len(tokens):
+        token = tokens[index]
+        if token.type == "table_open":
+            mirror = (token.meta or {}).get("dir") == "rtl"
+            if mirror:
+                token = token.copy(attrs={**(token.attrs or {}), "align": "right"})
+        elif token.type == "table_close":
+            mirror = False
+        elif mirror and token.type == "tr_open":
+            out.append(token)
+            index += 1
+            cells: list[list] = []
+            while index < len(tokens) and tokens[index].type != "tr_close":
+                if tokens[index].type in ("th_open", "td_open") or not cells:
+                    cells.append([])
+                cells[-1].append(tokens[index])
+                index += 1
+            for cell in reversed(cells):
+                out += cell
+            continue
+        out.append(token)
+        index += 1
+    return out
+
+
+_LTR_BLOCK = re.compile(r"<(pre|p|td)\b")
+
+
+def _left_to_right(rule):
+    """*rule* (a code block's, a formula's) with its blocks left-to-right where _directions marked the token
+    (in a right-to-left list item or quote: its lines began at the right)."""
+    def made(tokens, idx, options, env):
+        out = rule(tokens, idx, options, env)
+        if (tokens[idx].meta or {}).get("ltr") and not env.get("browser"):
+            out = _LTR_BLOCK.sub(r'<\1 dir="ltr"', out)
+        return out
+
+    return made
+
+
 def to_html(doc: MD.Document, dark: bool = False) -> str:
     """The HTML of *doc* for Qt (see the module docstring)."""
     return "<html><body>" + "".join(to_html_parts(doc, dark, 0)) + "</body></html>"
@@ -1511,7 +1690,10 @@ def to_html_parts(doc: MD.Document, dark: bool = False, blocks: int = 2500, togg
     md = doc.parser
     _install_rules(md, dark)
     _mark_task_lists(doc.tokens)
-    tokens, chunks = _join_table_parts(fold_details(doc.tokens, toggled, hidden, first_details))
+    folded = fold_details(doc.tokens, toggled, hidden, first_details)
+    _directions(folded)
+    tokens, chunks = _join_table_parts(folded)
+    tokens = _mirrored(tokens)
     if blocks:
         tokens = _html_pieces(_table_pieces(_paragraph_pieces(_in_bands(tokens))))
     ranges = _part_ranges(tokens, blocks, chunks)
@@ -1530,7 +1712,7 @@ def to_html_parts(doc: MD.Document, dark: bool = False, blocks: int = 2500, togg
         if opened:  # (a part going on inside a container: see _part_ranges - ui.markdown_view looks for this)
             body = CONTINUED + body
         body = _ID.sub(lambda match: _anchor(match, counter), body)
-        body = _ALIGN.sub(r'<\1 align="\2">', body)
+        body = _ALIGN.sub(r'<\1 align="\2"\3>', body)
         body = _TASK.sub(_task, body)
         body = _TABLE.sub(table_tag, body)
         if ' piece="' in body:  # (a table's pieces in a container one under another: no room between them)
@@ -2116,7 +2298,10 @@ def _event_pieces(events: list) -> list:
             segments += _text_segments(event[1])
         at += 1
     end = at
-    if depth or len(segments) < 2 or (parent is not None and end >= len(events)):
+    # (an element this block never ends - "<p>" over 2,000 lines, ended by the page - is cut as one that
+    # is: each piece but the last ends it, the last leaves it open as the block did. It was one piece -
+    # a first part of 218,000 characters, one paragraph laid out in a turn of 0.13 s)
+    if depth or len(segments) < 2:
         return [events]
     head = [events[k] for k in chain]
     tail = [("end", events[k][1]) for k in reversed(chain)]
@@ -2184,35 +2369,40 @@ EXPORT_POLICY = ("default-src 'none'; style-src 'unsafe-inline'; img-src data:; 
 
 def _export_style(dark) -> str:
     c = colours(dark)
-    alerts = "\n".join(f".markdown-alert-{kind} {{ border-left-color: {c[kind]}; }}" for kind in ALERT_TITLES)
+    alerts = "\n".join(f".markdown-alert-{kind} {{ border-inline-start-color: {c[kind]}; }}" for kind in ALERT_TITLES)
     return f"""
 body {{ color: {c['text']}; background: {c['page_bg']}; max-width: 52em; margin: 2em auto;
        padding: 0 1em; font: 16px/1.6 -apple-system, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif; }}
 h1, h2 {{ border-bottom: 1px solid {c['rule']}; padding-bottom: .3em; }}
 h1 {{ color: {c['h1']}; }} h2 {{ color: {c['h2']}; }} h3 {{ color: {c['h3']}; }}
 h4 {{ color: {c['h4']}; }} h5 {{ color: {c['h5']}; }} h6 {{ color: {c['h6']}; }}
-a {{ color: {c['link']}; text-decoration: none; }} a:hover {{ text-decoration: underline; }}
+a {{ color: {c['link']}; text-decoration: underline; }}
+.footnote-ref a, a.footnote-backref {{ text-decoration: none; }}
+mark {{ background: {c['highlight_bg']}; color: {c['text']}; }}
+mark a {{ color: {c['mark_link']}; }} mark s, mark del {{ color: {c['mark_muted']}; }}
+mark .math {{ color: {c['mark_math']}; }}
 code {{ background: {c['code_bg']}; color: {c['code_fg']}; padding: .1em .3em; border-radius: 4px;
         font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 90%; }}
-pre {{ background: {c['pre_bg']}; padding: 1em; border-radius: 6px; overflow: auto; }}
+pre {{ background: {c['pre_bg']}; padding: 1em; border-radius: 6px; overflow: auto; direction: ltr;
+       text-align: left; }}
 pre code {{ background: none; color: {c['text']}; padding: 0; font-size: 90%; }}
-blockquote {{ color: {c['quote_fg']}; border-left: 4px solid {c['rule']}; margin: 0; padding: 0 1em; }}
+blockquote {{ color: {c['quote_fg']}; border-inline-start: 4px solid {c['rule']}; margin: 0; padding: 0 1em; }}
 table {{ border-collapse: collapse; display: block; overflow: auto; }}
 th, td {{ border: 1px solid {c['rule']}; padding: 6px 13px; }}
 th {{ background: {c['th_bg']}; }}
 img {{ max-width: 100%; }}
 hr {{ border: 0; border-top: 1px solid {c['rule']}; }}
-dt {{ font-weight: 700; margin-top: .5em; }} dd {{ margin-left: 2em; }}
+dt {{ font-weight: 700; margin-top: .5em; }} dd {{ margin-inline-start: 2em; }}
 s, del {{ color: {c['muted']}; }}
-ul.task-list {{ list-style: none; padding-left: 1.2em; }}
+ul.task-list {{ list-style: none; padding-inline-start: 1.2em; }}
 .task-done {{ color: {c['mark']}; font-weight: 700; }} .task-open {{ color: {c['muted']}; font-weight: 700; }}
 .footnotes {{ color: {c['muted']}; font-size: 90%; }}
 .front-matter {{ color: {c['muted']}; font-size: 85%; }}
 .math {{ color: {c['math']}; font-family: {MATH_FAMILIES}; }}
 .math-block {{ color: {c['math']}; font-family: {MATH_FAMILIES}; font-size: 115%;
-               text-align: center; margin: 1em 0; }}
+               text-align: center; margin: 1em 0; direction: ltr; }}
 .math-rows {{ display: inline-block; text-align: left; background: none; margin: 0; font-size: 100%; }}
-.markdown-alert {{ border-left: 4px solid; padding: .5em 1em; margin: 1em 0; background: {c['alert_bg']}; }}
+.markdown-alert {{ border-inline-start: 4px solid; padding: .5em 1em; margin: 1em 0; background: {c['alert_bg']}; }}
 .alert-title {{ font-weight: 700; margin: 0 0 .3em; }}
 .code-label {{ color: {c['muted']}; font-size: 80%; font-style: italic; margin: 1em 0 -.8em; }}
 kbd {{ border: 1px solid {c['rule']}; border-radius: 4px; padding: 0 .3em; font-family: ui-monospace, monospace;
@@ -2335,6 +2525,7 @@ def export_body(doc: MD.Document, dark: bool = False, images: dict | None = None
     md = doc.parser
     _install_rules(md, dark)
     _mark_task_lists(doc.tokens)
+    _directions(doc.tokens)
     try:
         body = md.renderer.render(doc.tokens, md.options, {"browser": True, "images": images or {}})
     except (Exception, RecursionError) as exc:  # noqa: BLE001 - a block's fault: the text as written,

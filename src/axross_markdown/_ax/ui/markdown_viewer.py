@@ -53,6 +53,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QTextEdit,
     QVBoxLayout,
+    QWidget,
 )
 
 from axross_markdown._ax.core.i18n import tr
@@ -146,6 +147,10 @@ def find_mark_format(theme) -> QTextCharFormat:
     return fmt
 
 
+#: Seconds a file that keeps changing is looked at again after at most (MarkdownViewerDialog._file_touched).
+WATCH_AT_MOST = 2.0
+
+
 class MarkdownViewerDialog(QDialog):
     """The Markdown file *path* of *backend*, rendered. *source_pane*: the
     pane it was opened from (Edit opens the editor of its window).
@@ -218,19 +223,24 @@ class MarkdownViewerDialog(QDialog):
             self.open_button.clicked.connect(lambda: self._opener(self))
         zoom_out = QPushButton("−")
         zoom_out.setToolTip(tr("Smaller (Ctrl+-)"))
+        zoom_out.setAccessibleName(tr("Smaller"))  # (a sign alone was its name: "−")
         zoom_out.clicked.connect(lambda: self.view.zoom_by(-1))
         zoom_reset = QPushButton("100%")  # (the zoom level as it is - a click: its own size again)
         zoom_reset.setToolTip(tr("The text's size – click for the original size (Ctrl+0)"))
+        zoom_reset.setAccessibleDescription(tr("The text's size – click for the original size (Ctrl+0)"))
         self.zoom_reset = zoom_reset
         zoom_reset.clicked.connect(lambda: self.view.zoom_by(0))
         zoom_in = QPushButton("+")
         zoom_in.setToolTip(tr("Larger (Ctrl++)"))
+        zoom_in.setAccessibleName(tr("Larger"))
         zoom_in.clicked.connect(lambda: self.view.zoom_by(1))
         self.back_button = QPushButton("←")
         self.back_button.setToolTip(tr("Back (Alt+Left)"))
+        self.back_button.setAccessibleName(tr("Back"))
         self.back_button.clicked.connect(self.back)
         self.forward_button = QPushButton("→")
         self.forward_button.setToolTip(tr("Forward (Alt+Right)"))
+        self.forward_button.setAccessibleName(tr("Forward"))
         self.forward_button.clicked.connect(self.forward)
         # (a push button as its neighbours, its menu's arrow beside the text - a
         # tool button's was drawn over its "t")
@@ -262,6 +272,8 @@ class MarkdownViewerDialog(QDialog):
         self.find_field = QLineEdit()
         self.find_field.setPlaceholderText(tr("Find (Ctrl+F, Enter: next, Shift+Enter: back)"))
         self.find_field.setClearButtonEnabled(True)
+        self.find_field.setAccessibleName(tr("Find"))  # (a placeholder is no name: it goes with the first letter)
+        self.find_field.setToolTip(tr("Find (Ctrl+F, Enter: next, Shift+Enter: back)"))
         self.find_field.returnPressed.connect(self.find_next)
         self.find_field.textChanged.connect(self._find_typed)
         self.find_count = QLabel()
@@ -292,6 +304,11 @@ class MarkdownViewerDialog(QDialog):
         self.view.navigator = self
         self.view.link.connect(self.follow)
         self.view.zoom_changed.connect(lambda percent: self.zoom_reset.setText(f"{percent}%"))
+        self._window_ground = None
+        self.view.shown.connect(self._window_theme)  # (the window in the page's theme: with the page)
+        from axross_markdown._ax.ui.markdown_theme_ui import hub
+
+        hub().changed.connect(self._window_theme_soon)
         root.addWidget(self.view, 1)
         self._update_history_buttons()
         for keys, slot in (
@@ -325,9 +342,41 @@ class MarkdownViewerDialog(QDialog):
             button.setAutoDefault(False)
             button.setDefault(False)
         # The text has the focus: Space, Page Down, the arrows scroll it at
-        # once (it was a tool button's: Space opened its menu).
-        self.setFocusProxy(self.view.browser)
+        # once (it was a tool button's: Space opened its menu). Not as the window's focus proxy: with one, Tab
+        # went from the page to the corner's buttons and back to the page, never to the toolbar - Export and
+        # the outline's button, which have no key of their own, were reached with Shift+Tab only.
+        self._tab_order()
         self.view.browser.setFocus()
+
+    def _tab_order(self) -> None:
+        """Tab goes through the toolbar as it reads (its two rows' order in a narrow window too), the find
+        field, the outline, the page - then the corner's buttons, and round."""
+        menus = [button for button in (self.view_button, self.help_button) if button is not None]
+        order = [*self._buttons, *self._zoom, self.export_button, *menus, self.find_field, self.view.outline,
+                 self.view.browser]
+        for before, after in zip(order, order[1:], strict=False):
+            QWidget.setTabOrder(before, after)
+
+    def focusInEvent(self, event) -> None:  # noqa: N802 - Qt
+        """(the window itself given the focus - setFocus() on it) the page has it."""
+        super().focusInEvent(event)
+        if not sip.isdeleted(self.view):
+            self.view.browser.setFocus(event.reason())
+
+    def _window_theme_soon(self, _theme_id: str = "") -> None:
+        QTimer.singleShot(0, lambda: None if sip.isdeleted(self) else self._window_theme())
+
+    def _window_theme(self) -> None:
+        """(axross-markdown) the toolbar, the find field, the outline and the status line in the theme the
+        page shows - View > Theme chose it; "Automatic": the window's own theme again (they stayed light beside
+        a dark page). In axross the application's theme rules its windows: nothing is done there."""
+        from axross_markdown._ax.ui.markdown_theme_ui import standalone, window_style
+
+        want = getattr(self.view, "_ground", None) if standalone() else None
+        if want is self._window_ground:
+            return
+        self._window_ground = want
+        self.setStyleSheet(window_style(want) if want is not None else "")
 
     def changeEvent(self, event) -> None:  # noqa: N802 - Qt
         super().changeEvent(event)
@@ -359,7 +408,16 @@ class MarkdownViewerDialog(QDialog):
         writing. (A bound method, not a lambda: PyQt drops a method's
         connection with its object - the reader's tests crashed now and
         then, SIGSEGV in one of these two lambdas, called for a dialog
-        already gone.)"""
+        already gone.) A file written to without a pause is shown anew every
+        WATCH_AT_MOST seconds all the same: each change put the look off again -
+        a log growing for 20 s showed nothing new until its writer stopped."""
+        import time
+
+        now = time.monotonic()
+        if not self._watch_timer.isActive():
+            self._touched_first = now
+        elif now - getattr(self, "_touched_first", now) >= WATCH_AT_MOST:
+            return  # (waited long enough: the look that is due comes)
         self._watch_timer.start()
 
     def _find_typed(self, _text: str) -> None:
@@ -778,8 +836,10 @@ class MarkdownViewerDialog(QDialog):
             return "web", url.toString(QUrl.ComponentFormattingOption.FullyEncoded), ""
         if scheme == "mailto" and url.path() and "\0" not in url.path():
             # (as a web link: a question naming the address - its domain in punycode, not "%D0%B0" -
-            # then the mail program)
-            return "web", MV.mail_address(url).toString(QUrl.ComponentFormattingOption.FullyEncoded), ""
+            # then the mail program; of its parameters only the subject: attach=, bcc=, body= are not passed on)
+            from axross_markdown._ax.ui.markdown_safe import plain_mailto
+
+            return "web", plain_mailto(MV.mail_address(url)).toString(QUrl.ComponentFormattingOption.FullyEncoded), ""
         refused = ("refused", tr("Not opened: {target}").format(target=MV.printable(url.toString())), "")
         if scheme or url.toString().startswith("//"):
             return refused
@@ -869,6 +929,12 @@ class MarkdownViewerDialog(QDialog):
 
         body = tr("This link leads out of the document's folder:\n{target}\n\nOpen it?").format(
             target=MV.printable(path))
+        # (a link through a symbolic link: "etcdir/passwd" was asked about, /etc/passwd shown on Yes)
+        real = self._paths().realpath(path) if MV._is_local(self.backend) else path
+        if real != path:  # (said before the question, not after it)
+            said, _gap, question = body.rpartition("\n\n")
+            body = (said + "\n\n" + tr("Through a symbolic link it really opens:\n{real}").format(
+                real=MV.printable(real)) + "\n\n" + question)
         if text and text.strip() != path:
             body += "\n\n" + tr("Link text: {text}").format(text=MV.printable(text.strip())[:200])
         answer = QMessageBox.question(self, tr("Open Link"), body,
@@ -1027,10 +1093,10 @@ class MarkdownViewerDialog(QDialog):
         the images they show that are not read yet (MV.image_names, the view's source), a progress window
         with Cancel meanwhile; those images then the view's, as if the page had shown them. None when
         cancelled. The page itself is not laid out for it."""
-        text = self.view.markdown.replace("\r\n", "\n").replace("\r", "\n")
-        full, source, read = self.view.full, self.view.source, set(self.view.originals)
+        written, full, source, read = self.view.markdown, self.view.full, self.view.source, set(self.view.originals)
 
         def work():
+            text = written.replace("\r\n", "\n").replace("\r", "\n")
             kind, parts = MV.held_while(MV.print_parts, text, full)  # (its making: the collector held)
             names = []
             if source is not None:
@@ -1062,10 +1128,13 @@ class MarkdownViewerDialog(QDialog):
 
         title = self._name() if self.path else tr("Markdown Viewer")
         if self.view.full:
-            text = MD.clean(self.view.markdown.removeprefix("\ufeff"))
+            written_text = self.view.markdown
             source, originals = self.view.source, dict(self.view.originals)
 
             def work():
+                # (the text cleaned here, not before the worker began: all of 7 MB in the export's own turn
+                # was 0.14 to 0.25 s of the GUI thread)
+                text = MD.clean(written_text.removeprefix("\ufeff"))
                 # (parsed a piece at a time, as the page: all of it at once held every token of the text -
                 # 4 MB, 700 MiB more; the images it shows that the page has not read yet - not laid out whole
                 # first: read here, a piece's before its body is made)
@@ -1145,9 +1214,10 @@ class MarkdownViewerDialog(QDialog):
 
         def safe():
             embedded = _embedded(images)
-            first = H.safe_page(head, embedded).replace(
+            top, parts = MV.lean_qt_html(head, bodies)  # (a style written once, not in every tag)
+            first = H.safe_page(top, embedded).replace(
                 "<head>", f'<head><meta http-equiv="Content-Security-Policy" content="{H.EXPORT_POLICY}">', 1)
-            return [first, *(H.safe_page(body, embedded) for body in bodies), "</body></html>"]
+            return [first, *(H.safe_page(body, embedded) for body in parts), "</body></html>"]
 
         return self._in_background(safe, label)
 

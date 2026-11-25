@@ -51,6 +51,17 @@ axross-mdcat README.md                         # in the terminal, in colour (no 
 axross-markdown --html notes.md > notes.html   # the page for a web browser
 ```
 
+PyPI may lag behind the releases: `axross-markdown --version` says which one pip gave you. The
+wheel of this release, 0.17.5, straight from GitHub:
+
+```sh
+pip install https://github.com/c0decave/axross-markdown/releases/download/v0.17.5/axross_markdown-0.17.5-py3-none-any.whl
+```
+
+To check it first, download `axross_markdown-0.17.5-py3-none-any.whl`, `SHA256SUMS` and `SHA256SUMS.sig` from the
+[release](https://github.com/c0decave/axross-markdown/releases/tag/v0.17.5), check the signature
+and the sums ([how](https://github.com/c0decave/axross-markdown/blob/main/docs/README-extended.md#checking-a-download-by-hand)), then `pip install ./axross_markdown-0.17.5-py3-none-any.whl`.
+
 Or a one-file program without Python - Linux (also as an AppImage), macOS (also as a disk
 image) and Windows - from the [latest release](https://github.com/c0decave/axross-markdown/releases/latest);
 it updates itself from the signed releases ([how](https://github.com/c0decave/axross-markdown/blob/main/docs/README-extended.md#updates)).
@@ -64,9 +75,11 @@ Every dependency is pinned and reviewed in `requirements.lock.txt`
 python -m pytest tests
 ```
 
-The tool's own tests from axross - 48 files, their imports renamed as the code's - and a test that the program starts and ends cleanly; Qt's offscreen platform, no display needed.
+The tool's own tests from axross - 53 test files and the helpers they share, their imports renamed as the code's - and a test that the program starts and ends cleanly; Qt's offscreen platform, no display needed.
 
-Tests that pass or fail by elapsed time only - the window's heartbeat and turn budgets, the freeze sweep, the stress grids - carry the marker `timing`; tests that assert what the page shows or refuses *and* a duration carry `budgets`: their content is asserted as any test's, each duration through `budget()` (`tests/markdown_timing.py`; `tests/test_markdown_timing_marks.py` fails when a test asserts a duration otherwise, or a `timing` test asserts anything but a duration - a security test never does). The CI's blocking job runs `-m "not timing"`: every content assertion blocks, a duration over its budget is a warning there. A job of its own that blocks nothing runs `-m "timing or budgets"` strictly (a shared runner about twice as slow fails a duration without a bug); a release waits for the blocking job only.
+Tests that pass or fail by elapsed time only - the window's heartbeat and turn budgets, the freeze sweep, the stress grids - carry the marker `timing`; tests that assert what the page shows or refuses *and* a duration carry `budgets`: their content is asserted as any test's, each duration through `budget()` (`tests/markdown_timing.py`; `tests/test_markdown_timing_marks.py` fails when a test asserts a duration otherwise, or a `timing` test asserts anything but a duration - a security test never does). The CI's blocking job runs `-m "not timing"`: every content assertion blocks, a duration over its budget is a warning there. A job of its own that blocks nothing runs `-m "timing or budgets"` strictly (a shared runner about twice as slow fails a duration without a bug); a release does not wait for it.
+
+One duration blocks a release all the same: a **turn** - the GUI thread's own CPU time in one event-loop turn, which nothing else on the machine can lengthen. Every heartbeat a test stops is judged after the test: a turn over 0.25 s (times how much slower the machine lays out a page) fails it in every job - the window was frozen by its own work. The CI's job `turns` runs the timing tests for this alone (`AXROSS_TIMING_BUDGETS=gate`, `-m timing`: their wall-clock assertions are warnings there) and a release waits for it.
 
 **Locally nothing changes:** `python -m pytest tests` runs the whole suite at full strictness, durations included - that is the bar for every change.
 

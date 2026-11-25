@@ -4,6 +4,250 @@ What changed in each release of axross-markdown. The code is axross's
 Markdown viewer (https://github.com/c0decave/axross), written out by axross's
 `scripts/export_standalone.py markdown`.
 
+## 0.17.5 - 2026-11-24
+
+What the twenty-eighth review found: the place read lost at a zoom out, the
+window held by its own work on texts the freeze sweep did not hold, content
+Qt's own parser lost, a settings file that turned "off" into "auto", and
+the editor.
+
+### The window
+
+- **A zoom out keeps the place read.** Zooming in kept it; each zoom out on a
+  page read far in - and Ctrl+0 - jumped hundreds of sections on (H2400 to
+  H2591, H2813, H3318 on a page of 4,000 sections), in both parsers. The
+  page's height shrank under the scroll bar's value, which then lay far
+  into the stand-in for what is not laid out yet and was read as the thumb
+  dropped there. On a page not read to its end the place held after a zoom
+  rode on with every part laid out after it (section 746 to 794). Tested in
+  both directions and back to 100 %.
+- **A raw HTML table no longer holds the window as it is opened** (one turn
+  of 0.17 s for 50,000 rows, 0.55 s for 150,000, both parsers; a missing
+  anchor on that page 0.52 s). It was Python's full collection, running in
+  the GUI thread's next turn, over the 1.6 million events of the table that
+  the sanitizer of raw HTML still held - in a cycle only the collector
+  frees. It keeps none of them now.
+- **A page of many images** no longer holds the window at every zoom, resize
+  and theme switch (0.2 to 0.36 s a turn for 20,000 to 100,000 images, 0.3 s
+  a part read on). Qt's HTML reader gives every image a frame of its own,
+  and the layout walks them all at every change; images now go into the page
+  without one, count as a block each in every bound, and an old page is let
+  go of in pieces sized by its images.
+- **An emphasis run around one letter** (30,000 `*` or `_`, a letter, 30,000
+  more): Qt's own parser held the window 0.75 to 0.9 s at open, zoom, resize
+  and theme switch, markdown-it's page showed its letter after 34 s. A run
+  of more than 500 is cut (said in the notice); what it opens and closes
+  pairs as before.
+- **Export HTML** cleans the text on its worker, not in the turn that starts
+  it (0.14 to 0.25 s for a page of 7 MB).
+- **Tab reaches the toolbar.** From the page it went to Maximize, Dock, Close
+  and back; Outline, Reload, Edit, Export, zoom, View, Find and the outline
+  were reached with Shift+Tab only.
+- **A theme switch and F5 no longer show the page's top** for 0.2 to 0.56 s
+  before the place read: the view's picture is held until that place is
+  shown, as it is through a resize and a zoom.
+- **The first screen comes before the rest is prepared.** 60,000 small code
+  blocks were one part (90 s of an empty window); so were 500,000 lines of a
+  link each (40 s), one line of 400,000 character references (18 s) and one
+  of 4 MB dense with emphasis (36 s, 1.4 GB). Each is cut in parts now, the
+  first shown in about a second. Qt's own parser made every pass over the
+  whole text, and coloured all of its code, before it showed anything (1 MB
+  of sections with code 9 s, 7 MB 54 s): it shows the text's first part
+  while the whole page is made, which then takes its place - the reader
+  where they were. Find, meanwhile, goes on in the whole page when it comes
+  (a word past the first part was "not found").
+- **A file written to without a pause** is shown anew every two seconds; it
+  showed nothing new until its writer stopped.
+- **A release waits for the freeze tests.** A turn - the GUI thread's own
+  CPU time in one event-loop turn - does not depend on what else the machine
+  does. Every heartbeat a test stops is now judged after the test: a turn
+  over 0.25 s (times the machine's slowness) fails it in every job. The CI's
+  new job `turns` runs the tests that pass or fail by elapsed time for this
+  alone and blocks a release; their wall-clock budgets stay in the job that
+  blocks nothing. The freeze sweep holds the texts above, in both parsers,
+  and a resize, a theme switch and a missing anchor for every case.
+- **A list nested deeper than it is shown** (Qt's own parser): its innermost
+  items, 2,900 of them for a text of 8 MB of indentation, were one part of
+  the page - one turn of 0.2 s at open, at a theme switch and at each
+  export. A part may begin with an item of its own now.
+- **A `$` amount before a code span** that begins with `$` was read as a
+  formula: ``pay $5 or `$HOME` and $PATH`` showed ``pay 5 or `HOME` and
+  $PATH``. A code span wins over a formula now, and a formula never ends
+  past the link text it is in.
+- **Right-to-left text** (markdown-it's page): each paragraph, heading, list
+  item, quote and table takes its direction from its own text. Arabic and
+  Hebrew stand at the right, with bullets, numbers and a quote's bar on the
+  right and a table mirrored; an English paragraph and code stay
+  left-to-right. Export HTML says the same directions.
+- **Links are underlined** in every theme, in the window and in Export HTML:
+  they were told from the text by their colour alone (Solar Dark's link is
+  as light as its text). A footnote's raised number has no line.
+- **Themes:** a link, struck text and a formula inside a `<mark>` reach AA
+  (AAA in the High Contrast themes) in all twelve (a link was 3.60:1 in
+  Dark, 3.81 in Retro); a formula in a table's header does too (Arctic 4.41,
+  Retro 4.23 - their formula colour is a shade lighter). The contrast check
+  measures the rendered page, fragment by fragment. Light chosen while
+  "Automatic" showed Light kept Qt's own selection colours (3.69:1). A
+  themed page's scroll bars are in its theme (a dark page had a white
+  handle), and in axross-markdown the toolbar, the find field and the
+  outline follow the page's theme.
+- **Find** matches across Unicode's normal forms ("café" typed finds it
+  written with a combining accent) and ignores soft hyphens and zero-width
+  characters; the selection and the marks cover the page's own characters.
+- **GFM:** `ftp://…` is linked; a struck link is struck; an empty list item
+  is drawn (`1.` `2.` `3.` showed 1, 2); raw `<ol start="3">` starts at 3; a
+  link in a `<summary>` is a link again.
+- **Names for a screen reader:** the buttons "←", "→", "−", "+" and the find
+  field have them; an image's alt text is its tooltip.
+- **Links:** the question about a link out of the document's folder names
+  where a symbolic link really leads; a `mailto:` link passes on its address
+  and subject only (no `attach=`, `bcc=`, `cc=`, `body=`). `--html -`
+  embeds no image of the current folder for a text from a pipe.
+
+### Qt's own parser (axross's built-in viewer; the window without markdown-it)
+
+- **The text of a raw `<table>` cell before a code block** is shown again
+  (in a "Before / After" table "Old way:" was missing), and a raw table
+  never closed no longer shows an empty page. A cell ends where the next one
+  begins; Markdown after an empty line in a cell is read as Markdown.
+- **A heading that starts with code, emphasis or a link** is a heading (it
+  was body text); the fifth and sixth levels are as big as in markdown-it's
+  page.
+- A table right under a paragraph is a table; `<br>` in a cell is a line
+  break in that cell, not a new row; header cells follow `:-:` and `--:`.
+- A link whose title or destination is on another line keeps its address;
+  character references in an address are read; a local image inside a link
+  is the link's.
+- A list item that starts with a code block or a quote is one item, not one
+  a block; a heading or a small table in a quote is drawn in the quote's
+  box.
+- `www.` links with trailing punctuation or parentheses are links; `> [!NOTE]`
+  without text shows no backslash; `a~b~c` is struck.
+- A right-to-left quote has its bar on the right; a right-to-left table
+  begins on the right.
+- Links are underlined in every theme.
+- Export HTML and print: a closed `<details>` is written open with its
+  content (it was left out); the exported page writes each style once
+  (4.2 MB to 1.1 MB for 3,000 sections).
+
+### The editor
+
+- **A long line pasted** (5,000,000 characters) held the window 1.5 to
+  1.8 s, and so did every key after it and the redo. A line of more than
+  200,000 characters is folded into one mark that says how long it is:
+  saved, copied, cut, undone and previewed whole, not searched; *Show
+  Anyway* shows it as before. No turn over 0.04 s.
+- **Big pastes, their undo and redo** go in a slice a turn: 20 MB pasted was
+  one turn of 4 s (undo 0.9 s, redo 1.5 s), now 0.06 s at most; Ctrl+Z still
+  takes the paste back as one step.
+- **Edit (F4)** reads the file off the window's thread and sets its text in
+  slices: 0.12 to 0.30 s from 1 MB on, now 0.04 s; the editor's Open… and
+  Reload too. Ctrl+S of 20 MB was a turn of 0.7 s, now 0.04 s.
+- **The preview follows every edit**, not the first only; a pause in the
+  typing makes it once, and its top is no longer painted before the place
+  typed at.
+- **Find Previous, Replace All and regular expressions** no longer run on
+  the window's thread (0.14 to 0.57 s at 5 MB). A regular expression that
+  backtracks without end - `(\w+\s?)+$X` on 210 bytes froze the window for
+  good - is stopped after 3 s, and the find bar says so. Replace All is one
+  step to undo.
+- **Saving:** a file marked read-only is asked about before it is replaced,
+  and stays read-only; the new file and its folder are synced before
+  "Saved"; a link whose target holds `..` is saved through, and no temp
+  file is left behind when a save fails; a file deleted while it was edited
+  is asked about before it is made again.
+- **Keys and names:** Esc closes the find bar, Shift+Enter searches
+  backwards, Ctrl+0 resets the zoom, zoom reaches the preview; a file that
+  is not UTF-8 says it is shown as Latin-1; the Find fields, the text and a
+  tab's close button have names for a screen reader; the preview's hint no
+  longer names a pane axross-markdown does not have.
+
+### Settings and updates
+
+- **`"update_mode": "off"` wins whenever the settings file leaves a doubt.**
+  A commented-out line, a nested object's key, a second key, single quotes,
+  "Off", a file cut short, saved as UTF-16, unreadable or over 1 MiB read as
+  "auto" or "notify"; now the updater does nothing by itself until the file
+  is repaired, and writing another setting never writes a mode no one chose.
+  A file that cannot be read or is too large is left as it is.
+- A megabyte of escaped quotes took 3.6 s a read, twice at the window's
+  start; now 0.004 s, and an unchanged file is read once. A FIFO at the path
+  no longer blocks the start. Nothing is made beside a device that
+  settings.json links to; the temporary file has a random name and is made
+  anew; a link planted at a lock file is not followed.
+- "Install automatically" says so when an update fails (once a version). A
+  second window no longer installs the same release again over the copy of
+  the old program. After an install, Check for Updates says the new version
+  is installed and starts the next time. A whole answer has a deadline
+  (60 s; the program's file an hour, and at least 1 KiB a second); a
+  self-test whose child left its process group no longer holds the updater.
+  A failing program's escape sequences are not printed by `--update`.
+
+### axross-mdcat
+
+- **Muted text is no longer faint.** The address after a link, the front
+  matter, a note's number and an image's note were written in the theme's
+  muted colour and dimmed (SGR 2): 2.0 to 3.8:1 in all twelve themes. The
+  muted colour mutes; every text colour written reaches 4.5:1.
+- h4 to h6 are not underlined (a link is). `axross-mdcat - <&-` says that
+  standard input is closed (it was a traceback). `--help` and the errors
+  are in the locale's language. Unicode tag characters and interlinear
+  annotation marks are stripped (a flag's own tags stay).
+- 60,000 small code blocks took 108 s: the first 500 are coloured, the
+  others while 3 s last, the rest plain (said once). A line's emphasis marks
+  past 20,000 are text (4 MB of them held 1.5 GB).
+- **Errors in a line, not a traceback:** a file no one may read, standard
+  output closed, Ctrl+C while a text is drawn (exit 130), and
+  `axross-markdown --help > /dev/full` (it ended with status 120).
+- **A pipe given as a path** is read: `axross-mdcat <(printf '# hi\n')` and
+  `/dev/stdin` said "not a regular file". Up to the same 8 MiB.
+- **Colours as asked:** `--color always` beats `NO_COLOR`; `FORCE_COLOR=0`
+  forces none (it forced colour).
+- **100,000 footnotes** with a reference a line did not finish in two
+  minutes: every part of the text was given every note. A part holds the
+  notes it refers to now - four times the notes take four times as long.
+- In 256 colours inline code keeps its contrast on its own ground (3.7:1 in
+  Solar Light, 4.17 in Slate). A table's links are `[L1]`, `[L2]` - its
+  footnotes' numbers were `[1]` too. `-w 1` and a mistyped
+  `AXROSS_MDCAT_THEME` are said; `-w` in other digits than 0 to 9 is
+  refused; text that is not UTF-8 is said to be shown as Latin-1;
+  `--html -- -x.md` works.
+- `--check-update` asks GitHub also with `AXROSS_MARKDOWN_NO_UPDATE_CHECK=1`:
+  the variable stops the window's own checks only. The help says so now.
+
+### The release
+
+- **The README's install section** names this release's own wheel on GitHub:
+  PyPI may lag behind the releases.
+- The wheel is the same bytes for the same commit whatever the builder's
+  umask (`packaging/reproducible_wheel.py`; the workflow said it was, its
+  files' modes were the builder's). It carries the German texts the tool
+  has, not all of axross's catalogue (485 KB of its 841 KB), and no empty
+  catalogues. The About dialog is in German too.
+- The tests pass in one process against the installed wheel, as the CI
+  runs them: the windows earlier tests closed are deleted before each test
+  (Export PDF's turn was theirs, 0.6 to 2.3 s), and no test assumes
+  axross's folders.
+
+- **A language of its own:** View > Language (Automatic, English, Deutsch),
+  kept in axross-markdown's settings and spoken from the next start on;
+  `$LANGUAGE` counts. Qt's own translation is loaded with it - a file
+  dialog's words stayed English.
+- `scripts/sign_release.py` gives the key's passphrase to no `gh` child,
+  signs the release of the pinned repository only (`--repo` of another one
+  is refused unless a long option names it a test), and says a missing `gh`
+  or a missing terminal in a line. The release workflow checks the tag against the package's own version too,
+  attests only a tag's push, and no checkout keeps its credentials. The
+  package has classifiers. The README counts its test files right and says
+  what a pip install is told while PyPI lags.
+
+### Known limits
+
+- A raw HTML table is one part of the page: 150,000 rows show after half a
+  minute. A code block of 1,000,000 lines read to its end holds about
+  1.4 GB. An image's alt text is its tooltip, not yet what a screen reader
+  reads. The supply-chain gate covers two of the four lock files.
+
 ## 0.17.4 - 2026-11-23
 
 What the twenty-seventh review left open, and two tests that failed now

@@ -28,7 +28,9 @@ TICK_MS = 3600 * 1000
 
 class UpdateController(QObject):
     """The program's updates (one an application). ``said(kind, text)``: "available", "installed",
-    "current" or "error" - on the GUI thread."""
+    "current" or "error" - on the GUI thread. An install that fails is said in a notice also when it was
+    begun by itself ("auto"), once a version; Check for Updates… after an install says that the new version
+    is installed and starts the next time."""
 
     said = pyqtSignal(str, str)
     _from_worker = pyqtSignal(str, str, object)
@@ -55,6 +57,8 @@ class UpdateController(QObject):
         #: the version this session installed (it starts next time): no check finds it newer again - auto mode
         #: installed the same release every 24 hours
         self.installed: str | None = None
+        #: the versions whose install failed by itself ("auto") and was said so: once a version a session
+        self.failed: set[str] = set()
         self._installing = threading.Lock()
         self._from_worker.connect(self._arrived)
         self.scheduler = MU.Scheduler(self._background_check, start=self.start_thread)
@@ -137,7 +141,14 @@ class UpdateController(QObject):
         def check() -> None:
             result = MU.check(self.current, self.fetcher)
             MU.record_check(result)
-            self._from_worker.emit("available" if self._newer(result) else "current", result.text, result)
+            if self._newer(result):
+                kind = "available"
+            elif result.newer and self.installed is not None:
+                # (installed in this session, this program still the old one: it said "<old> is up to date")
+                kind = "installed"
+            else:
+                kind = "current"
+            self._from_worker.emit(kind, result.text, result)
 
         self._start(self._worker(check))
 
@@ -171,8 +182,15 @@ class UpdateController(QObject):
         if kind == "available":
             self.notified.add(version)
         self.said.emit(kind, text)
-        if kind in ("current", "error") and not asked:
-            return  # (a background check that found nothing new, or failed: the log has it)
+        if kind == "current" and not asked:
+            return  # (a background check that found nothing new)
+        if kind == "error" and not asked:
+            # (an install begun by itself - "auto" - that failed: it said nothing, the program stayed old for
+            # ever and no one knew; said once a version, not at every day's try)
+            log.warning("The update was not installed: %s", text)
+            if result is None or version in self.failed:  # (no release in hand: a check that failed - the log's)
+                return
+            self.failed.add(version)
         self.notice(kind, text, self.parent_window)
         self.parent_window = None
 
@@ -214,9 +232,12 @@ class UpdateController(QObject):
         if kind == "current":
             return tr("axross-markdown {current} is up to date.").format(current=self.current)
         if kind == "installed" and result is not None:
-            return tr("axross-markdown {new} is installed and checked – it starts the next time.").format(
+            said = tr("axross-markdown {new} is installed and checked – it starts the next time.").format(
                 new=result.release.version)
-        return tr("The update was not installed: {why}").format(why=text)
+            if result.release.version != self.current:
+                said += "\n\n" + tr("This window still runs {current}.").format(current=self.current)
+            return said
+        return tr("The update was not installed: {why}").format(why=MU.printable(text))
 
     def fill_help_menu(self, menu) -> None:
         """Help: Check for Updates…, and Updates (Off / Tell me / Install automatically, the one set

@@ -7,6 +7,7 @@ from __future__ import annotations
 import logging
 import re
 import threading
+import time
 
 from PyQt6.QtCore import QRect, QSize, Qt, QTimer
 from PyQt6.QtGui import (
@@ -33,6 +34,9 @@ MAX_HIGHLIGHT_CHARS = 2_000_000
 #: most SYNC_WAIT_SECONDS; a larger text is coloured when its tokens come.
 SYNC_LEX_CHARS = 20_000
 SYNC_WAIT_SECONDS = 1.0
+#: The GUI thread's time one turn of painting a lexed text's colours may
+#: take: all the lines of 1 MB painted in one go held the window 0.2 s.
+PAINT_SECONDS = 0.012
 _SHEBANGS = {"bash": "Bash", "sh": "Bash", "zsh": "Bash", "python": "Python", "python3": "Python",
              "perl": "Perl", "ruby": "Ruby", "node": "JavaScript", "php": "PHP", "lua": "Lua"}
 
@@ -173,6 +177,23 @@ def _ranges_of(
     return ranges
 
 
+_BLOCK_END = re.compile("\u2029")
+
+
+def _block_starts(raw: str) -> list[int]:
+    """The QTextCursor position each block begins at, from the document's
+    text as its blocks hold it (QTextDocument.toRawText(): U+2029 between
+    two blocks). Pure - runs on a worker thread."""
+    starts = [0]
+    starts.extend(match.end() for match in _BLOCK_END.finditer(raw))
+    astral = [m.start() for m in _ASTRAL.finditer(raw)]
+    if astral:
+        import bisect
+
+        starts = [start + bisect.bisect_left(astral, start) for start in starts]
+    return starts
+
+
 def _changed_blocks(old: dict, new: dict, origin: list[int]) -> list[int]:
     """Numbers of the blocks whose paint under *new* differs from the paint
     they show. ``origin[n]`` is the number block n had when *old* was
@@ -228,6 +249,12 @@ class PygmentsHighlighter(QSyntaxHighlighter):
         # signal of the highlighter: closing the editor tab deletes the
         # highlighter, maybe while the thread reports (core/thread_relay.py).
         self._lexed = GuiCall(self._apply)
+        #: The next block whose colours are still to be painted (_paint_on).
+        self._to_paint = None
+        self._painter = QTimer(self)
+        self._painter.setSingleShot(True)
+        self._painter.setInterval(0)
+        self._painter.timeout.connect(self._paint_on)
         document.contentsChange.connect(self._changed)
 
     def detach(self) -> None:
@@ -245,8 +272,9 @@ class PygmentsHighlighter(QSyntaxHighlighter):
 
     @property
     def lexing(self) -> bool:
-        """A worker is lexing a text whose result is still awaited."""
-        return self.applied_generation != self.generation
+        """A worker is lexing a text whose result is still awaited - or its
+        colours are still being painted (_paint_all)."""
+        return self.applied_generation != self.generation or self._to_paint is not None
 
     def set_dark(self, dark: bool) -> None:
         from pygments.styles import get_style_by_name
@@ -278,8 +306,61 @@ class PygmentsHighlighter(QSyntaxHighlighter):
             self._formats[ttype] = fmt
         return fmt
 
+    def forget(self) -> None:
+        """Another text is about to go in: what was lexed is none of its."""
+        self._stop_painting()
+        self._ranges = {}
+        self._origin = []
+
+    def edited_in_bulk(self) -> None:
+        """Many edits went in while ``loading`` was set (a text loaded or
+        pasted in slices, ui.editor_text): lexed once now, every line's
+        paint unknown."""
+        self._stop_painting()
+        self._origin = [-1] * self._doc.blockCount()
+        self.relex(wait=False)
+
+    def _stop_painting(self) -> bool:
+        """The lines not painted yet stay as they are (their paint unknown)."""
+        if self._to_paint is None:
+            return False
+        self._to_paint = None
+        self._painter.stop()
+        self._origin = [-1] * len(self._origin)
+        return True
+
+    def _paint_all(self) -> None:
+        """Every line painted with the ranges, a part of them a turn of the
+        event loop (rehighlight() paints them all in one)."""
+        self._to_paint = self._doc.begin()
+        self._paint_on()
+
+    def _paint_on(self) -> None:
+        block = self._to_paint
+        if block is None or self.document() is None:
+            self._to_paint = None
+            return
+        began = time.thread_time()
+        while block.isValid() and time.thread_time() - began < PAINT_SECONDS:
+            for _line in range(16):  # (the clock read once for a few lines)
+                self.rehighlightBlock(block)
+                block = block.next()
+                if not block.isValid():
+                    break
+        if block.isValid():
+            self._to_paint = block
+            self._painter.start()
+        else:
+            self._to_paint = None
+
+    @property
+    def painting(self) -> bool:
+        """Colours of a lexed text are still being painted (_paint_all)."""
+        return self._to_paint is not None
+
     def _changed(self, position: int, removed: int, added: int) -> None:
         self._edits += 1
+        self._stop_painting()  # (its blocks are others now: painted when this text is lexed)
         if self.loading:
             return  # CodeEditor.setPlainText lexes once it is in
         self._follow_edit(position, added)
@@ -316,6 +397,7 @@ class PygmentsHighlighter(QSyntaxHighlighter):
         changed - at once for a small text (*wait*: the GUI waits for it up
         to SYNC_WAIT_SECONDS), else when the child's tokens come."""
         self._timer.stop()
+        self._stop_painting()  # (what is not painted yet is painted with this lexing's ranges)
         self.generation += 1
         generation = self.generation
         document = self._doc
@@ -330,14 +412,19 @@ class PygmentsHighlighter(QSyntaxHighlighter):
             self.applied_generation = generation
             return
         text = document.toPlainText()
+        if not text:
+            # (nothing to lex: an editor's language is set before its text - the window
+            # waited for the child's answer about an empty text, its start included)
+            self._ranges = {}
+            self._origin = list(range(document.blockCount()))
+            self.applied_generation = generation
+            return
         old, origin, edits = self._ranges, list(self._origin), self._edits
         if len(origin) != document.blockCount():  # an edit went unseen: paint all
             origin = [-1] * document.blockCount()
-        starts = []
-        block = document.begin()
-        while block.isValid():
-            starts.append(block.position())
-            block = block.next()
+        # (where each block begins is read from the text as its blocks hold it, on the worker:
+        # asked of each of 100,000 blocks here it was 0.06 s of the turn)
+        raw = document.toRawText()
         style = self._style_name
 
         def result(ranges):
@@ -360,6 +447,7 @@ class PygmentsHighlighter(QSyntaxHighlighter):
             from axross_markdown._ax.core import lex_worker
 
             try:
+                starts = _block_starts(raw)
                 tokens = lex_worker.lex(language, text, style, cancel=stale)
                 ranges = _ranges_of(tokens, text, starts, stale)
             except (_Stale, lex_worker.LexCancelled):
@@ -396,6 +484,7 @@ class PygmentsHighlighter(QSyntaxHighlighter):
             return  # a newer text is being lexed
         self.applied_generation = generation
         ranges, changed, edits = result
+        self._stop_painting()
         self._ranges = ranges
         document = self._doc
         if self.document() is None:
@@ -404,7 +493,9 @@ class PygmentsHighlighter(QSyntaxHighlighter):
             self.setDocument(document)
             self.rehighlight()  # also drops Qt's own delayed pass
         elif edits != self._edits or len(changed) > document.blockCount() // 2:
-            self.rehighlight()
+            self._origin = list(range(document.blockCount()))
+            self._paint_all()
+            return
         else:
             for number in changed:
                 block = document.findBlockByNumber(number)
@@ -435,6 +526,7 @@ class CodeEditor(QPlainTextEdit):
         font = QFont("Monospace", 10)
         font.setStyleHint(QFont.StyleHint.Monospace)
         self.setFont(font)
+        self._base_size = font.pointSizeF()
         self.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         self.setTabStopDistance(self.fontMetrics().horizontalAdvance(" ") * 4)
         self.language = TEXT_ONLY
@@ -494,8 +586,9 @@ class CodeEditor(QPlainTextEdit):
         highlighter.relex()
 
     def zoom(self, steps: int) -> None:
+        """The text *steps* points bigger (smaller: negative); 0: the size it began with."""
         font = self.font()
-        font.setPointSizeF(max(6.0, font.pointSizeF() + steps))
+        font.setPointSizeF(max(6.0, font.pointSizeF() + steps) if steps else self._base_size)
         self.setFont(font)
         self.setTabStopDistance(self.fontMetrics().horizontalAdvance(" ") * 4)
         self._update_margin()

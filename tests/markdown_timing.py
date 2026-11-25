@@ -16,6 +16,14 @@ A test passes or fails by its content, by elapsed time, or by both:
   its assertions block (tests/test_markdown_timing_marks.py checks that every assertion of a TIMING test
   is a duration's, and the names).
 
+One duration blocks a release all the same: a **turn** - the GUI thread's own CPU time in one event-loop turn
+(tests/markdown_heartbeat.py). What else the machine does cannot lengthen it; only a slower machine can, and
+that is measured (machine_factor). Every heartbeat a test stops is looked at after the test (gate_turns): a
+turn over TURN_GATE (0.25 s on the calibration machine) fails the test in every job - the window was frozen
+by its own work. The CI's job ``turns`` runs the timing tests for this alone (``AXROSS_TIMING_BUDGETS=gate``
+with ``-m timing``: their wall-clock assertions are warnings there, a turn over the gate fails) and blocks a
+release, as the blocking job does for every other test's heartbeats.
+
 Locally nothing changes: ``python -m pytest tests`` runs everything at full strictness, the bar for every
 change.
 
@@ -45,7 +53,10 @@ READY_SECONDS = 120
 #: The environment variable that makes every budget a warning (``warn``) - as ``-m "not timing"`` does.
 ENV = "AXROSS_TIMING_BUDGETS"
 #: Whether a budget missed is a warning (the blocking job: -m "not timing") - else it fails.
-SOFT = os.environ.get(ENV, "").strip().lower() == "warn"
+SOFT = os.environ.get(ENV, "").strip().lower() in ("warn", "gate")
+#: The gating run of the tests that pass or fail by elapsed time only (``gate``): their durations are warnings
+#: (as every budget's) - what fails is a turn of the GUI thread over tests/markdown_heartbeat.py's TURN_GATE.
+GATE = os.environ.get(ENV, "").strip().lower() == "gate"
 #: The budgets missed in this run under SOFT (their messages).
 MISSED: list[str] = []
 
@@ -88,8 +99,11 @@ def until_within(wait, condition, seconds: float, *rest) -> bool:
 def configure(config) -> None:
     """(the conftests' pytest_configure) the markers; SOFT under ``-m "not timing"`` (the blocking job)."""
     global SOFT
+    from tests.markdown_heartbeat import LONG_TURN_HELP
+
     config.addinivalue_line("markers", MARKER_HELP)
     config.addinivalue_line("markers", BUDGETS_HELP)
+    config.addinivalue_line("markers", LONG_TURN_HELP)
     expression = " ".join(str(getattr(config.option, "markexpr", "") or "").split())
     if expression == f"not {MARKER}":
         SOFT = True
@@ -98,6 +112,11 @@ def configure(config) -> None:
 TIMING = frozenset({
     "test_markdown_emoji_font_scan_budget::test_sad_opening_a_markdown_file_does_not_hold_the_window_with_slow_fonts",
     "test_markdown_freeze_sweep::test_sad_no_text_of_the_sweep_freezes_the_window",
+    "test_markdown_full_bugs29::test_guard_100_000_arabic_paragraphs_hold_no_turn",
+    "test_markdown_full_bugs29::test_guard_100_000_lines_of_amounts_and_code_hold_no_turn",
+    "test_markdown_full_bugs29::test_guard_200_000_underlined_links_hold_no_turn",
+    "test_markdown_full_bugs29::test_guard_code_before_math_is_found_in_linear_time",
+    "test_markdown_full_bugs29::test_guard_directions_are_found_in_one_pass",
     "test_markdown_freeze_sweep::test_sad_the_heartbeat_sees_a_worker_holding_the_lock_not_the_gui_s_own_work",
     "test_markdown_reader_bugs13::test_guard_no_formula_takes_long_to_lay_out",
     "test_markdown_reader_bugs14::test_sad_thousands_of_spans_in_a_line_never_hold_up_the_window",
@@ -138,13 +157,26 @@ TIMING = frozenset({
 #: helper that budgets (the marker budgets: run strictly by the timing job, a duration a warning in the
 #: blocking one).
 BUDGETS = frozenset({
+    "test_markdown_editor_bugs29::test_happy_a_file_opened_in_the_background_is_coloured_and_reloads_in_slices",
+    "test_markdown_editor_bugs29::test_sad_a_big_paste_its_undo_and_redo_go_in_slices",
+    "test_markdown_editor_bugs29::test_sad_a_long_line_pasted_holds_no_turn_nor_does_the_key_after_it",
+    "test_markdown_editor_bugs29::test_sad_a_save_and_a_search_of_a_big_text_read_it_in_slices",
+    "test_markdown_editor_bugs29::test_sad_a_regular_expression_that_backtracks_without_end_is_stopped_and_said",
+    "test_markdown_editor_bugs29::test_sad_f4_reads_the_file_off_the_window_s_thread_and_sets_its_text_in_slices",
+    "test_markdown_editor_bugs29::test_sad_find_previous_and_replace_all_in_5_mb_hold_no_turn",
     "test_markdown_emoji_font_scan_budget::test_sad_hundreds_of_fonts_without_emoji_do_not_hold_the_window",
+    "test_markdown_freeze_sweep::test_sad_no_text_of_the_sweep_holds_a_turn",
     "test_markdown_full::test_edge_a_word_of_a_megabyte_is_cut_in_linear_time",
     "test_markdown_full::test_edge_the_columns_of_a_huge_table_are_fitted_in_time",
     "test_markdown_full::test_sad_autolinks_of_hostile_lines_stay_linear",
+    "test_markdown_full_bugs29::test_guard_find_on_5_mb_written_with_combining_accents_holds_no_turn",
+    "test_markdown_full_bugs29::test_guard_the_window_s_theme_on_a_big_page_holds_no_turn",
     "test_markdown_image_safety::test_safety_a_slow_svg_is_stopped_by_the_documents_time",
     "test_markdown_image_safety::test_safety_a_use_bomb_as_a_data_image_is_refused",
     "test_markdown_image_safety::test_safety_a_use_bomb_is_refused_at_once",
+    "test_markdown_md4c_bugs29::test_sad_the_new_passes_hold_no_turn_on_a_big_page",
+    "test_markdown_md4c_bugs29::test_sad_the_raw_table_passes_stay_linear",
+    "test_markdown_md4c_bugs29::test_sad_the_text_passes_stay_linear",
     "test_markdown_preview_off_gui_thread::test_sad_a_long_table_does_not_freeze_the_window",
     "test_markdown_preview_off_gui_thread::test_sad_crafted_emphasis_does_not_freeze_the_window",
     "test_markdown_reader_bugs10::test_sad_a_drop_at_95_percent_shows_its_place_at_once",
@@ -243,12 +275,22 @@ BUDGETS = frozenset({
     "test_markdown_reader_bugs26::test_sad_openers_never_closed_are_read_in_one_pass",
     "test_markdown_reader_bugs28::test_sad_a_resize_that_keeps_the_text_s_width_lays_nothing_out_again",
     "test_markdown_reader_bugs28::test_sad_the_comment_rules_stay_linear",
+    "test_markdown_reader_bugs29::test_sad_a_long_paragraph_in_an_html_block_is_laid_out_in_parts",
+    "test_markdown_reader_bugs29::test_sad_a_page_of_150_000_headings_shown_again_holds_no_turn",
+    "test_markdown_reader_bugs29::test_sad_a_page_of_many_images_holds_no_turn",
+    "test_markdown_reader_bugs29::test_sad_a_raw_html_table_holds_no_turn_as_it_is_opened",
+    "test_markdown_reader_bugs29::test_sad_markdown_it_s_page_shows_the_first_of_60_000_code_blocks_at_once",
+    "test_markdown_reader_bugs29::test_sad_an_emphasis_run_around_one_letter_holds_no_turn",
+    "test_markdown_settings_bugs29::test_sad_a_megabyte_of_escaped_quotes_is_read_at_once",
     "test_markdown_reader_bugs5::test_sad_the_terminal_shows_the_start_of_a_long_list_at_once",
     "test_markdown_reader_bugs6::test_sad_markdown_its_page_shows_the_start_of_a_long_file_at_once",
     "test_markdown_reader_bugs7::test_sad_a_long_run_of_spaces_takes_qts_own_parser_no_time",
     "test_markdown_reader_bugs8::test_sad_a_paragraph_of_many_dropped_tags_takes_no_time",
     "test_markdown_reader_bugs9::test_sad_an_idle_page_is_not_laid_out_again_and_again",
     "test_markdown_reader_features::test_sad_hostile_math_is_bounded_and_escaped",
+    "test_markdown_term_bugs29::test_sad_a_line_of_emphasis_marks_past_the_bound_is_text",
+    "test_markdown_term_bugs29::test_sad_many_small_code_blocks_are_shown_in_seconds",
+    "test_markdown_term_bugs29::test_sad_notes_by_the_ten_thousand_are_read_in_linear_time",
     "test_markdown_themes::test_sad_rapid_switching_is_rate_limited_to_one_change_a_moment",
     "test_markdown_themes::test_sad_switching_the_theme_of_a_big_page_keeps_the_window_answering",
     "test_markdown_update::test_sad_a_check_and_an_update_never_run_on_the_gui_thread",

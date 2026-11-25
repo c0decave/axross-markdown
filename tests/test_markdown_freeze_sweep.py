@@ -13,7 +13,8 @@ a shape the stress tests before had not tried. Here the shapes are generated, no
 - **sizes:** 2 KB, 30 KB, 200 KB and 2 MB;
 - **both parsers** (markdown-it's page and Qt's own), each text through what the window does with it:
   open (and Ctrl+End, Ctrl+Home), the editor's preview (three pauses in the typing), Export PDF and
-  Export HTML, Find (typed, then Enter twice) and a zoom followed by a scroll to the end.
+  Export HTML, Find (typed, then Enter twice), a zoom followed by a scroll to the end, a resize that
+  changes the text's width, a theme chosen and a link to an anchor the page does not have.
 
 Two things are measured for each: the GUI thread's longest heartbeat gap (tests/markdown_heartbeat.py:
 what the user sees - the GUI thread's own wait for a CPU another job on the machine had left out) and the
@@ -21,8 +22,15 @@ longest time a worker held Python's lock as the GUI thread waited for it (HB.Hea
 on a CPU nor waiting for one). Over GAP (0.15 s on the machine the budgets were measured on), the case is
 measured again and fails if it still is.
 
+A third number gates a release: the GUI thread's longest **turn** - its own CPU time in one event-loop
+turn. What else the machine does cannot lengthen it, so it is judged in the blocking job too
+(test_sad_no_text_of_the_sweep_holds_a_turn: over HB.TURN_GATE it fails wherever it runs; over HB.TURN it
+misses a budget). The gap and the hold stay a job of their own that blocks nothing: a shared runner's
+other work lengthens them.
+
 The run here takes a deterministic, representative subset (SUBSET: a fixed sample of the space plus the
-review's own shapes) - quick enough for CI. ``AXROSS_FREEZE_SWEEP=full`` runs all of the space
+review's own shapes) - quick enough for CI. ``AXROSS_FREEZE_SWEEP=turns`` runs the texts of TURNS alone, each
+in both parsers; ``AXROSS_FREEZE_SWEEP=full`` runs all of the space
 (``AXROSS_FREEZE_SWEEP_SHARD=i/n`` a share of it; ``AXROSS_FREEZE_SWEEP_REPORT`` names a file for each
 case's numbers, JSON lines); it takes hours.
 """
@@ -119,7 +127,7 @@ SHAPES = {
 MODES = ("one run", "runs of one", "runs of 999", "lines")
 SIZES = (2_000, 30_000, 200_000, 2_000_000)
 PARSERS = ("markdown-it", "md4c")
-ACTIONS = ("open", "preview", "pdf", "html", "find", "zoom")
+ACTIONS = ("open", "preview", "pdf", "html", "find", "zoom", "resize", "theme", "anchor")
 
 
 def document(unit: str, shape: str, mode: str, size: int) -> str:
@@ -183,6 +191,40 @@ REVIEW = {
     "R2 a block tag's line of 2 MB": "<div>\n" + "* " * 1000000,
     "R1 an HTML block of 2 MB": "<p>\n" + ("plain words here and there " * 4 + "\n") * 18000,
 }
+
+
+def _nested_list(size: int, mark: str = "- ", step: int = 2) -> str:
+    """A list each of whose items is one level deeper than the one before, about *size* characters."""
+    rows, total, depth = [], 0, 0
+    while total < size:
+        rows.append(" " * (step * depth) + mark + "x")
+        total += len(rows[-1]) + 1
+        depth += 1
+    return "\n".join(rows) + "\n"
+
+
+#: Texts that held one turn of the GUI thread for 0.1 to 0.9 s in 0.17.4 though no case above did: a raw
+#: HTML table, images by the ten thousand, an emphasis run around one letter, reference links, lists nested
+#: thousands deep, a code block of 700,000 lines, a big page exported. Each in both parsers.
+TURNS = {
+    "a raw HTML table of 50,000 rows": "<table>\n" + "<tr><td>a</td><td><a href='x'>b</a></td></tr>\n" * 50000
+                                       + "</table>\n",
+    "20,000 images, ten a paragraph": "".join(f"![alt{i}](img/p{i}.png)\n" + ("\n" if i % 10 == 9 else "")
+                                              for i in range(20000)),
+    "one image named 20,000 times": "".join("![alt](img/p.png)\n" + ("\n" if i % 10 == 9 else "")
+                                            for i in range(20000)),
+    "an emphasis run of * around a letter": "*" * 30000 + "a" + "*" * 30000 + "\n",
+    "an emphasis run of _ around a letter": "_" * 30000 + "a" + "_" * 30000 + "\n",
+    "40,000 reference links": "".join(f"[r{i}]: http://example.com/{i}\n" for i in range(40000)) + "\n"
+                              + " ".join(f"[r{i}]" for i in range(40000)) + "\n",
+    "a list nested to 8 MB": _nested_list(8_300_000),
+    "an ordered list nested to 8 MB": _nested_list(8_300_000, "1. ", 3),
+    "a code block of 700,000 lines": "# Top\n\n```\n" + "".join(f"L{i}\n" for i in range(700000)) + "```\n",
+    "2 MB of words, emphasis and code spans": "word *em* `c` " * 150000 + "\n",
+    "150,000 raw line breaks": "a<br>\n" * 150000,
+    "invalid bytes read as text": ("caf\ufffd \ufffd\ufffd word\n" * 20 + "\n") * 9000,
+}
+REVIEW.update(TURNS)
 
 
 #: (subset) the shapes taken at each size: all of them at the small ones, a few drawn at the big ones.
@@ -300,6 +342,28 @@ def run_case(text: str, full: bool, folder: Path, actions=ACTIONS) -> dict:
             pump(0.05)
             until(lambda: not viewer.view._scheduled, 300)
             out["zoom"] = measure.stop()
+        if "resize" in actions:  # (narrower: the text's width changes, the page is laid out for it)
+            measure = _Measure()
+            viewer.resize(820, 700)
+            pump(0.05)
+            until(lambda: viewer.view._readable and not viewer.view._scheduled, 300)
+            out["resize"] = measure.stop()
+        if "theme" in actions:  # (another theme chosen: the page made in its colours)
+            from axross_markdown._ax.ui import markdown_theme_ui
+
+            measure = _Measure()
+            generation = viewer.view._page_generation
+            markdown_theme_ui.hub().choose("dark", keep=False)
+            until(lambda: viewer.view._page_generation > generation, 5)
+            until(lambda: viewer.view._readable and not viewer.view._scheduled, 300)
+            pump(0.05)
+            out["theme"] = measure.stop()
+        if "anchor" in actions:  # (a link to a heading the page does not have)
+            measure = _Measure()
+            viewer.view.go_to_anchor("no-such-heading-here")
+            pump(0.05)
+            until(lambda: not viewer.view._scheduled, 300)
+            out["anchor"] = measure.stop()
         for action, export in (("pdf", viewer.export_pdf), ("html", viewer.export_html)):
             if action not in actions:  # (a big text's export cancelled after EXPORT_SECONDS: its parts are alike)
                 continue
@@ -332,6 +396,10 @@ def run_case(text: str, full: bool, folder: Path, actions=ACTIONS) -> dict:
             out["preview"] = measure.stop()
     finally:
         markdown_doc.available = available
+        if "theme" in actions:
+            from axross_markdown._ax.ui import markdown_theme_ui
+
+            markdown_theme_ui.hub().choose("auto", keep=False)
         for widget in (viewer, preview):
             if widget is not None:
                 widget.close()
@@ -342,6 +410,11 @@ def run_case(text: str, full: bool, folder: Path, actions=ACTIONS) -> dict:
 
 #: The pauses in the typing of the preview (one for a text of a megabyte or more: each is the same text again).
 PREVIEW_PAUSES = 3
+
+
+def longest_turn(measured: dict) -> tuple[float, str]:
+    """(the longest turn of a case - the GUI thread's own CPU time in one event-loop turn -, where)."""
+    return max(((numbers["turn"], action) for action, numbers in measured.items()), default=(0.0, ""))
 
 
 def worst(measured: dict) -> tuple[float, str]:
@@ -402,6 +475,7 @@ def test_happy_the_space_holds_every_unit_shape_mode_size_and_parser():
     assert set(class_units()) <= set(units())
 
 
+@pytest.mark.long_turn  # (the GUI thread kept busy on purpose: what the meter must tell apart)
 def test_sad_the_heartbeat_sees_a_worker_holding_the_lock_not_the_gui_s_own_work():
     """HB.Heartbeat.blocked: a worker in one long search of a regular expression is a hold (the GUI thread
     asleep on the lock); the GUI thread's own long turn is not (the heartbeat's turn shows that)."""
@@ -425,6 +499,8 @@ def test_sad_the_heartbeat_sees_a_worker_holding_the_lock_not_the_gui_s_own_work
 
 
 def _cases(full_sweep: bool) -> list:
+    if os.environ.get("AXROSS_FREEZE_SWEEP", "") == "turns":  # (TURNS alone, each text in both parsers)
+        return [(name, None, None, len(TURNS[name]), parser) for name in TURNS for parser in PARSERS]
     if not full_sweep:
         return subset()
     cases = list(space())
@@ -437,6 +513,31 @@ def _cases(full_sweep: bool) -> list:
 
 
 FULL = os.environ.get("AXROSS_FREEZE_SWEEP", "") == "full"
+#: Each case's numbers, measured once for both tests below (the timing job and a local run do both).
+_MEASURED: dict = {}
+
+
+def _measured(case, folder: Path) -> dict:
+    name = _case_name(case)
+    if name not in _MEASURED:
+        _MEASURED.clear()  # (one case's at a time: the other test of the same case comes right after it)
+        _MEASURED[name] = judged(case, folder)
+        report = os.environ.get("AXROSS_FREEZE_SWEEP_REPORT")
+        if report:
+            with open(report, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"case": name, "measured": _MEASURED[name]}) + "\n")
+    return _MEASURED[name]
+
+
+@pytest.mark.parametrize("case", _cases(FULL), ids=_case_name)
+def test_sad_no_text_of_the_sweep_holds_a_turn(case, tmp_path):
+    """Before (0.17.4): a raw HTML table held one turn 0.17 to 0.58 s as it was opened, a page of images
+    0.36 s at every zoom and resize, an emphasis run in Qt's own parser 0.75 to 0.9 s - and no release
+    waited for this sweep: it ran in the job that blocks nothing. A turn is the GUI thread's own CPU time,
+    whatever else the machine does: over HB.TURN_GATE this fails in the blocking job as well."""
+    measured = _measured(case, tmp_path)
+    longest, where = longest_turn(measured)
+    HB.assert_turn(longest, (_case_name(case), where, measured.get(where)))
 
 
 @pytest.mark.parametrize("case", _cases(FULL), ids=_case_name)
@@ -444,11 +545,7 @@ def test_sad_no_text_of_the_sweep_freezes_the_window(case, tmp_path):
     """Before (0.16.10): a heading of spaced words 0.3 to 18 s (H1), fences never closed 1.6 to 64 s (H2),
     paragraphs after a space, of "#" or of "+++" 0.12 to 1.7 s (H3), Export HTML with Qt's own parser up
     to 2.2 s under load (M5). Now no gap and no hold of Python's lock over GAP (0.15 s here)."""
-    measured = judged(case, tmp_path)
-    report = os.environ.get("AXROSS_FREEZE_SWEEP_REPORT")
-    if report:
-        with open(report, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps({"case": _case_name(case), "measured": measured}) + "\n")
+    measured = _measured(case, tmp_path)
     longest, where = worst(measured)
     budget = HB.gap_budget()
     TB.budget(longest < budget, (_case_name(case), where, measured[where], f"at most {budget:.3f} s"))

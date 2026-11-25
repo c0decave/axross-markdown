@@ -61,6 +61,7 @@ keeps those checks off whatever the setting says. ``--check-update`` and
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import http.client
 import json
@@ -119,7 +120,18 @@ MAX_SUMS_LINES = 500
 MAX_NOTES_CHARS = 20_000
 API_TIMEOUT = 15.0
 READ_TIMEOUT = 60.0
+#: The longest a whole answer may take, however steadily its bytes come (READ_TIMEOUT is one read's: a
+#: server sending a byte a second never ran into it, and held the worker for as long as it liked): the API's
+#: answer, SHA256SUMS and its signature - and the program's file, which also has to come at
+#: MIN_BYTES_A_SECOND at least once STALL_SECONDS have passed.
+API_SECONDS = 60.0
+DOWNLOAD_SECONDS = 3600.0
+STALL_SECONDS = 60.0
+MIN_BYTES_A_SECOND = 1024
 SELF_TEST_SECONDS = 30.0
+#: How long the self-test's pipes are waited for once its process group was ended: a child that left the
+#: group holds them open as long as it lives - the updater waited for that child.
+GROUP_END_SECONDS = 5.0
 #: How long the new program runs before the old one (.previous) goes.
 KEEP_PREVIOUS_SECONDS = 60
 _CHUNK = 1 << 16
@@ -187,6 +199,29 @@ class NotWritable(UpdateError):
 
 class Cancelled(UpdateError):
     pass
+
+
+class AlreadyInstalled(UpdateError):
+    """The program in place is the release's file already (another window installed it): not installed
+    again - the copy of the old program (.previous) would be one of the new."""
+
+
+#: (printable) a terminal's escape sequences: CSI, OSC (to its BEL or ST), any other ESC pair.
+_ESCAPES = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b[@-_]?")
+#: (printable) control characters but the newline and the tab, and the characters no one sees: bidi
+#: controls, zero-width ones, the line and paragraph separators, annotation marks, tag characters.
+_UNSEEN = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff"
+                     "\ufff9-\ufffb\U000e0000-\U000e007f]")
+
+
+def printable(text: str) -> str:
+    """*text* of another program (a self-test's standard error) as it may be printed or shown: no escape
+    sequence (it moved the cursor, set the terminal's title, coloured what followed), no control character."""
+    return _UNSEEN.sub("", _ESCAPES.sub("", text))
+
+
+#: The clock the deadlines are read from (its own name: a test's).
+_clock = time.monotonic
 
 
 # -- versions -------------------------------------------------------------------------------------
@@ -423,7 +458,23 @@ class Web:
             size = int(length) if length is not None else None
         except ValueError:
             size = None
-        return Reply(response.status, "", size, response)
+        return Reply(response.status, "", size, _AsItComes(response))
+
+
+class _AsItComes:
+    """An answer's body read as it comes: read(n) gives what one read of the connection brought (read1) -
+    HTTPResponse.read(n) waits until all n bytes are there, so a server sending a byte a second held one
+    call for hours, and no deadline was looked at meanwhile."""
+
+    def __init__(self, response) -> None:
+        self.response = response
+
+    def read(self, size: int = -1) -> bytes:
+        some = getattr(self.response, "read1", None)
+        return self.response.read(size) if some is None or size is None or size < 0 else some(size)
+
+    def close(self) -> None:
+        self.response.close()
 
 
 def check_url(url: str) -> str:
@@ -446,11 +497,16 @@ def check_url(url: str) -> str:
     return url
 
 
-def fetch(url: str, fetcher, max_bytes: int, *, sink=None, progress=None, cancel=None) -> bytes | int:
+def fetch(url: str, fetcher, max_bytes: int, *, sink=None, progress=None, cancel=None,
+          seconds: float | None = None) -> bytes | int:
     """*url*'s body (or, with *sink*, the number of bytes written to it): redirects followed here, each
-    checked (check_url); more than *max_bytes*: TooLarge."""
+    checked (check_url); more than *max_bytes*: TooLarge; not all there within *seconds* (API_SECONDS; with
+    *sink* DOWNLOAD_SECONDS), or a file coming more slowly than MIN_BYTES_A_SECOND: an UpdateError."""
+    seconds = (API_SECONDS if sink is None else DOWNLOAD_SECONDS) if seconds is None else seconds
+    began = _clock()
     for _hop in range(MAX_REDIRECTS + 1):
         check_url(url)
+        _in_time(began, seconds, 0, False, url)
         try:
             reply = fetcher.get(url)
         except (OSError, http.client.HTTPException) as exc:  # (a fetcher's own: said as the network's)
@@ -470,7 +526,7 @@ def fetch(url: str, fetcher, max_bytes: int, *, sink=None, progress=None, cancel
                 raise TooLarge(f"{url.rsplit('/', 1)[-1][:80]} is {reply.length} bytes, more than "
                                f"{max_bytes} - refused")
             try:
-                return _read(reply, max_bytes, sink, progress, cancel, url)
+                return _read(reply, max_bytes, sink, progress, cancel, url, began, seconds)
             except (OSError, http.client.HTTPException) as exc:
                 # (a connection reset, a time-out in the body: the worker died with no word, the controller
                 # stuck "busy" for the session, --update a traceback - an UpdateError, as every other failure)
@@ -480,12 +536,27 @@ def fetch(url: str, fetcher, max_bytes: int, *, sink=None, progress=None, cancel
     raise UpdateError(f"more than {MAX_REDIRECTS} redirects - refused")
 
 
-def _read(reply: Reply, max_bytes: int, sink, progress, cancel, url: str):
+def _in_time(began: float, seconds: float, count: int, rated: bool, url: str) -> None:
+    """An UpdateError when the answer for *url*, begun at *began*, took more than *seconds* - or (*rated*:
+    the program's file) came more slowly than MIN_BYTES_A_SECOND for STALL_SECONDS and more."""
+    took = _clock() - began
+    name = url.rsplit("/", 1)[-1][:80]
+    if took > seconds:
+        raise UpdateError(f"GitHub's answer for {name} took more than {seconds:.0f} s - given up; try again later")
+    if rated and took > STALL_SECONDS and count < took * MIN_BYTES_A_SECOND:
+        raise UpdateError(f"{name} comes too slowly ({count} bytes in {took:.0f} s) - given up; try again later")
+
+
+def _read(reply: Reply, max_bytes: int, sink, progress, cancel, url: str, began: float | None = None,
+          seconds: float | None = None):
     data = bytearray()
     count = 0
+    began = _clock() if began is None else began
+    seconds = (API_SECONDS if sink is None else DOWNLOAD_SECONDS) if seconds is None else seconds
     while True:
         if cancel is not None and cancel():
             raise Cancelled("cancelled")
+        _in_time(began, seconds, count, sink is not None, url)
         chunk = reply.body.read(_CHUNK)
         if not chunk:
             break
@@ -730,6 +801,14 @@ def download(release: Release, install: Install, current: str, fetcher=None, *, 
     if asset.digest and asset.digest != expected:
         raise ChecksumError(f"GitHub's digest of {name} is not the signed one - refused")
     target = install.target
+    # (another window - this version still running in it - installed the release: installed once more, the
+    # old program kept as .previous became a copy of the new one, and no way back was left)
+    try:
+        in_place = sha256_of(target)
+    except OSError:
+        in_place = ""
+    if in_place == expected:
+        raise AlreadyInstalled(f"{PROGRAM} {release.version} is installed already - it starts the next time")
     folder = target.parent
     if not os.access(folder, os.W_OK):
         raise NotWritable(f"{folder} cannot be written: the program stays as it is "
@@ -810,7 +889,15 @@ def _run_alone(args, *, timeout: float, env: dict | None = None, **kwargs):
             out, err = process.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             _end_group(process)
-            process.communicate()
+            try:
+                # (a child that left the process group - a session of its own - lives on and holds the pipes
+                # open: waited for without an end, the updater was held until that child ended)
+                process.communicate(timeout=GROUP_END_SECONDS)
+            except subprocess.TimeoutExpired:
+                for pipe in (process.stdout, process.stderr):
+                    if pipe is not None:
+                        with contextlib.suppress(OSError):
+                            pipe.close()
             raise
         if check and process.returncode:
             raise subprocess.CalledProcessError(process.returncode, args, out, err)
@@ -852,8 +939,10 @@ def self_test(path: Path, version: str, program: str = PROGRAM, *, timeout: floa
     out = (done.stdout or b"")[-4096:].decode("utf-8", "replace").strip().splitlines()
     if done.returncode == 0 and out and out[-1].strip() == self_test_answer(version, program):
         return
-    said = next((line.strip() for line in (done.stderr or b"")[-4096:].decode("utf-8", "replace").splitlines()
-                 if line.strip()), "")
+    # (another program's words, shown in a notice and printed by --update: no escape sequence of it reaches
+    # the terminal)
+    said = next((line.strip() for line in printable((done.stderr or b"")[-4096:].decode("utf-8", "replace"))
+                 .splitlines() if line.strip()), "")
     raise SelfTestFailed(f"it does not run here (status {done.returncode}{': ' + said[:200] if said else ''})")
 
 
@@ -989,7 +1078,10 @@ def update(install_: Install | None = None, current: str | None = None, fetcher=
     if not install_.can_update:
         return f"{result.text} - {install_.why_not()}"
     with _updating(install_.target):
-        downloaded = download(result.release, install_, current, fetcher, progress=progress, cancel=cancel)
+        try:
+            downloaded = download(result.release, install_, current, fetcher, progress=progress, cancel=cancel)
+        except AlreadyInstalled as already:  # (by another window: nothing to do, and no error)
+            return str(already)
         installed = install(downloaded, install_, test=test, after=after)
     return f"{PROGRAM} {installed.version} is installed - it starts the next time"
 
@@ -1001,11 +1093,17 @@ def _updating(target: Path):
     over the other's install. Held already: UpdateError."""
     lock = Path(target).with_name(f".{Path(target).name}.update-lock")
     try:
-        fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
-    except OSError:  # (an unwritable folder: download() says so)
-        yield
+        # (never through a link planted at the lock's name: the file it leads to was made, or opened and held)
+        fd = os.open(lock, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+                     0o600)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.EMLINK) or os.path.islink(lock):
+            raise UpdateError(f"{lock} is a link, not the update's lock file - refused; remove it") from None
+        yield  # (an unwritable folder: download() says so)
         return
     try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise UpdateError(f"{lock} is no file, not the update's lock - refused; remove it")
         try:
             if os.name == "nt":
                 import msvcrt
@@ -1025,11 +1123,13 @@ def _updating(target: Path):
 # -- the settings ---------------------------------------------------------------------------------
 
 def mode(path=None) -> str:
-    """"off", "notify" (the default) or "auto"."""
-    from axross_markdown._ax.core.markdown_settings import read_setting
+    """"off", "notify" (the default: no settings file, or none named in it) or "auto" - "off" whenever the
+    settings file leaves a doubt (a comment, a typo, a file that cannot be read: core.markdown_settings.
+    update_mode says which): nothing is asked, fetched or installed by itself then."""
+    from axross_markdown._ax.core.markdown_settings import update_mode
 
-    value = read_setting(SETTING_MODE, DEFAULT_MODE, path)
-    return value if value in MODES else DEFAULT_MODE
+    value = update_mode(path, DEFAULT_MODE)
+    return value if value in MODES else "off"
 
 
 def set_mode(value: str, path=None) -> None:
@@ -1137,11 +1237,11 @@ class Scheduler:
         return max(0.0, last + self.interval - self.clock())
 
 
-__all__ = ["ALLOWED_HOSTS", "Asset", "Cancelled", "CheckResult", "ChecksumError", "DEFAULT_MODE",
+__all__ = ["ALLOWED_HOSTS", "AlreadyInstalled", "Asset", "Cancelled", "CheckResult", "ChecksumError", "DEFAULT_MODE",
            "DowngradeRefused", "Downloaded", "HostRefused", "Install", "Installed", "MODES", "NO_CHECK_ENV",
            "NotWritable", "PIP_HINT", "pip_hint", "Release", "Reply", "Scheduler", "SelfTestFailed", "SignatureError",
            "TRUSTED_KEYS", "TooLarge", "UpdateError", "Web", "asset_name", "check", "check_url", "checks_allowed",
            "cleanup_partials", "cleanup_previous", "detect_install", "download", "due", "fetch", "install",
-           "is_newer", "last_check", "mode", "parse_release", "parse_sums", "parse_version", "record_check",
+           "is_newer", "last_check", "mode", "parse_release", "parse_sums", "parse_version", "printable", "record_check",
            "roll_back", "seen_newer", "self_test", "self_test_answer", "set_mode", "signed_sums", "update",
            "verify_signature"]

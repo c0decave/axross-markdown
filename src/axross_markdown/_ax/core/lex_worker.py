@@ -28,6 +28,7 @@ import sys
 from array import array
 
 from axross_markdown._ax.core import image_worker as IW
+from axross_markdown._ax.core import text_search
 
 log = logging.getLogger(__name__)
 
@@ -114,6 +115,9 @@ def _paint_check(style_name: str):
 
 
 def _lex_request(request: dict) -> tuple[dict, bytes]:
+    if "find" in request:
+        # (the editor's find bar: a regular expression of the user's, run where it can be ended)
+        return text_search.answer(request["find"]), b""
     from pygments.lexers import find_lexer_class
     from pygments.util import ClassNotFound
 
@@ -215,6 +219,33 @@ def lex(language: str, text: str, style: str = "default", cancel=None) -> list[t
     return _POOL.ask({"language": language, "text": text, "style": style}, consume, cancel)
 
 
+class FindTooSlow(LexError):
+    """A regular expression of the editor's find bar past its time."""
+
+
+def find(request: dict, seconds: float) -> dict:
+    """The editor's find bar's *request* (core.text_search.answer) answered
+    by a child: Python's ``re`` cannot be interrupted, and a pattern that
+    backtracks without end - ``(\\w+\\s?)+$X`` on a line of 40 words - ran
+    for good, the window frozen (on a worker thread too: one match holds
+    Python's lock). Past *seconds* the child is ended: :class:`FindTooSlow`.
+    :class:`LexError` when no child answers."""
+    import time
+
+    deadline = time.monotonic() + seconds
+
+    def late() -> bool:
+        return time.monotonic() >= deadline
+
+    def consume(head: dict, _body) -> dict:
+        return head
+
+    try:
+        return _POOL.ask({"find": request}, consume, late)
+    except LexCancelled:
+        raise FindTooSlow(f"the search took longer than {seconds:g} s") from None
+
+
 def warm() -> None:
     """Start a lexing child now, without waiting for it (an editor opens)."""
     _POOL.warm()
@@ -236,7 +267,9 @@ __all__ = [
     "LexCrashed",
     "LexError",
     "LexTooSlow",
+    "FindTooSlow",
     "close_pool",
+    "find",
     "idle_pids",
     "lex",
     "warm",

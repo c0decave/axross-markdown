@@ -204,25 +204,19 @@ def test_sad_mdcat_shows_a_link_of_a_megabyte_in_seconds():
 # -- M1, M2. the event loop never held by a worker, nor by a short text's parse --------------------
 
 class _Gaps:
-    """The longest pause of the event loop (a 5 ms timer's ticks) while it runs."""
+    """The longest pause of the event loop while it runs: the heartbeat's gap (tests/markdown_heartbeat.py)
+    - the wall clock between two ticks without the GUI thread's own wait for a CPU another job on the
+    machine had. (Plain wall clock between two ticks of a timer failed on a busy machine: 0.29 to 0.32 s
+    against 0.25, the window's own share 0.16 s.)"""
 
     def __init__(self):
-        from PyQt6.QtCore import QTimer
+        from tests.markdown_heartbeat import Heartbeat
 
-        self.last, self.longest = time.monotonic(), 0.0
-        self.timer = QTimer()
-        self.timer.setInterval(5)
-        self.timer.timeout.connect(self._tick)
-        self.timer.start()
-
-    def _tick(self):
-        now = time.monotonic()
-        self.longest = max(self.longest, now - self.last)
-        self.last = now
+        self.beat = Heartbeat(5)
 
     def stop(self) -> float:
-        self.timer.stop()
-        return self.longest
+        _turn, gap = self.beat.stop()
+        return gap
 
 
 def _render_gaps(text: str) -> tuple[object, float]:

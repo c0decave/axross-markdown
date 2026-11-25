@@ -99,6 +99,49 @@ class MarkdownApp:
 
         themes.aboutToShow.connect(refill)
         refill()
+        self.language_menu(menu)
+
+    def language_menu(self, menu) -> None:
+        """View > Language: Automatic (axross's choice, else the locale's) or one of the languages the
+        program has; kept in its own settings (core.markdown_settings), spoken from the next start on -
+        said when one is chosen. (There was none: the language was axross's session's, or the locale's.)"""
+        from PyQt6.QtGui import QActionGroup
+
+        from axross_markdown._ax.core import i18n
+        from axross_markdown._ax.core.i18n import tr
+        from axross_markdown._ax.core.markdown_settings import SETTING_LANGUAGE, read_setting, write_setting
+
+        languages = menu.addMenu(tr("Language"))
+        languages.setObjectName("language")
+
+        def choose(code) -> None:
+            try:
+                write_setting(SETTING_LANGUAGE, code)
+            except OSError as exc:
+                self._language_said = str(exc)
+                return
+            self._language_said = tr("The language changes the next time {name} starts.").format(name=NAME)
+            window = menu.parentWidget()
+            view = getattr(window.window() if window is not None else None, "view", None)
+            if view is not None:
+                view.say(self._language_said)
+
+        def refill() -> None:
+            for group in languages.findChildren(QActionGroup):
+                group.deleteLater()
+            languages.clear()
+            group = QActionGroup(languages)
+            now = i18n.normalise_language(read_setting(SETTING_LANGUAGE))
+            for code, name in ((None, tr("Automatic")), *i18n.available_languages().items()):
+                action = languages.addAction(name)
+                action.setCheckable(True)
+                action.setChecked(code == now)
+                action.setData(code)
+                group.addAction(action)
+                action.triggered.connect(lambda _checked=False, code=code: choose(code))
+
+        languages.aboutToShow.connect(refill)
+        refill()
 
     def help_menu(self, menu) -> None:
         """Help: Check for Updates… and Updates (Off / Tell me / Install automatically) - the checks run
@@ -127,7 +170,9 @@ class MarkdownApp:
             self.editor_window = EditorWindow()
         window = self.editor_window
         window.preview_new_tabs = True
-        window.open_file(backend, path)
+        # (read off the window's thread, its text put in a slice a turn: read and set here,
+        # a file of 1 MB and more held the window 0.12 to 0.29 s)
+        window.open_file(backend, path, background=True)
         window.show()
         window.raise_()
         window.activateWindow()
@@ -141,6 +186,7 @@ def build(app, args: list[str]):
 
     # (the window's size in the program's own state: it was written into axross's ~/.config/axross/session.json)
     viewer_window.STATE_FILE = window_state_path()
+    speak_chosen_language(app)
     program = MarkdownApp()
     program.open_paths(list(args))
     app._ax_markdown = program  # noqa: SLF001 - kept with the application
@@ -152,12 +198,70 @@ def build(app, args: list[str]):
     return None
 
 
+def speak_chosen_language(app) -> str:
+    """The program's own language (View > Language, $LANGUAGE - core.markdown_settings.chosen_language) set
+    before its first window, and Qt's own texts in it: the catalogue's (ui.qt_translations: the standard
+    buttons) and Qt's translation files where they are there (qtbase_LANGUAGE.qm - a file dialog's and a
+    print dialog's words stayed English). Returns the language spoken."""
+    from PyQt6.QtCore import QLibraryInfo, QTranslator
+
+    from axross_markdown._ax.core import i18n
+    from axross_markdown._ax.core.markdown_settings import chosen_language
+
+    chosen = chosen_language()
+    if chosen and chosen != i18n.active().language:
+        i18n.install(chosen)
+        from axross_markdown._ax.ui.qt_translations import install_qt_translator
+
+        old = getattr(app, "_ax_qt_translator", None)
+        if old is not None:
+            app.removeTranslator(old)
+            app._ax_qt_translator = None  # noqa: SLF001
+        install_qt_translator(app)
+    language = i18n.active().language
+    for old in getattr(app, "_ax_qt_own", ()):
+        app.removeTranslator(old)
+    app._ax_qt_own = []  # noqa: SLF001 - kept with the application
+    if language != i18n.DEFAULT_LANGUAGE:
+        folder = QLibraryInfo.path(QLibraryInfo.LibraryPath.TranslationsPath)
+        for name in ("qtbase", "qt"):
+            own = QTranslator(app)
+            if own.load(f"{name}_{language}", folder):
+                # (before the catalogue's translator: Qt asks the one installed last first - ours wins)
+                app.installTranslator(own)
+                app._ax_qt_own.append(own)  # noqa: SLF001
+                break
+        catalogue = getattr(app, "_ax_qt_translator", None)
+        if catalogue is not None and app._ax_qt_own:  # noqa: SLF001
+            app.removeTranslator(catalogue)
+            app.installTranslator(catalogue)
+    return language
+
+
+def _said(status: int) -> int:
+    """*status* once what was printed is written - or 1, said, when it cannot be ("--help > /dev/full" ended
+    with Python's own complaint at the exit and status 120)."""
+    try:
+        if sys.stdout is not None:
+            sys.stdout.flush()
+    except OSError as exc:
+        from axross_markdown._ax.core.markdown_cli import _quiet_stdout
+
+        _quiet_stdout()
+        print(f"{NAME}: cannot write the output: {exc.strerror or exc}", file=sys.stderr)
+        return 1
+    return status
+
+
 def export_html_main(args: list[str]) -> int:
     """``--html FILE``: the page of *FILE* ("-": standard input) for a web
     browser on standard output - its images (beside the file, as the
-    terminal reads them: core.markdown_term.read_picture) in it."""
+    terminal reads them: core.markdown_term.read_picture) in it; of
+    standard input's only the images the text holds itself."""
     from axross_markdown._ax.core import markdown_doc as MD
 
+    if args[:1] == ["--"]:  # ("--html -- -x.md": a file whose name begins with a dash)
+        args = args[1:]
     if len(args) != 1:
         print("axross-markdown: --html takes one file (- for standard input)", file=sys.stderr)
         return 2
@@ -174,8 +278,11 @@ def export_html_main(args: list[str]) -> int:
     from axross_markdown._ax.ui.markdown_html import export_html
 
     doc = MD.parse(MD.clean(text))
-    folder = os.path.dirname(os.path.abspath(name)) if name != "-" else os.getcwd()
-    title = os.path.basename(name) if name != "-" else ""
+    # (text from a pipe has no folder: "![x](notes.png)" in it embedded that file of the folder the command
+    # happened to run in - only the images held in the text itself are in its page)
+    piped = name == "-" or not os.path.isfile(name)  # (a pipe given as a path - "<(...)" - is one too)
+    folder = os.path.dirname(os.path.abspath(name)) if not piped else None
+    title = os.path.basename(name) if not piped else ""
     page = export_html(doc, title=title, images=_images_of(doc, folder))
     from axross_markdown._ax.core.markdown_cli import OutputGone, _write
 
@@ -186,10 +293,11 @@ def export_html_main(args: list[str]) -> int:
     return 0
 
 
-def _images_of(doc, folder: str) -> dict[str, str]:
+def _images_of(doc, folder: str | None) -> dict[str, str]:
     """``{src: "data:image/png;base64,…"}`` of the images of *doc* beside
     the file and held in it (read as the terminal reads them: bounded, never
-    a secret, never above *folder*) - the only ones the page shows."""
+    a secret, never above *folder*) - the only ones the page shows. No
+    *folder* (standard input): those held in the text only, no file read."""
     import base64
     import io
 
@@ -211,6 +319,8 @@ def _images_of(doc, folder: str) -> dict[str, str]:
         if name[:5].lower() == "data:":  # (held in the file: decoded and checked as the terminal's)
             data, _why = T.data_image(name)
             image = T.decode_picture(data, left) if data is not None else "not an image"
+        elif folder is None:
+            continue
         else:
             path, why = T.locate(name, folder)
             if why or not path:
@@ -247,7 +357,8 @@ def _parser():
     parser.add_argument("--html", metavar="FILE", help="write FILE's page for a web browser to standard output")
     parser.add_argument("--version", action="version", version=f"{NAME} {program_version()}")
     parser.add_argument("--check-update", action="store_true",
-                        help="ask GitHub whether a newer release is out, and exit (no window)")
+                        help="ask GitHub whether a newer release is out, and exit (no window; asked for here, so "
+                             "also with AXROSS_MARKDOWN_NO_UPDATE_CHECK=1 - that stops the window's own checks only)")
     parser.add_argument("--update", action="store_true",
                         help="install a newer release - the one-file programs (pip: says the command) - and exit")
     parser.add_argument("--update-mode", choices=("off", "notify", "auto"),
@@ -284,10 +395,14 @@ def main(argv: list[str] | None = None) -> int:
         return terminal([a for a in rest if a not in TERMINAL], prog=NAME)
     if rest[:1] == ["--script"]:  # (a build's check: ui.standalone_app.bundle_check)
         return run(NAME, TITLE, "markdown", build, argv, smoke_ms=smoke_ms_from_env())
+    for at in range(len(rest) - 2):  # ("--html -- -x.md": a file whose name begins with a dash)
+        if rest[at] == "--html" and rest[at + 1] == "--":
+            rest[at:at + 3] = ["--html=" + rest[at + 2]]
+            break
     try:
         options = _parser().parse_args(rest)
     except SystemExit as stop:  # (--help, --version: said; an unknown option: said, exit 2)
-        return int(stop.code or 0)
+        return _said(int(stop.code or 0))
     if options.self_test:
         return self_test()
     if options.update_mode or options.check_update or options.update:
