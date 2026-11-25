@@ -3,8 +3,9 @@
 
 The parser is markdown-it-py - CommonMark, plus GitHub's tables and
 strike-through, footnotes, task lists, definition lists, YAML / TOML front
-matter and GitHub's heading anchors (mdit-py-plugins); bare URLs become links
-when linkify-it-py is there. And what GitHub shows beyond those: its alerts
+matter and GitHub's heading anchors (mdit-py-plugins); bare addresses become
+links as GitHub links them (:func:`_autolinks` - never linkify-it-py's, also
+where it is installed). And what GitHub shows beyond those: its alerts
 (``> [!NOTE]``, TIP, IMPORTANT, WARNING, CAUTION: :func:`alert_of`), math
 (``$…$``, ``$$…$$``, a ``math`` fence: shown as text, the common TeX
 commands as Unicode - :func:`math_text`) and emoji short codes (``:tada:``,
@@ -360,45 +361,6 @@ def _fewer_marks(md) -> None:
             md.inline.ruler.at(name, bounded(original, run))
 
 
-def _linkify_in_pieces(md) -> None:
-    """linkify-it-py's searches a piece of a long text at a time: its rule
-    pretested all of an inline's text and matched all of a text token in one
-    call each - a line of 10 MB held Python's lock for seconds, the window
-    froze though only a worker parsed. A long text token is cut where a word
-    begins (a link holds no space; markdown-it's text_join joins the pieces
-    again), the pretest is asked of the pieces (_text_pieces)."""
-    finder = md.linkify
-    if getattr(finder, "_ax_pieces", False):
-        return
-    whole = finder.pretest
-
-    def pretest(text: str) -> bool:
-        if len(text) <= LINES_AT_ONCE:
-            return whole(text)
-        return any(whole(text[begin:stop]) for begin, stop in _text_pieces(text))
-
-    finder.pretest = pretest
-    finder._ax_pieces = True
-    Token = token_class()
-
-    def cut(state) -> None:
-        for token in state.tokens:
-            if token.type != "inline" or not token.children or len(token.content) <= LINES_AT_ONCE:
-                continue
-            children = []
-            for child in token.children:
-                if child.type != "text" or len(child.content) <= LINES_AT_ONCE:
-                    children.append(child)
-                    continue
-                for begin, stop in _text_pieces(child.content):
-                    piece = Token("text", "", 0)
-                    piece.content, piece.level = child.content[begin:stop], child.level
-                    children.append(piece)
-            token.children = children
-
-    md.core.ruler.before("linkify", "linkify_pieces", cut)
-
-
 def _display_math_lines(state) -> None:
     """A $$...$$ that stands on its own lines in a paragraph - after an alert's "[!NOTE]", after a line
     of text - a display formula, as GitHub shows it: markdown-it read it as inline math (no block may
@@ -534,15 +496,14 @@ def make_parser():
     except ImportError as exc:
         raise _not_installed(exc) from exc
 
-    linkify = _has_linkify()
     # html=True only so that raw HTML comes as tokens of its own: _safe_html
     # replaces every one of them by its allowed subset before any view sees it.
-    md = MarkdownIt("commonmark", {"html": True, "linkify": linkify, "typographer": False,
+    # linkify off - also where linkify-it-py is installed (the lock's, the extra "linkify"): its links
+    # were no GitHub's ("README.md" and "setup.py" went to http://README.md, "www.a.org/x:" kept its ":",
+    # "…?q=a&hl;" its "&hl", "ftp://nohost" was one); GitHub's extended autolinks are _autolinks.
+    md = MarkdownIt("commonmark", {"html": True, "linkify": False, "typographer": False,
                                    "maxNesting": MAX_NESTING})
     md.enable(["table", "strikethrough"])
-    if linkify:
-        md.enable("linkify")
-        _linkify_in_pieces(md)
     md.use(front_matter_plugin).use(footnote_plugin).use(tasklists_plugin).use(deflist_plugin)
     md.core.ruler.at("github-tasklists", _task_lists)
     _folded_note_refs(md)
@@ -576,8 +537,7 @@ def make_parser():
     md.core.ruler.push("fewer_spans", _fewer_spans)
     md.core.ruler.after("inline", "backtick_math", _backtick_math)
     md.core.ruler.push("fewer_formulas", _fewer_formulas)
-    if not linkify:  # (GitHub's extended autolinks: linkify-it-py is no dependency - its rule when there)
-        md.core.ruler.push("autolinks", _autolinks)
+    md.core.ruler.push("autolinks", _autolinks)  # (GitHub's extended autolinks)
     md.block.ruler.before("front_matter", "toml_front_matter", _toml_front_matter,
                           {"alt": ["paragraph", "reference", "blockquote", "list"]})
     _linear_inline_rules(md)
@@ -696,14 +656,6 @@ def _toml_front_matter(state, start_line: int, end_line: int, silent: bool) -> b
     token.content = state.src[state.bMarks[1]:state.eMarks[close - 1]] if close > 1 else ""
     token.map = [0, close + 1]
     state.line = close + 1
-    return True
-
-
-def _has_linkify() -> bool:
-    try:
-        import linkify_it  # noqa: F401
-    except ImportError:
-        return False
     return True
 
 
@@ -1092,8 +1044,6 @@ def note_plan(text: str):
     none in code; one in a quote too."""
     md = make_parser()
     md.disable("footnote_tail")  # (the definitions where they are, their lines with them)
-    if "linkify" in md.get_active_rules()["core"]:  # (no link holds a note: 1 s of 3.8 MB)
-        md.disable(["linkify", "linkify_pieces"])
     env: dict = {}
     tokens = md.parse(text, env)
     notes = env.get("footnotes") or {}
@@ -1729,9 +1679,9 @@ def _unsafe_links(state) -> None:
 
 
 def _autolinks(state) -> None:
-    """Bare addresses in the text made links (without linkify-it-py: GFM's
-    extended autolinks - Qt's own parser linked them, markdown-it's page
-    did not). Never in code, nor in a link."""
+    """Bare addresses in the text made links: GFM's extended autolinks (Qt's
+    own parser linked them, markdown-it's page did not - nor as GitHub with
+    linkify-it-py). Never in code, nor in a link."""
     Token = token_class()
 
     md = state.md
@@ -1765,20 +1715,22 @@ def _autolinks(state) -> None:
             else:
                 if at < len(text):
                     pieces.append(("text", text[at:]))
+                level = run[0].level  # (the levels markdown-it gives a link's tokens: its text one deeper)
                 for kind, value in pieces:
                     if kind == "text":
                         piece = Token("text", "", 0)
-                        piece.content = value
+                        piece.content, piece.level = value, level
                         children.append(piece)
                         continue
                     shown, href = value
                     opened = Token("link_open", "a", 1)
                     opened.attrs = {"href": href}
-                    opened.markup, opened.info = "linkify", "auto"
+                    opened.markup, opened.info, opened.level = "linkify", "auto", level
                     label = Token("text", "", 0)
                     label.content = md.normalizeLinkText(shown)  # ("www.pаypal.com": in punycode)
+                    label.level = level + 1
                     closed = Token("link_close", "a", -1)
-                    closed.markup, closed.info = "linkify", "auto"
+                    closed.markup, closed.info, closed.level = "linkify", "auto", level
                     children.extend((opened, label, closed))
             run.clear()
 

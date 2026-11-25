@@ -10,6 +10,7 @@ Each test named test_sad_ here failed before.
 from __future__ import annotations
 
 import os
+import re
 import sys
 import time
 import unicodedata
@@ -780,6 +781,20 @@ def test_sad_a_bare_ftp_address_is_a_link():
     assert '<a href="ftp://foo.bar.baz/x?y=1">ftp://foo.bar.baz/x?y=1</a>.' in page
     assert "ftp://nohost and sftp://a.b/c" in page
     assert _kinds("`ftp://foo.bar.baz`\n")[0] == ["ftp://foo.bar.baz"]
+
+
+def test_sad_bare_addresses_are_github_s_with_linkify_it_py_installed_too():
+    """With linkify-it-py installed (the lock's: the CI's, the programs', the extra "linkify"), its rule made
+    the links of markdown-it's page - no GitHub's: a file's name ("README.md", "setup.py") went to
+    http://README.md, "//host.com/x" and "http://localhost/x" were links, "www.a.org/x:" kept its ":",
+    "…?q=a&hl;" its "&hl" and "…?x=1;" lost its ";". Now GitHub's extended autolinks, installed or not."""
+    page = _html("see README.md, setup.py and example.com, //host.com/x and http://localhost/x\n")
+    assert "<a " not in page, page
+    page = _html("www.a.org/x: www.e.org/q?x=1; www.g.com/s?q=a&hl; user@ex.net\n")
+    links = re.findall(r'<a href="([^"]*)">([^<]*)</a>', page)
+    assert links == [("http://www.a.org/x", "www.a.org/x"), ("http://www.e.org/q?x=1;", "www.e.org/q?x=1;"),
+                     ("http://www.g.com/s?q=a", "www.g.com/s?q=a"), ("mailto:user@ex.net", "user@ex.net")], links
+    assert MD.make_parser().options["linkify"] is False
 
 
 def test_sad_a_struck_link_is_struck():

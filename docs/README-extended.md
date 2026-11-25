@@ -262,7 +262,6 @@ What a file holds is shown, never run:
 
 ```sh
 pip install axross-markdown              # or: pipx install axross-markdown
-pip install "axross-markdown[linkify]"   # bare addresses linked as GitHub links them
 ```
 
 - **PyPI may lag behind the releases** (`axross-markdown --version` says which one pip gave you).
@@ -270,10 +269,10 @@ pip install "axross-markdown[linkify]"   # bare addresses linked as GitHub links
   `pip install https://github.com/c0decave/axross-markdown/releases/download/v0.17.5/axross_markdown-0.17.5-py3-none-any.whl` - or, checked first: download `axross_markdown-0.17.5-py3-none-any.whl`,
   `SHA256SUMS` and `SHA256SUMS.sig` from the
   [release](https://github.com/c0decave/axross-markdown/releases/tag/v0.17.5), check them
-  ([Checking a download by hand](#checking-a-download-by-hand)) and `pip install ./axross_markdown-0.17.5-py3-none-any.whl`
-  (with the extra: `pip install "./axross_markdown-0.17.5-py3-none-any.whl[linkify]"`).
+  ([Checking a download by hand](#checking-a-download-by-hand)) and `pip install ./axross_markdown-0.17.5-py3-none-any.whl`.
 - **Python 3.11 or newer** with PyQt6 6.6 to 6.11, markdown-it-py, mdit-py-plugins,
-  Pygments and Pillow (installed with it).
+  Pygments and Pillow (installed with it). Bare addresses are linked as GitHub links them
+  without more (the extra `linkify` adds nothing since 0.17.5).
 - **One-file programs without Python** from the
   [latest release](https://github.com/c0decave/axross-markdown/releases/latest): Linux
   x86-64 (also as an AppImage), macOS arm64 (also as a disk image with the app) and

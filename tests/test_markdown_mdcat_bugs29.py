@@ -460,7 +460,9 @@ def test_sad_errors_are_german_under_a_german_locale(tmp_path):
     out = _mdcat("-w", "abc", "x.md", env=GERMAN)
     assert out.returncode == 2 and "Argument -w/--width: keine Spaltenzahl: abc" in out.stderr
     out = _mdcat("--theme", "nope", "x.md", env=GERMAN)
-    assert out.returncode == 2 and "ungültige Auswahl: 'nope'" in out.stderr and "'sepia'" in out.stderr
+    # (the choices as the standard library lists them: quoted - "'sepia'" - on Python 3.11, not on 3.12)
+    assert out.returncode == 2 and re.search(r"axross-mdcat: Fehler: Argument --theme: ungültige Auswahl: 'nope' "
+                                             r"\(möglich: ('?)auto\1, \1light\1, .*\1sepia\1", out.stderr), out.stderr
     out = _mdcat("--watch", "-", env=GERMAN)
     assert out.returncode == 2 and "--watch zeigt eine Datei (nicht die Standardeingabe)" in out.stderr
     if os.name == "posix":

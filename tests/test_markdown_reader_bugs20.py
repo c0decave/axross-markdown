@@ -124,8 +124,8 @@ def test_sad_the_window_shows_and_copies_a_quoted_formula_without_its_marks(full
 def test_sad_linkify_finds_every_link_of_a_long_line_in_pieces():
     """With linkify-it-py (the lock's), its rule pretested and matched all of a 10 MB line in one call
     each: the window froze 4-6 s while a worker parsed (tests/test_markdown_reader_bugs19.py's 10 MB test).
-    Now a piece at a time - and every link found as before."""
-    pytest.importorskip("linkify_it")
+    Now a piece at a time - and every link found as before. (Since 0.17.5 GitHub's extended autolinks find
+    them, linkify-it-py or not: _autolinks, a piece at a time too.)"""
     from axross_markdown._ax.core import markdown_doc as MD
 
     links = ["https://e.com/a", "www.example.org/b", "user@example.net", "http://x.io/(c)"]

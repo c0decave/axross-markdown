@@ -96,10 +96,14 @@ def _opened(tmp_path, text: str, full: bool) -> tuple[float, float]:
 
 # -- the heartbeat itself ----------------------------------------------------------------------------------
 
-def test_sad_the_heartbeat_sees_a_worker_that_holds_pythons_lock_the_cpu_meter_does_not():
+def test_sad_the_heartbeat_sees_a_worker_that_holds_pythons_lock_the_cpu_meter_does_not(monkeypatch):
     """The new measure: a worker thread in one long search of a regular expression holds the GIL - the GUI
     thread spends no CPU time, so the per-turn CPU meter reads nearly nothing, but the window does not
-    answer: the heartbeat's wall-clock gap says so."""
+    answer: the heartbeat's wall-clock gap says so. Its own failure is asserted in every job: the gap over
+    its budget is Frozen - and in the blocking jobs (SOFT: AXROSS_TIMING_BUDGETS=warn or gate, the job
+    "turns") a warning. (The job "turns" failed 0.17.5: there assert_responsive warned, "DID NOT RAISE".)"""
+    if not getattr(sys, "_is_gil_enabled", lambda: True)():
+        pytest.skip("no GIL (a free-threaded Python): a worker's search holds no lock the window waits for")
     pattern = re.compile(r"(`+)(?:(?!\1).)+?\1")  # (0.16.9's _CODE_SPAN: cubic in a run of backticks)
     beat = HB.Heartbeat()
     pump(0.05)
@@ -109,9 +113,16 @@ def test_sad_the_heartbeat_sees_a_worker_that_holds_pythons_lock_the_cpu_meter_d
         pump(0.01)
     turn, gap = beat.stop()
     TB.budget(turn < 0.1, turn)  # (the GUI thread itself did nothing)
-    TB.budget(gap > 0.25, gap)  # (but the window was frozen)
-    with pytest.raises(AssertionError):
-        HB.assert_responsive(gap * HB.machine_factor() * 10)
+    # (the window was frozen for the whole search - seconds, on any machine: no duration's budget, the measure's)
+    assert gap > max(0.25, HB.gap_budget()) and gap > 10 * turn, (gap, turn)
+    monkeypatch.setattr(TB, "SOFT", False)
+    with pytest.raises(HB.Frozen):
+        HB.assert_responsive(gap)
+    monkeypatch.setattr(TB, "SOFT", True)
+    monkeypatch.setattr(TB, "MISSED", [])  # (this warning is the test's own: no budget missed, no annotation)
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    with pytest.warns(TB.TimingBudgetWarning, match="the window did not answer"):
+        HB.assert_responsive(gap)
 
 
 def test_happy_every_stress_meter_measures_the_gap_too(monkeypatch):
@@ -329,10 +340,9 @@ def test_happy_the_linear_inline_rules_read_what_they_read_before():
     page = H.to_html(MD.parse("see <b>bold</b> and <!-- gone --> x <?pi?> <a href=\"https://e.com\">e</a>\n"))
     assert "<b>bold</b>" in page or "<strong>bold</strong>" in page
     assert "gone" not in page and 'href="https://e.com"' in page
-    if MD._has_linkify():
-        page = H.to_html(MD.parse("go to https://e.com/x, mailto:a@b.example and www.e.org now\n"))
-        assert 'href="https://e.com/x"' in page and 'href="mailto:a@b.example"' in page
-        assert "xhttp://e.com" in H.to_html(MD.parse("xhttp://e.com\n"))
+    page = H.to_html(MD.parse("go to https://e.com/x, mailto:a@b.example and www.e.org now\n"))
+    assert 'href="https://e.com/x"' in page and 'href="mailto:a@b.example"' in page
+    assert "xhttp://e.com" in H.to_html(MD.parse("xhttp://e.com\n"))
 
 
 # -- N6: Qt's own parser's HTML export --------------------------------------------------------------------

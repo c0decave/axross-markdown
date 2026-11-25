@@ -97,6 +97,11 @@ the editor.
 - **GFM:** `ftp://…` is linked; a struck link is struck; an empty list item
   is drawn (`1.` `2.` `3.` showed 1, 2); raw `<ol start="3">` starts at 3; a
   link in a `<summary>` is a link again.
+- **Bare addresses are linked as GitHub links them with linkify-it-py
+  installed too** (the one-file programs, the extra `linkify`): its rule
+  linked a file's name (`README.md`, `setup.py` went to
+  `http://README.md`), `//host.com/x` and `ftp://nohost`, kept the `:` after
+  `www.a.org/x:` and the `&hl` of `?q=a&hl;`, and cut the `;` of `?x=1;`.
 - **Names for a screen reader:** the buttons "←", "→", "−", "+" and the find
   field have them; an image's alt text is its tooltip.
 - **Links:** the question about a link out of the document's folder names
